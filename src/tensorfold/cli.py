@@ -95,7 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
     cuda.add_argument("--kv-budget-gib", type=float, default=None,
                       help="with --concurrency: admit a request only while every live request's attention rows "
                            "(prompt + max_tokens) and recurrent state fit this budget")
-    cuda.add_argument("--cache-gib", type=float, default=6.0,
+    cuda.add_argument("--cache-gib", type=float, default=8.0,
                       help="with --concurrency: memory for cached prompt prefixes and agent conversations to resume "
                            "(~64 KiB a token)")
     serve.set_defaults(func=cmd_serve)

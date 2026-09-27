@@ -46,6 +46,7 @@ class Request:
     done: bool = False
     rounds: int = 0
     accepted: int = 0
+    t_submit: float = 0.0
     t_admit: float = 0.0
     t_first: float = 0.0
     t_done: float = 0.0
@@ -117,7 +118,7 @@ class Scheduler:
     def __init__(self, w: Weights, draft=None, *, concurrency: int = 16, row_budget: int = 128, max_rows: int = 6,
                  allow_copy: bool = True, stop_eos: bool = True, min_prefix: int = 64, prefill_reserve: int = 32,
                  cache: PrefixCache | None = None, kv_budget_gib: float | None = None, turn_entries: int = 4,
-                 turn_min: int = 8192, turn_budget: int | None = None, log=None):
+                 turn_min: int = 8192, turn_budget: int | None = None, block_budget: int | None = None, log=None):
         from .batch_draft import BatchDraft
 
         self.log = log
@@ -130,6 +131,9 @@ class Scheduler:
         # states after a long prompt and after its reply: an agent loop sends the growing conversation again
         # each call, and resumes from these. Kept apart so they cannot evict the shared-prefix entries.
         self.turns = PrefixCache(turn_entries, turn_budget)
+        # the system-and-tools blocks the server marks (``checkpoint``): every new agent conversation starts with
+        # one, and bursts of other requests or the agent's own turns must not push it out
+        self.blocks = PrefixCache(2, block_budget)
         self.turn_min = turn_min
         self.last_step = time.perf_counter()
         self.failed_steps = 0
@@ -154,6 +158,7 @@ class Scheduler:
 
     # ---- queue ----
     def submit(self, r: Request) -> None:
+        r.t_submit = time.perf_counter() - self.t0
         with self.lock:
             self.waiting.append(r)
 
@@ -172,6 +177,11 @@ class Scheduler:
             if self.bd is not None and r.slot >= 0:
                 self.bd.release(r.slot)
         r.st = None
+        if self.log is not None:
+            first = f"{r.t_first - r.t_admit:.1f}s" if r.t_first else "-"
+            end = ", cancelled" if r.cancel else (f", error: {r.error[:120]}" if r.error else "")
+            self.log(f"done: prompt {len(r.prompt)} tokens (resumed {r.cached}), {len(r.out)} out, queued "
+                     f"{max(0.0, r.t_admit - r.t_submit):.1f}s, first token {first}, total {r.t_done - r.t_submit:.1f}s{end}")
         if r.emit is not None:
             r.emit(None)
 
@@ -218,10 +228,8 @@ class Scheduler:
                      f"live {len(self.live) + 1}, waiting {len(self.waiting)}")
 
     def _best(self, prompt: list[int]):
-        a, b = self.cache.best(prompt), self.turns.best(prompt)
-        if a is None or (b is not None and len(b[0]) > len(a[0])):
-            return b
-        return a
+        hits = [h for h in (self.cache.best(prompt), self.turns.best(prompt), self.blocks.best(prompt)) if h is not None]
+        return max(hits, key=lambda h: len(h[0])) if hits else None
 
     @torch.no_grad()
     def step(self) -> bool:
@@ -380,9 +388,10 @@ class Scheduler:
                 continue
             r.pos += len(it.tokens)
             if r.cache_at and r.pos == r.cache_at:
-                hit = cache.best(r.prompt[:r.pos + 1])
+                hit = self._best(r.prompt[:r.pos + 1])
                 if hit is None or len(hit[0]) < r.pos:
-                    cache.add(r.prompt[:r.pos], private_clone(r.st), bd.snapshot(r.slot) if bd is not None else None)
+                    (self.blocks if r.pos == r.checkpoint else cache).add(
+                        r.prompt[:r.pos], private_clone(r.st), bd.snapshot(r.slot) if bd is not None else None)
                 later = [p for p in r.cache_points if p > r.pos]
                 r.cache_at = later[0] if later else 0
             if r.pos == len(r.prompt) and len(r.prompt) >= self.turn_min:
@@ -426,7 +435,8 @@ class Scheduler:
         return {"live": live, "waiting": waiting, "last_step_age_s": round(time.perf_counter() - self.last_step, 1),
                 "failed_steps": self.failed_steps, "rounds": self.stats["rounds"],
                 "shared_prefixes": len(self.cache.entries), "turn_states": len(self.turns.entries),
-                "cache_gib": round((self.cache.bytes() + self.turns.bytes()) / 2**30, 2)}
+                "system_blocks": len(self.blocks.entries),
+                "cache_gib": round((self.cache.bytes() + self.turns.bytes() + self.blocks.bytes()) / 2**30, 2)}
 
 
 @torch.no_grad()

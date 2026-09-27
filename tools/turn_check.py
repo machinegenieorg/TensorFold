@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A growing conversation (an agent loop) resumes from the previous call's state; stop sequences; /health.
 
-  turn_check.py PROMPTS.json [--url http://127.0.0.1:8891]"""
+  turn_check.py PROMPTS.json [--url http://127.0.0.1:8891] [--burst 24]"""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import argparse
 import json
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 
 def call(base, body):
@@ -35,6 +36,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("prompts")
     ap.add_argument("--url", default="http://127.0.0.1:8891")
+    ap.add_argument("--burst", type=int, default=24)
     a = ap.parse_args()
     msgs = json.load(open(a.prompts))
     block = "\n\n".join(x["content"] for m in msgs[30:40] for x in m)[:100000]      # a long fixed context
@@ -49,6 +51,12 @@ def main():
         other = [{"role": "system", "content": block}, {"role": "user", "content": f"Name two people mentioned above ({n})."}]
         _, finish, pt, ttft, total = call(a.url, {**base, "messages": other})
         print(f"new conversation {n}: prompt {pt} tokens, first token {ttft}s, total {total}s", flush=True)
+    # a burst of other work (short prompts sharing their own prefixes) must not push the long block out
+    with ThreadPoolExecutor(8) as ex:
+        list(ex.map(lambda m: call(a.url, {**base, "max_tokens": 16, "messages": m}), msgs[:a.burst]))
+    other = [{"role": "system", "content": block}, {"role": "user", "content": "Name one organisation mentioned above."}]
+    _, finish, pt, ttft, total = call(a.url, {**base, "messages": other})
+    print(f"after a burst of {a.burst}: new conversation, prompt {pt} tokens, first token {ttft}s, total {total}s", flush=True)
     text, finish, _, _, _ = call(a.url, {**base, "messages": [{"role": "user", "content": "Count from 1 to 20, one number per line."}],
                                          "stop": ["\n7"]})
     print(f"stop ['\\n7']: finish {finish}, ends with {text[-12:]!r}, contains '7': {'7' in text}", flush=True)

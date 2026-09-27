@@ -24,7 +24,7 @@ class ConcurrentEngine:
 
     def __init__(self, model_dir: Path, draft_dir: Path | None, *, concurrency: int = 16, max_rows: int = 6,
                  row_budget: int = 128, prefill_reserve: int = 32, kv_budget_gib: float | None = None,
-                 cache_entries: int = 4, cache_gib: float | None = 6.0, allow_copy: bool = True):
+                 cache_entries: int = 4, cache_gib: float | None = 8.0, allow_copy: bool = True):
         import torch
 
         from .sched import PrefixCache, Scheduler
@@ -42,13 +42,14 @@ class ConcurrentEngine:
             self.draft = DFlash2(draft_dir, self.w)
         torch.cuda.empty_cache()
         self.eos = tuple(self.w.config.eos)
-        # cached states (shared prompt prefixes, and agent conversations to resume) hold their attention rows:
-        # ~64 KiB a token, so a 24k-token agent prompt is ~1.5 GiB. 40% of the budget for prefixes, 60% for turns.
+        # cached states hold their attention rows: ~64 KiB a token, so a 24k-token agent prompt is ~1.5 GiB. A
+        # quarter of the budget for shared prefixes, a quarter for agents' system blocks, half for their turns.
         budget = None if cache_gib is None else int(cache_gib * 2**30)
-        shared, turns = (None, None) if budget is None else (budget * 2 // 5, budget - budget * 2 // 5)
+        shared, blocks, turns = (None, None, None) if budget is None else (budget // 4, budget // 4, budget // 2)
         self.sched = Scheduler(self.w, self.draft, concurrency=concurrency, row_budget=row_budget, max_rows=max_rows,
                                allow_copy=allow_copy, prefill_reserve=prefill_reserve,
                                cache=PrefixCache(cache_entries, shared), kv_budget_gib=kv_budget_gib, turn_budget=turns,
+                               block_budget=blocks,
                                log=lambda m: print(f"[tensorfold] {m}", flush=True))
         self.wake = threading.Condition()
         self.thread = threading.Thread(target=self._loop, name="tensorfold-scheduler", daemon=True)
@@ -56,10 +57,18 @@ class ConcurrentEngine:
 
     def _loop(self) -> None:
         self.torch.cuda.set_device(0)
+        released = True
         while True:
             with self.wake:
                 while self.sched.idle():
-                    self.wake.wait()
+                    # 5 s with nothing to do: hand the memory the last burst used back to the machine (the
+                    # allocator keeps freed blocks otherwise; cached states stay, within --cache-gib)
+                    if not released and not self.wake.wait(timeout=5.0) and self.sched.idle():
+                        self.torch.cuda.empty_cache()
+                        released = True
+                    elif released:
+                        self.wake.wait()
+            released = False
             try:
                 self.sched.step()
                 self.sched.failed_steps = 0
