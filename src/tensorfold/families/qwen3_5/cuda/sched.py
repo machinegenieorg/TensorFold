@@ -267,11 +267,14 @@ class Scheduler:
         for (kind, r), it, (r0, r1) in zip(kinds, items, f.spans):
             if r.constraint is None:
                 continue
-            if kind == "decode":
-                r.constraint.mask_tree(it.tokens, it.parents, f.logits[r0:r1])
-            elif id(r) in last_row:
-                lr = last_row[id(r)]
-                r.constraint.mask_first(f.logits[lr:lr + 1])
+            try:
+                if kind == "decode":
+                    r.constraint.mask_tree(it.tokens, it.parents, f.logits[r0:r1])
+                elif id(r) in last_row:
+                    lr = last_row[id(r)]
+                    r.constraint.mask_first(f.logits[lr:lr + 1])
+            except Exception as exc:              # this request's grammar failed: end it alone
+                r.error, r.cancel, r.constraint = f"grammar: {type(exc).__name__}: {exc}", True, None
         greedy_rows = any(r.sampling is None or r.sampling.temperature <= 0 for _, r in kinds)
         picks = f.logits.argmax(dim=-1).cpu().tolist() if greedy_rows and len(want) else None
         stats["verify_s"] += time.perf_counter() - stage
@@ -303,7 +306,10 @@ class Scheduler:
             paths.append(path)
             new = [it.tokens[row] for row in path[1:]] + [terminal]
             if r.constraint is not None:
-                r.constraint.advance(new)
+                try:
+                    r.constraint.advance(new)
+                except Exception as exc:
+                    r.error, r.cancel, r.constraint = f"grammar: {type(exc).__name__}: {exc}", True, None
             r.out.extend(new)
             r.context.extend(new)
             r.rounds += 1
@@ -330,7 +336,10 @@ class Scheduler:
                 lr = last_row[id(r)]
                 first = picks[lr] if greedy else sample_rows(f.logits[lr:lr + 1], [len(r.prompt)], r.sampling)[0]
                 if r.constraint is not None:
-                    r.constraint.advance([first])
+                    try:
+                        r.constraint.advance([first])
+                    except Exception as exc:
+                        r.error, r.cancel, r.constraint = f"grammar: {type(exc).__name__}: {exc}", True, None
                 r.out, r.context = [first], list(r.prompt) + [first]
                 r.copies = CopyIndex() if self.allow_copy and not r.serial else None
                 r.t_first = now

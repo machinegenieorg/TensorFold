@@ -100,7 +100,7 @@ class Constraint:
     def mask_first(self, logits: torch.Tensor) -> None:
         """The first reply token (the prompt's last row)."""
 
-        if not self.active:
+        if not self.active or self.m.is_terminated():
             return
         bitmask = self.xgr.allocate_token_bitmask(1, self.vocab)
         self.m.fill_next_token_bitmask(bitmask, 0)
@@ -117,6 +117,8 @@ class Constraint:
         masked: list[int] = []
 
         def visit(r: int, active: bool) -> None:
+            if active and self.m.is_terminated():
+                return                            # after the stop token: the path ends here, the row is unused
             if active:
                 self.m.fill_next_token_bitmask(bitmask, r)
                 masked.append(r)
@@ -137,6 +139,8 @@ class Constraint:
 
         for t in tokens:
             if self.active:
+                if self.m.is_terminated():
+                    break
                 if not self.m.accept_token(t):
                     raise RuntimeError(f"grammar rejected accepted token {t}")
             elif t == self.think_end:

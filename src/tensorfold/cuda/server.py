@@ -362,7 +362,17 @@ def make_handler(app: App):
 
                 if chat:
                     emit({"role": "assistant"})
-                result = app.run(body, chat, emit)
+                try:
+                    result = app.run(body, chat, emit)
+                except Exception as exc:
+                    try:
+                        self.wfile.write(f"data: {json.dumps({'error': {'message': str(exc), 'type': 'server_error'}})}\n\n"
+                                         "data: [DONE]\n\n".encode())
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    self.close_connection = True
+                    return
                 if result["final"]:
                     emit(result["final"])
                 if result["calls"]:
@@ -382,7 +392,10 @@ def make_handler(app: App):
                     pass
                 self.close_connection = True
                 return
-            result = app.run(body, chat, lambda delta: True)
+            try:
+                result = app.run(body, chat, lambda delta: True)
+            except Exception as exc:              # the request failed (not the connection): say so
+                return self._json(500, {"error": {"message": str(exc), "type": "server_error"}})
             usage = {"prompt_tokens": result["prompt_tokens"], "completion_tokens": result["completion_tokens"],
                      "total_tokens": result["prompt_tokens"] + result["completion_tokens"]}
             if chat:
@@ -413,7 +426,13 @@ def serve(app: App, host: str, port: int) -> None:
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, _terminate)
-    server = ThreadingHTTPServer((host, port), make_handler(app))
+
+    class Server(ThreadingHTTPServer):
+        # the default listen backlog (5) drops simultaneous connections, which clients see as a reset
+        request_queue_size = 256
+        daemon_threads = True
+
+    server = Server((host, port), make_handler(app))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
