@@ -7,7 +7,8 @@ skips its vision tower. MLX's converter drops the checkpoint's MTP head, so draf
 separate repository (``DRAFTER``, model_type ``qwen3_5_mtp``) that ``--drafter auto`` passes in once pulled.
 
 There is no MLX engine for this family (no ``load``), so ``tensorfold serve`` refuses the MLX backend for it.
-``cuda/``: the weight loader and its layout contract with the kernels (``cuda/weights.py``).
+``cuda/``: the weight loader and its layout contract with the kernels (``weights.py``), the forward (``forward.py``),
+prefill and serial decoding (``decode.py``) and the engine ``tensorfold serve`` runs (``engine.py``).
 """
 
 from __future__ import annotations
@@ -26,6 +27,9 @@ DRAFTER_MODEL_TYPE = "qwen3_5_mtp"
 
 # the CUDA engine's kernels read MLX affine weights of this (bits, group size)
 CUDA_QUANTIZATION = (4, 64)
+# the prompt-plus-reply window admitted unless --context says otherwise (smaller when memory is short; an explicit
+# --context is refused rather than shrunk, and --context 0 asks for the model's whole window)
+CONTEXT = 32768
 
 # the text model's shapes the kernels are built for (config.json text_config)
 SHAPE = {"hidden_size": 2048, "num_hidden_layers": 40, "vocab_size": 248320, "num_attention_heads": 16,
@@ -120,14 +124,33 @@ def check_drafter(drafter_dir: str | Path) -> None:
         raise ValueError(f"{drafter_dir} is not {TITLE}'s MTP drafter ({DRAFTER}): it has {', '.join(wrong)}")
 
 
+def requested_context(model_dir: str | Path, context: int | None, explicit: bool) -> int:
+    """The window to admit for ``--context``: ``CONTEXT`` unless it was given (0: the model's whole window). A negative
+    context, or one past the model's window, is refused here, before torch is imported."""
+
+    from tensorfold.families import read_config
+
+    window = int(_text(read_config(model_dir)).get("max_position_embeddings") or 262144)
+    if not explicit or context is None:
+        return min(CONTEXT, window)
+    if int(context) < 0:
+        raise ValueError(f"--context must be 0 (the model's {window}-token window) or a token count, not {context}")
+    if int(context) > window:
+        raise ValueError(f"--context {context} exceeds {TITLE}'s {window}-token window")
+    return int(context)
+
+
 def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
                 master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None,
                 context: int | None = None, **options: Any):
-    """The CUDA engine on one GPU (``tensorfold serve`` on a DGX Spark).
+    """The CUDA engine on one GPU (``tensorfold serve`` on a DGX Spark), set up as the recipe runs it.
 
     Everything here is checked before torch is imported or a GPU is touched: one GPU (``tp=1``), a checkpoint the
-    kernels read (``check``) and, with ``drafter``, the MTP drafter (``check_drafter``). ``mtp_drafts`` > 0 needs the
-    drafter; without it (and with ``no_drafts``) every round decodes one token, the serial reference.
+    kernels read (``check``), the context (``requested_context``: 32,768 tokens by default) and, with ``drafter``, the
+    MTP drafter (``check_drafter``). ``mtp_drafts`` > 0 needs the drafter; without it (and with ``no_drafts``) every
+    round decodes one token, the serial reference. The engine then admits the context against the device's memory
+    (``tensorfold.cuda.capacity``) before it loads anything. ``options``: the CLI's ``context_explicit`` (whether
+    --context was given) and ``parallel`` (--parallel N; requests are still served one at a time).
     """
 
     if int(tp) != 1 or int(rank) != 0:
@@ -140,5 +163,11 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
     elif mtp_drafts and not no_drafts:
         raise ValueError(f"{TITLE}'s MTP drafts come from its drafter ({DRAFTER}): `tensorfold pull {DRAFTER}` once "
                          "(--drafter auto then uses it), or pass --no-drafts for the serial reference")
-    raise NotImplementedError(f"{TITLE}'s CUDA engine is not built yet: this package has its checks, config reader "
-                              "and weight loader (cuda/weights.py); the engine itself (cuda/engine.py) comes next")
+    explicit = bool(options.get("context_explicit", context is not None))
+    requested = requested_context(model_dir, context, explicit)
+    from .cuda.engine import Qwen36Engine
+
+    return Qwen36Engine(Path(model_dir), drafter="" if no_drafts else str(drafter or ""), context=requested,
+                        context_explicit=explicit, no_drafts=bool(no_drafts),
+                        mtp_drafts=None if mtp_drafts is None else int(mtp_drafts),
+                        streams=max(1, int(options.get("parallel") or 1)))
