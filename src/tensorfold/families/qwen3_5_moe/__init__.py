@@ -29,6 +29,7 @@ DRAFTER_MODEL_TYPE = "qwen3_5_mtp"
 CUDA_QUANTIZATION = (4, 64)
 # prompt plus reply tokens the caches hold unless --context says otherwise (0: the model's whole window)
 CONTEXT = 32768
+MAX_DRAFTS = 15           # --mtp-drafts at most (windows of up to 16 rows)
 
 # the text model's shapes the kernels are built for (config.json text_config)
 SHAPE = {"hidden_size": 2048, "num_hidden_layers": 40, "vocab_size": 248320, "num_attention_heads": 16,
@@ -145,8 +146,10 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
 
     Everything here is checked before torch is imported or a GPU is touched: one GPU (``tp=1``), a checkpoint the
     kernels read (``check``), the context (``context_of``: 32,768 tokens by default) and, with ``drafter``, the MTP
-    drafter (``check_drafter``). ``mtp_drafts`` > 0 needs the drafter; without it (and with ``no_drafts``) every round
-    decodes one token, the serial reference. The engine then checks GPU memory before it loads anything.
+    drafter (``check_drafter``). With the drafter a round verifies the pending token and up to ``mtp_drafts`` MTP
+    drafts (6 by default, at most 15; a chain stops before a later draft the head gives less than 50%), over the
+    76,882-token draft vocabulary in ``cuda/draft_vocab.txt``. Without it, with ``no_drafts`` or ``mtp_drafts=0``,
+    every round decodes one token, the serial reference. The engine then checks GPU memory before it loads anything.
     """
 
     if int(tp) != 1 or int(rank) != 0:
@@ -154,6 +157,8 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
     check(model_dir)
     if mtp_drafts is not None and int(mtp_drafts) < 0:
         raise ValueError(f"--mtp-drafts must be 0 or more, not {mtp_drafts}")
+    if mtp_drafts is not None and int(mtp_drafts) > MAX_DRAFTS:
+        raise ValueError(f"--mtp-drafts: at most {MAX_DRAFTS} MTP drafts a round, not {mtp_drafts}")
     if drafter and not no_drafts:
         check_drafter(drafter)
     elif mtp_drafts and not no_drafts:

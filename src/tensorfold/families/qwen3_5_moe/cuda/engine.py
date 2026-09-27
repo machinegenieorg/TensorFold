@@ -1,20 +1,22 @@
 """The Qwen3.6-35B-A3B CUDA engine behind ``tensorfold.cuda.server``: one GPU (one DGX Spark), one stream.
 
-One request decodes at a time. Every round today decodes one token: prefill (``decode.prefill``) then serial steps
-(``decode.serial_decode``), the reference that drafted decoding must match token for token. MTP drafting, from the
-separate drafter repository, comes with decode's drafted loop; until then a drafter passed in is checked and noted,
-and every round still decodes one token.
+One request decodes at a time, MTP-drafted when the drafter is present (``decode.mtp_decode``): a round verifies the
+pending token and up to ``depth`` chained drafts (6; a chain keeps its first draft and ends before a later one the
+head gives less than ``confidence``, 0.5) in one window, and keeps the rows up to the first draft the keyed sampler
+disagrees with. Drafted output is token for token serial decoding's (``decode.serial_decode``). Windows of up to
+``depth + 1`` rows and the head's steps replay CUDA graphs captured at start (``graphs.py``), with eager's bits.
+Without the drafter (or with ``no_drafts``) every round decodes one token.
 
-Memory is checked before anything is loaded (``memory_plan``): the weights (about 18.3 GiB), two sequence states
-(GDN states, conv windows and a key/value cache for ``capacity`` positions each), the kept snapshots and the window
-buffers, against the device's free memory. On a GPU that shares the host's memory (GB10) that is the larger of CUDA's
+Memory is checked before anything is loaded (``memory_plan``): the weights (about 18.3 GiB) and the MTP head with its
+draft head (about 0.54 GiB), two sequence states (GDN states, conv windows and key/value caches for ``capacity``
+positions each, the head's included), the kept snapshots and the window buffers, against the device's free memory. On a GPU that shares the host's memory (GB10) that is the larger of CUDA's
 free memory and the kernel's MemAvailable, which counts page cache the kernel gives back on demand.
 
 Prefix reuse: the engine keeps the state after the last request's prompt and after its reply (``State.snapshot``,
 with their cache rows in place in the one sequence state), and a prompt that extends either resumes from it. Rows
 never depend on their chunk, so a resumed prompt ends in the state and logits of a fresh prefill. A fresh prompt
-starts over. A request with ``draft=False`` decodes from a fresh prefill in a second state and leaves the kept
-states as they are: the serial reference.
+starts over. A request with ``draft=False`` decodes one token a round from a fresh prefill in a second state and
+leaves the kept states as they are: the serial reference.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ RESERVE = 1 << 30          # allocator slack, Triton's workspace, sampling's tem
 SNAPSHOTS = 3              # kept for prefix reuse: the prompt's, the reply's and the one being taken
 STATES = 2                 # the kept sequence and the serial switch's
 WINDOW_ROWS, ATTN_ROWS, LOGIT_ROWS = 32, 64, 32
+MAX_DEPTH = 15             # MTP drafts a round at most (the package's MAX_DRAFTS): windows of up to 16 rows
 _BYTES = {"U32": 4, "I32": 4, "F32": 4, "BF16": 2, "F16": 2}
 
 
@@ -88,7 +91,8 @@ def state_bytes(cfg, capacity: int, mtp_layers: int = 0) -> tuple[int, int]:
     rec = nl * cfg.nv * cfg.dv * cfg.dk * 4
     conv = nl * (cfg.conv_kernel - 1) * cfg.conv_dim * 2
     kv = 2 * (na + mtp_layers) * capacity * cfg.kv_heads * cfg.head_dim * 2
-    return 2 * rec + conv + kv, rec + conv
+    tail = cfg.hidden * 2 if mtp_layers else 0      # the hidden row the head has not absorbed yet
+    return 2 * rec + conv + kv + tail, rec + conv + tail
 
 
 def buffer_bytes(cfg, capacity: int, rows: int, *, window_rows: int = WINDOW_ROWS, attn_rows: int = ATTN_ROWS,
@@ -119,11 +123,49 @@ def buffer_bytes(cfg, capacity: int, rows: int, *, window_rows: int = WINDOW_ROW
     return int(total * 1.05) + (4 << 20)
 
 
+def drafter_bytes(drafter_dir: str | Path, cfg, draft_vocab: str | None = "default") -> tuple[int, int, int]:
+    """(the MTP head in the kernels' layout with its draft head, the load's transient, the draft head's rows) from the
+    drafter's layout and the draft vocabulary: its stored weights, its router table in fp32, the model's head rows at
+    the draft vocabulary's ids. While ``mtp.prepare_mtp`` runs, the loaded drafter and the model's head in MLX's
+    layout (from which the draft head is cut) sit beside it."""
+
+    from .mtp import draft_token_ids
+    from .weights import Config, mtp_layout
+
+    stored = _spec_bytes(mtp_layout(Config.read(drafter_dir)))
+    ids = draft_token_ids(draft_vocab)
+    rows = cfg.vocab if ids is None else int(((ids >= 0) & (ids < cfg.vocab)).sum())
+    row = cfg.hidden // 2 + cfg.hidden // 64 * 4
+    return stored + (cfg.experts + 1) * cfg.hidden * 4 + rows * row, stored + cfg.vocab * row, rows
+
+
+def mtp_buffer_bytes(cfg, capacity: int, rows: int, head_rows: int) -> int:
+    """``mtp.MTPBuffers``: steps of up to ``rows`` rows, only the last row past the cache write."""
+
+    from . import qmm
+
+    d, e, k, width = cfg.hidden, cfg.experts + 1, cfg.top_k + 1, cfg.moe_width
+    qd = cfg.heads * cfg.head_dim
+    total = rows * d * 2 * 6 + rows * (3 * d // 64) * 4 + rows * (sum(cfg.attn_rows) + qd) * 2   # rows, pa, q
+    total += -(-capacity // 512) * cfg.heads * (cfg.head_dim + 2) * 4 + qd * 4 + (2048 + 8) * 4 + d * 8   # one row
+    total += e * 4 + k * 8 + k * width * (2 + 4 / 32) + k * d * 4 + (k + 1) * 2 * 4                     # its MoE
+    total += 4 * qmm.split_scratch(rows, [(d, 2 * d), (sum(cfg.attn_rows), d), (d, qd), (head_rows, d)])
+    total += head_rows * 2
+    return int(total * 1.05) + (1 << 20)
+
+
 def memory_plan(cfg, capacity: int, *, rows: int, states: int = STATES, mtp_layers: int = 0,
-                drafter_bytes: int = 0) -> MemoryPlan:
+                drafter: tuple[int, int, int] | None = None, mtp_rows: int = 64) -> MemoryPlan:
+    """What the engine holds at ``capacity`` positions with ``rows``-row prefill chunks; ``drafter``: what
+    ``drafter_bytes`` gives (the head's cache counts in the states with ``mtp_layers=1``)."""
+
     weights, peak = weight_bytes(cfg)
     one, snap = state_bytes(cfg, capacity, mtp_layers)
-    return MemoryPlan(weights + drafter_bytes, peak, states * one, SNAPSHOTS * snap, buffer_bytes(cfg, capacity, rows))
+    buffers = buffer_bytes(cfg, capacity, rows)
+    head, head_peak, head_rows = drafter or (0, 0, cfg.vocab)
+    if mtp_layers:
+        buffers += mtp_buffer_bytes(cfg, capacity, mtp_rows, head_rows)
+    return MemoryPlan(weights + head, max(peak, head_peak), states * one, SNAPSHOTS * snap, buffers)
 
 
 def _mem_available() -> int | None:
@@ -156,25 +198,29 @@ class Qwen36Engine:
     """``eos`` and ``generate`` as ``tensorfold.cuda.server`` expects, on one GPU.
 
     ``capacity``: prompt plus reply tokens a request may hold (the caches' positions). ``drafter``: the MTP drafter's
-    directory (checked by the package; drafting is not wired yet). ``free_memory``: bytes to plan against instead of
-    reading the device. ``model``: an already prepared ``forward.Model`` (tests), which skips the load.
+    directory; ``mtp_drafts``: most drafts a round (default ``decode.DEPTH``; 0 or ``no_drafts``: one token a round);
+    ``confidence``: the chain's stop (default ``decode.CONFIDENCE``). ``graphs``: decode windows replay CUDA graphs.
+    ``free_memory``: bytes to plan against instead of reading the device. ``model`` and ``mtp``: an already prepared
+    ``forward.Model`` and MTP head (tests), which skip the loads.
     """
 
     def __init__(self, model_dir: str | Path | None, drafter: str = "", *, capacity: int | None = None,
-                 no_drafts: bool = False, mtp_drafts: int | None = None, rows: int | None = None,
-                 prefill_chunk: int | None = None, tp: int = 1, free_memory: int | None = None, model=None,
-                 warm: bool = True) -> None:
+                 no_drafts: bool = False, mtp_drafts: int | None = None, confidence: float | None = None,
+                 rows: int | None = None, prefill_chunk: int | None = None, tp: int = 1,
+                 free_memory: int | None = None, model=None, mtp=None, graphs: bool = True, warm: bool = True) -> None:
         if int(tp) != 1:
             raise ValueError("Qwen3.6-35B-A3B's CUDA engine runs on one GPU: two ranks do not apply")
-        if mtp_drafts is not None and int(mtp_drafts) < 0:
-            raise ValueError(f"MTP drafts a round must be 0 or more, not {mtp_drafts}")
-        if mtp_drafts and not drafter and not no_drafts:
+        if mtp_drafts is not None and not 0 <= int(mtp_drafts) <= MAX_DEPTH:
+            raise ValueError(f"MTP drafts a round: 0 to {MAX_DEPTH}, not {mtp_drafts}")
+        if mtp_drafts and not drafter and mtp is None and not no_drafts:
             raise ValueError("MTP drafts come from the drafter (mlx-community/Qwen3.6-35B-A3B-MTP-4bit): pass its "
                              "directory, or no_drafts")
+        import gc
+
         import torch
 
         from .. import CONTEXT
-        from .decode import PREFILL_ROWS, Decoder
+        from .decode import CONFIDENCE, DEPTH, GRAPH_ROWS, MTP_ROWS, PREFILL_ROWS, Decoder
         from .weights import Config
 
         started = time.perf_counter()
@@ -185,13 +231,17 @@ class Qwen36Engine:
             raise ValueError(f"a context of {self.capacity} tokens: the model reads 1 to {cfg.max_position}")
         rows = int(rows or PREFILL_ROWS)
         self.chunk = prefill_chunk
-        # drafting: decode's drafted loop is not in yet, so every round decodes one token
-        self.drafter = str(drafter) if drafter and not no_drafts and mtp_drafts != 0 else ""
-        self.depth = 0
-        if self.drafter:
-            print("[tensorfold] Qwen3.6-35B-A3B: MTP drafting is not wired into the CUDA engine yet; every round "
-                  "decodes one token (the serial reference)", flush=True)
-        self.plan = memory_plan(cfg, self.capacity, rows=rows)
+        has_head = mtp is not None or bool(drafter)
+        self.depth = 0 if no_drafts or not has_head else DEPTH if mtp_drafts is None else int(mtp_drafts)
+        self.confidence = CONFIDENCE if confidence is None else float(confidence)
+        self.drafter = str(drafter) if self.depth and mtp is None else ""
+        head = None
+        if self.depth and mtp is None:
+            head = drafter_bytes(self.drafter, cfg)
+        elif self.depth:
+            head = (0, 0, mtp.head.n)
+        self.plan = memory_plan(cfg, self.capacity, rows=rows, mtp_layers=1 if self.depth else 0, drafter=head,
+                                mtp_rows=MTP_ROWS)
         if model is not None:                 # already on the GPU
             self.plan.weights = self.plan.load_peak = 0
         free, source = (int(free_memory), "given") if free_memory is not None else device_free_memory()
@@ -206,42 +256,63 @@ class Qwen36Engine:
             w = load(model_dir, "cuda")
             model = prepare(w, release=True)
             del w
-            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+        if self.depth and mtp is None:
+            from .mtp import prepare_mtp
+            from .weights import load_mtp
 
+            mtpw = load_mtp(self.drafter, model.cfg, "cuda")
+            mtp = prepare_mtp(mtpw, model, draft_vocab="default")
+            del mtpw
             gc.collect()
             torch.cuda.empty_cache()
         loaded_s = time.perf_counter() - started
-        self.e = Decoder(model, capacity=self.capacity, rows=rows, window_rows=WINDOW_ROWS, attn_rows=ATTN_ROWS,
-                         logit_rows=LOGIT_ROWS, states=STATES)
+        wide = self.depth + 1
+        self.e = Decoder(model, capacity=self.capacity, rows=rows, window_rows=max(WINDOW_ROWS, wide),
+                         attn_rows=ATTN_ROWS, logit_rows=max(LOGIT_ROWS, wide), states=STATES,
+                         mtp=mtp if self.depth else None, mtp_rows=MTP_ROWS, graphs=graphs,
+                         graph_rows=max(GRAPH_ROWS, wide))
         self.serial = self.e.pool.alloc()             # the serial switch's state; self.e.st keeps the prefixes
         self.cache: list[tuple[list[int], dict]] = []  # (committed ids, State.snapshot of them)
-        warm_s = self._warm() if warm and self.capacity >= 16 else 0.0
-        mode = ("no drafts: the serial reference, one token a round" if not self.drafter else
-                "MTP drafter present, drafting not wired yet: one token a round")
+        captured, warm_s = self._warm() if warm and self.capacity >= 128 else (0, 0.0)
+        if self.depth:
+            mode = (f"1 to {self.depth} MTP drafts a round, a chain stops before a later draft under "
+                    f"{self.confidence:.0%} ({mtp.head.n}-token draft head)")
+        else:
+            mode = "no drafts: the serial reference, one token a round"
+        head_gib = mtp.nbytes() / GiB if self.depth else 0.0
         print(f"[tensorfold] Qwen3.6-35B-A3B on CUDA: {mode}; {self.capacity}-token context; weights "
-              f"{model.nbytes() / GiB:.2f} GiB, {STATES} states {STATES * self.e.pool.nbytes_per_seq() / GiB:.2f} GiB, "
-              f"buffers {self.e.buf.nbytes() / GiB:.2f} GiB ({free / GiB:.1f} GiB was free, {source}); loaded in "
-              f"{loaded_s:.1f}s, kernels warmed in {warm_s:.1f}s", flush=True)
+              f"{model.nbytes() / GiB:.2f} GiB + MTP head {head_gib:.2f} GiB, {STATES} states "
+              f"{STATES * self.e.pool.nbytes_per_seq() / GiB:.2f} GiB ({free / GiB:.1f} GiB was free, {source}); "
+              f"loaded in {loaded_s:.1f}s, {captured} decode graphs captured and kernels warmed in {warm_s:.1f}s",
+              flush=True)
 
     @property
     def eos(self) -> tuple[int, ...]:
         return self.e.eos
 
-    def _warm(self) -> float:
-        """Compile what a request runs before the first one: a prefill chunk, a short window, one-row steps."""
+    def _warm(self) -> tuple[int, float]:
+        """Capture the decode graphs (windows of 1 to depth + 1 rows for the kept state, one-row steps for the serial
+        state, the head's steps) and compile what a request runs eagerly (a prefill chunk, a short window, the head's
+        prompt absorb) before the first request."""
 
         import torch
 
-        from .decode import prefill, serial_decode
-
         t0 = time.perf_counter()
-        n = min(72, self.capacity - 4)
-        prompt = [(97 * i + 13) % self.e.m.cfg.vocab for i in range(n)]
-        first = prefill(self.e, prompt, None, st=self.serial, chunk=min(64, self.e.buf.rows))
-        serial_decode(self.e, first, 3, None, st=self.serial)
+        captured = self.e.warm(self.depth + 1, states=[self.e.st]) + self.e.warm(1, states=[self.serial])
+        prompt = [(97 * i + 13) % self.e.m.cfg.vocab for i in range(72)]
+        chunk, self.chunk = self.chunk, 64
+        try:
+            self.generate(prompt, 12, None, None)               # a 64-row chunk, an 8-row window, decode rounds
+            self.generate(prompt, 3, None, None, draft=False)
+        finally:
+            self.chunk = chunk
+        self.cache = []
+        self.e.st.reset()
         self.serial.reset()
         torch.cuda.synchronize()
-        return time.perf_counter() - t0
+        return captured, time.perf_counter() - t0
 
     # -- prefix reuse ----------------------------------------------------------------------------------------------
     def _resume(self, prompt: Sequence[int]):
@@ -278,22 +349,25 @@ class Qwen36Engine:
 
     def generate(self, prompt: Sequence[int], max_tokens: int, sampling,
                  on_tokens: Callable[[list[int]], bool | None] | None, draft: bool = True) -> dict[str, Any]:
-        """Up to ``max_tokens`` reply tokens after ``prompt``, each passed to ``on_tokens`` as it is sampled (a True
-        return stops the decode); stops after an eos id. ``draft=False``: from a fresh prefill in the serial state,
-        leaving the kept states alone. Returns the request's stats."""
+        """Up to ``max_tokens`` reply tokens after ``prompt``, passed to ``on_tokens`` as each round keeps them (a True
+        return stops the decode); stops after an eos id. MTP-drafted when the engine has the head; ``draft=False``: one
+        token a round from a fresh prefill in the serial state, leaving the kept states alone. Both emit the same
+        tokens. Returns the request's stats."""
 
         import torch
 
-        from .decode import prefill, serial_decode
+        from .decode import mtp_decode, prefill, serial_decode
 
         max_tokens = self._limit(prompt, max_tokens)
         prompt = list(prompt)
+        drafting = draft and self.depth > 0 and self.e.mtp is not None
         hit = self._resume(prompt) if draft else None
         st = self.e.st if draft else self.serial
         t0 = time.perf_counter()
         if draft:
             self._start_from(hit)
-        first = prefill(self.e, prompt, sampling, st=st, chunk=self.chunk, resume=hit[1] if hit else None)
+        first = prefill(self.e, prompt, sampling, st=st, chunk=self.chunk, resume=hit[1] if hit else None,
+                        mtp=drafting)
         if draft:
             self._remember(prompt)
         torch.cuda.synchronize()
@@ -301,13 +375,19 @@ class Qwen36Engine:
         cached = len(hit[0]) if hit else 0
         stats: dict[str, Any] = {"prompt_tokens": len(prompt), "cached": cached, "prefill_s": round(prefill_s, 4),
                                  "prefill_tps": round((len(prompt) - cached) / prefill_s, 1) if prefill_s else 0.0,
-                                 "completion_tokens": 1, "drafts": False}
+                                 "completion_tokens": 1, "drafts": drafting}
         stop = on_tokens is not None and bool(on_tokens([first]))
         if stop or first in self.eos or max_tokens <= 1:
             return stats
-        res = serial_decode(self.e, first, max_tokens, sampling, st=st, stop_eos=True, on_tokens=on_tokens)
-        if draft and len(res.tokens) > 1:       # the reply's state: every token but the last is committed
-            self._remember(prompt + res.tokens[:-1])
+        if drafting:
+            res = mtp_decode(self.e, first, max_tokens, sampling, st=st, depth=self.depth,
+                             confidence=self.confidence, stop_eos=True, on_tokens=on_tokens)
+            stats.update(drafted=res.drafted, accepted=res.accepted, acceptance=round(res.acceptance, 3),
+                         tokens_per_round=round(res.tokens_per_round, 2))
+        else:
+            res = serial_decode(self.e, first, max_tokens, sampling, st=st, stop_eos=True, on_tokens=on_tokens)
+        if draft and res.committed:        # the reply's state: every token but the pending last one is committed
+            self._remember(prompt + res.committed)
         stats.update(completion_tokens=len(res.tokens), decode_s=round(res.seconds, 4), rounds=res.rounds,
                      decode_tps=round(res.tokens_per_second, 2))
         return stats

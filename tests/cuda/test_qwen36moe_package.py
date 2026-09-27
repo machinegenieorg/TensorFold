@@ -88,8 +88,8 @@ import sys
 from tensorfold.families import qwen3_5_moe as family
 family.check({str(folder)!r})
 assert family.eos_ids({str(folder)!r})[0] == 248046
-for kwargs in ({{"tp": 2}}, {{"rank": 1}}, {{"mtp_drafts": 3}}, {{"mtp_drafts": -1}}, {{"context": -1}},
-               {{"context": 300000}}):
+for kwargs in ({{"tp": 2}}, {{"rank": 1}}, {{"mtp_drafts": 3}}, {{"mtp_drafts": -1}}, {{"mtp_drafts": 16}},
+               {{"context": -1}}, {{"context": 300000}}):
     try:
         family.cuda_engine({str(folder)!r}, **kwargs)
     except ValueError:
@@ -142,6 +142,8 @@ def test_cuda_engine_checks_everything_then_builds_the_engine_as_the_recipe_runs
         assert isinstance(engine, _FakeEngine) and engine.model_dir == folder, kwargs
         assert engine.kwargs == want, kwargs
     assert family.CONTEXT == 32768 and family.context_of(folder, None) == 32768
+    with pytest.raises(ValueError, match="at most 15"):
+        family.cuda_engine(folder, drafter=str(drafter), mtp_drafts=16)
     with pytest.raises(ValueError, match="exceeds"):
         family.cuda_engine(folder, context=262145)
 
