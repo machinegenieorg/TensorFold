@@ -89,6 +89,12 @@ def build_parser() -> argparse.ArgumentParser:
                       help="with --tp 2: this machine's rank; rank 0 serves HTTP, rank 1 follows it")
     cuda.add_argument("--master", default="", help="with --tp 2: rank 0's address on the link between the machines")
     cuda.add_argument("--master-port", type=int, default=29551, help="with --tp 2: rank 0's rendezvous port")
+    cuda.add_argument("--concurrency", type=int, default=1,
+                      help="requests served at once on one GPU (Qwen3.8-27B); each stays byte-identical to its serial "
+                           "decode (1: one request at a time)")
+    cuda.add_argument("--kv-budget-gib", type=float, default=None,
+                      help="with --concurrency: admit a request only while every live request's attention rows "
+                           "(prompt + max_tokens) and recurrent state fit this budget")
     serve.set_defaults(func=cmd_serve)
 
     pull = commands.add_parser("pull", help="download models (or draft models) from Hugging Face")
@@ -323,6 +329,10 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path) -> int:
         options["mtp_drafts"] = int(args.mtp_drafts)
     if args.context is not None:
         options["context"] = int(args.context)
+    if args.concurrency > 1:
+        options["concurrency"] = int(args.concurrency)
+        if args.kv_budget_gib is not None:
+            options["kv_budget_gib"] = float(args.kv_budget_gib)
     served = args.name or (args.model.rstrip("/").split("/")[-1] if hub.is_repo_id(args.model) else model_dir.name)
     where = f", rank {args.rank} of 2" if args.tp == 2 else ""
     print(f"[tensorfold] loading {served}: {family.title} ({family.model_type}) on CUDA{where}", flush=True)

@@ -385,5 +385,13 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
                          f"would decode one token. Run `tensorfold pull {DRAFTER}` once (on both machines for "
                          "--tp 2), or pass --no-drafts for the serial reference")
     draft = Path(drafter) if drafter and not no_drafts else None
+    concurrency = int(options.get("concurrency", 1))
+    if concurrency > 1:
+        if tp != 1:
+            raise ValueError("--concurrency runs on one GPU: serve with --tp 1")
+        from .cuda.concurrent import ConcurrentEngine
+
+        return ConcurrentEngine(Path(model_dir), draft, concurrency=concurrency,
+                                kv_budget_gib=options.get("kv_budget_gib"), allow_copy=not no_drafts)
     return Qwen27Engine(Path(model_dir), draft, max_rows=12, tp=tp, rank=rank, master=master, port=master_port,
                         split_head=tp == 2, tp_draft=tp == 2 and draft is not None, allow_copy=not no_drafts)

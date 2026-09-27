@@ -1,6 +1,7 @@
 """OpenAI-compatible server for TensorFold's CUDA engines (DGX Spark and other NVIDIA GPUs).
 
-One request decodes at a time, as one exact stream: drafted output is byte-identical to serial decoding on the
+One request decodes at a time, as one exact stream, unless the engine is concurrent (``concurrent = True``,
+``--concurrency N``): then requests run together and each stays byte-identical to its serial decode on the
 same engine. The chat template is the model's own ``chat_template.jinja``; Qwen tool calls are parsed from the
 reply; with thinking on, text before ``</think>`` streams as ``reasoning_content``.
 
@@ -15,6 +16,7 @@ A family's CUDA engine (``cuda_engine`` in its package) provides:
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import threading
@@ -271,9 +273,15 @@ class App:
             return stopped["client"]
 
         draft = body.get("draft", True) is not False
-        with self.lock:
-            stats = self.engine.generate(prompt, max_tokens, sampling, on_tokens,
-                                         **({} if draft else {"draft": False}))
+        extra: dict[str, Any] = {} if draft else {"draft": False}
+        # structured output (``response_format``): only engines that can enforce it build a constraint
+        make = getattr(self.engine, "make_constraint", None)
+        constraint = make(body, after_think=chat and thinking) if make is not None else None
+        if constraint is not None:
+            extra["constraint"] = constraint
+        # a concurrent engine schedules requests itself; any other engine decodes one request at a time
+        with contextlib.nullcontext() if getattr(self.engine, "concurrent", False) else self.lock:
+            stats = self.engine.generate(prompt, max_tokens, sampling, on_tokens, **extra)
         reasoning, answer = visible(True)
         final: dict[str, Any] = {}
         if len(reasoning) > sent["reasoning"]:

@@ -7,10 +7,14 @@ prefix; the prefix it shares with other requests is cached the first time a requ
 
 Contract: every request's tokens equal its own serial decode. Rows never depend on their batch-mates or chunk
 boundaries, and a resumed prefix equals a fresh prefill.
+
+``Scheduler`` runs online (``submit`` from any thread, ``step`` from one): the server's concurrent engine drives it
+from a background thread. ``run`` serves a fixed list of requests (benchmarks).
 """
 
 from __future__ import annotations
 
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -45,6 +49,11 @@ class Request:
     t_admit: float = 0.0
     t_first: float = 0.0
     t_done: float = 0.0
+    serial: bool = False          # one token a round, no drafts and no copies (the serial reference)
+    cancel: bool = False          # set from another thread: drop the request at the next round
+    emit: object = None           # emit(new_ids) after each round; emit(None) when the request is finished
+    constraint: object = None     # grammar: masks the rows' logits and follows the accepted tokens
+    error: str = ""
 
 
 def _lcp(a: list[int], b: list[int]) -> int:
@@ -79,66 +88,128 @@ class PrefixCache:
             self.entries.pop(0)
 
 
-@torch.no_grad()
-def run(w: Weights, requests: list[Request], draft=None, *, concurrency: int = 8, row_budget: int = 128,
-        max_rows: int = 12, allow_copy: bool = True, stop_eos: bool = True, min_prefix: int = 64,
-        prefill_reserve: int = 32,
-        cache: PrefixCache | None = None) -> dict:
-    """Serve every request, ``concurrency`` at a time. Returns aggregate and per-request timings."""
+class Scheduler:
+    """Continuous batching: ``submit`` requests, call ``step`` until ``idle``. One thread calls ``step``."""
 
-    from .batch_draft import BatchDraft
+    def __init__(self, w: Weights, draft=None, *, concurrency: int = 16, row_budget: int = 128, max_rows: int = 6,
+                 allow_copy: bool = True, stop_eos: bool = True, min_prefix: int = 64, prefill_reserve: int = 32,
+                 cache: PrefixCache | None = None, kv_budget_gib: float | None = None):
+        from .batch_draft import BatchDraft
 
-    dev = w.norm.device
-    bd = BatchDraft(draft, concurrency) if draft is not None else None
-    cache = cache if cache is not None else PrefixCache()
-    waiting = deque(requests)
-    live: list[Request] = []
-    eos = set(w.config.eos)
-    stats = dict(rounds=0, rows=0, decode_rows=0, prefill_rows=0, verify_s=0.0, draft_s=0.0, commit_s=0.0,
-                 cached_tokens=0)
-    t0 = time.perf_counter()
+        self.w, self.draft = w, draft
+        self.bd = BatchDraft(draft, concurrency) if draft is not None else None
+        self.cache = cache if cache is not None else PrefixCache()
+        self.concurrency, self.row_budget, self.max_rows = concurrency, row_budget, max_rows
+        self.allow_copy, self.stop_eos, self.min_prefix, self.prefill_reserve = allow_copy, stop_eos, min_prefix, prefill_reserve
+        self.waiting: deque[Request] = deque()
+        self.live: list[Request] = []
+        self.recent: deque[list[int]] = deque(maxlen=8)      # recent prompts: a shared prefix with them is cached too
+        self.lock = threading.Lock()
+        self.eos = set(w.config.eos)
+        c = w.config
+        # admission budget: attention rows (every full-attention layer's K and V) and recurrent state per request
+        n_att = sum(1 for layer in w.layers if not layer.linear)
+        n_gdn = len(w.layers) - n_att
+        self.kv_row_bytes = n_att * 2 * c.kv_heads * c.head_dim * 2
+        self.state_bytes = n_gdn * (c.v_heads * c.dv * c.dk * 4 + (c.conv_kernel - 1) * (2 * c.k_heads * c.dk + c.v_heads * c.dv) * 2)
+        self.kv_budget = None if kv_budget_gib is None else kv_budget_gib * 2**30
+        self.stats = dict(rounds=0, rows=0, decode_rows=0, prefill_rows=0, verify_s=0.0, draft_s=0.0, commit_s=0.0,
+                          cached_tokens=0)
+        self.t0 = time.perf_counter()
 
-    def admit(r: Request) -> None:
-        r.t_admit = time.perf_counter() - t0
+    # ---- queue ----
+    def submit(self, r: Request) -> None:
+        with self.lock:
+            self.waiting.append(r)
+
+    def idle(self) -> bool:
+        with self.lock:
+            return not self.waiting and not self.live
+
+    def _need(self, r: Request) -> int:
+        return (len(r.prompt) + r.count + 1) * self.kv_row_bytes + self.state_bytes
+
+    def _finish(self, r: Request) -> None:
+        r.done = True
+        r.t_done = time.perf_counter() - self.t0
+        if r in self.live:
+            self.live.remove(r)
+            if self.bd is not None and r.slot >= 0:
+                self.bd.release(r.slot)
+        r.st = None
+        if r.emit is not None:
+            r.emit(None)
+
+    def fail_all(self, message: str) -> None:
+        """An error inside a round: every live and waiting request ends with it."""
+
+        with self.lock:
+            dead = list(self.live) + list(self.waiting)
+            self.waiting.clear()
+        for r in dead:
+            r.error = message
+            self._finish(r)
+
+    def _admit(self, r: Request) -> None:
+        w, bd = self.w, self.bd
+        r.t_admit = time.perf_counter() - self.t0
         r.slot = bd.acquire() if bd is not None else -1
-        hit = cache.best(r.prompt)
+        hit = self.cache.best(r.prompt)
         if hit is not None:
             tokens, st, snap = hit
             r.st, r.pos = private_clone(st), len(tokens)
             if bd is not None:
                 bd.load(r.slot, snap)
-            stats["cached_tokens"] += len(tokens)
+            self.stats["cached_tokens"] += len(tokens)
         else:
             r.st, r.pos = State(w), 0
             if bd is not None:
-                bd.load(r.slot, ([None] * draft.layers, [None] * draft.layers, 0, 0))
+                bd.load(r.slot, ([None] * self.draft.layers, [None] * self.draft.layers, 0, 0))
         reserve_kv(r.st, len(r.prompt) + r.count + 1)
-        # the prefix this prompt shares with a request not yet served: cache it on the way past
-        others = list(waiting)[:4] + [x for x in live if x is not r][:4]
-        share = max([_lcp(r.prompt, o.prompt) for o in others] + [0])
+        # the prefix this prompt shares with a request queued, running or just served: cache it on the way past
+        others = [o.prompt for o in list(self.waiting)[:4]] + [x.prompt for x in self.live if x is not r][:4] + list(self.recent)
+        share = max([_lcp(r.prompt, o) for o in others] + [0])
         share = min(share, len(r.prompt) - 1)
-        r.cache_at = share if share >= min_prefix and share > r.pos else 0
+        r.cache_at = share if share >= self.min_prefix and share > r.pos else 0
+        self.recent.append(r.prompt)
 
-    while waiting or live:
-        while waiting and len(live) < concurrency:
-            r = waiting.popleft()
-            admit(r)
-            live.append(r)
-        decoding = [r for r in live if r.out]
-        prefilling = [r for r in live if not r.out]
+    @torch.no_grad()
+    def step(self) -> bool:
+        """One round. False when there was nothing to do."""
+
+        w, bd, cache, stats, eos, stop_eos = self.w, self.bd, self.cache, self.stats, self.eos, self.stop_eos
+        with self.lock:
+            for r in [r for r in self.waiting if r.cancel]:
+                self.waiting.remove(r)
+                self._finish(r)
+            for r in [r for r in self.live if r.cancel]:
+                self._finish(r)
+            used = sum(self._need(r) for r in self.live)
+            while self.waiting and len(self.live) < self.concurrency:
+                r = self.waiting[0]
+                if self.kv_budget is not None and self.live and used + self._need(r) > self.kv_budget:
+                    break
+                self.waiting.popleft()
+                self._admit(r)
+                self.live.append(r)
+                used += self._need(r)
+        if not self.live:
+            return False
+        decoding = [r for r in self.live if r.out]
+        prefilling = [r for r in self.live if not r.out]
         stage = time.perf_counter()
         # decode windows share the budget, less a reserve for prompt chunks while any request is prefilling
-        budget = row_budget - (min(prefill_reserve, row_budget // 2) if prefilling else 0)
-        per = max(1, min(max_rows, budget // max(1, len(decoding)))) if decoding else 0
+        budget = self.row_budget - (min(self.prefill_reserve, self.row_budget // 2) if prefilling else 0)
+        per = max(1, min(self.max_rows, budget // max(1, len(decoding)))) if decoding else 0
         items, kinds = [], []
-        # decode windows first
         need = []
         proposals = {}
         for n, r in enumerate(decoding):
-            copied = r.copies.propose(r.context, per - 1) if r.copies is not None else []
+            width = 1 if r.serial else per
+            copied = r.copies.propose(r.context, width - 1) if r.copies is not None and width > 1 else []
             if copied:
                 proposals[n] = copied, list(range(-1, len(copied) - 1))
-            elif bd is not None and per > 1:
+            elif bd is not None and width > 1:
                 need.append(n)
             else:
                 proposals[n] = [], []
@@ -146,7 +217,7 @@ def run(w: Weights, requests: list[Request], draft=None, *, concurrency: int = 8
             trees = bd.propose([decoding[n].slot for n in need], [decoding[n].out[-1] for n in need],
                                [len(decoding[n].context) for n in need], per - 1, [decoding[n].sampling for n in need])
             proposals.update(zip(need, trees))
-        left = row_budget
+        left = self.row_budget
         for n, r in enumerate(decoding):
             guesses, parents = proposals[n]
             tokens = [r.out[-1]] + guesses
@@ -177,6 +248,8 @@ def run(w: Weights, requests: list[Request], draft=None, *, concurrency: int = 8
             items.append(Item(chunk, list(range(-1, k - 1)), r.st))
             kinds.append(("prefill", r))
             left -= k
+        if not items:
+            return True
         torch.cuda.synchronize()
         stats["draft_s"] += time.perf_counter() - stage
         stage = time.perf_counter()
@@ -190,13 +263,22 @@ def run(w: Weights, requests: list[Request], draft=None, *, concurrency: int = 8
             at += len(it.tokens)
         f = batch_forward_multi(w, items, capture_taps=bd is not None, logit_rows=want,
                                 committed=[x for x, (kind, _) in enumerate(kinds) if kind == "prefill"])
+        # grammar: each constrained row may only produce tokens its request's grammar allows after that row's path
+        for (kind, r), it, (r0, r1) in zip(kinds, items, f.spans):
+            if r.constraint is None:
+                continue
+            if kind == "decode":
+                r.constraint.mask_tree(it.tokens, it.parents, f.logits[r0:r1])
+            elif id(r) in last_row:
+                lr = last_row[id(r)]
+                r.constraint.mask_first(f.logits[lr:lr + 1])
         greedy_rows = any(r.sampling is None or r.sampling.temperature <= 0 for _, r in kinds)
         picks = f.logits.argmax(dim=-1).cpu().tolist() if greedy_rows and len(want) else None
         stats["verify_s"] += time.perf_counter() - stage
         PROF.flush()
         stage = time.perf_counter()
-        paths = []
-        now = time.perf_counter() - t0
+        paths, emits = [], []
+        now = time.perf_counter() - self.t0
         for (kind, r), it, (r0, r1) in zip(kinds, items, f.spans):
             greedy = r.sampling is None or r.sampling.temperature <= 0
             if kind == "prefill":
@@ -220,12 +302,16 @@ def run(w: Weights, requests: list[Request], draft=None, *, concurrency: int = 8
                 terminal = sampled[child]
             paths.append(path)
             new = [it.tokens[row] for row in path[1:]] + [terminal]
+            if r.constraint is not None:
+                r.constraint.advance(new)
             r.out.extend(new)
             r.context.extend(new)
             r.rounds += 1
             r.accepted += len(path) - 1
             stats["decode_rows"] += len(it.tokens)
-            if len(r.out) >= r.count or (stop_eos and r.out[-1] in eos):
+            emits.append((r, new))
+            if len(r.out) >= r.count or (stop_eos and r.out[-1] in eos) or \
+                    (r.constraint is not None and r.constraint.finished()):
                 r.done, r.t_done = True, now
         take = commit_many(w, items, f, paths)
         if bd is not None:
@@ -243,23 +329,44 @@ def run(w: Weights, requests: list[Request], draft=None, *, concurrency: int = 8
                 greedy = r.sampling is None or r.sampling.temperature <= 0
                 lr = last_row[id(r)]
                 first = picks[lr] if greedy else sample_rows(f.logits[lr:lr + 1], [len(r.prompt)], r.sampling)[0]
+                if r.constraint is not None:
+                    r.constraint.advance([first])
                 r.out, r.context = [first], list(r.prompt) + [first]
-                r.copies = CopyIndex() if allow_copy else None
+                r.copies = CopyIndex() if self.allow_copy and not r.serial else None
                 r.t_first = now
-                if r.count <= 1 or (stop_eos and first in eos):
+                emits.append((r, [first]))
+                if r.count <= 1 or (stop_eos and first in eos) or \
+                        (r.constraint is not None and r.constraint.finished()):
                     r.done, r.t_done = True, now
-        for r in [r for r in live if r.done]:
-            live.remove(r)
-            if bd is not None:
-                bd.release(r.slot)
-            r.st = None
         torch.cuda.synchronize()
+        for r, new in emits:
+            if r.emit is not None:
+                r.emit(new)
+        with self.lock:
+            for r in [r for r in self.live if r.done]:
+                self._finish(r)
         stats["commit_s"] += time.perf_counter() - stage
         stats["rounds"] += 1
         stats["rows"] += sum(len(it.tokens) for it in items)
-    wall = time.perf_counter() - t0
+        return True
+
+
+@torch.no_grad()
+def run(w: Weights, requests: list[Request], draft=None, *, concurrency: int = 8, row_budget: int = 128,
+        max_rows: int = 12, allow_copy: bool = True, stop_eos: bool = True, min_prefix: int = 64,
+        prefill_reserve: int = 32, cache: PrefixCache | None = None) -> dict:
+    """Serve every request, ``concurrency`` at a time. Returns aggregate and per-request timings."""
+
+    sched = Scheduler(w, draft, concurrency=concurrency, row_budget=row_budget, max_rows=max_rows,
+                      allow_copy=allow_copy, stop_eos=stop_eos, min_prefix=min_prefix,
+                      prefill_reserve=prefill_reserve, cache=cache)
+    for r in requests:
+        sched.submit(r)
+    while not sched.idle():
+        sched.step()
+    wall = time.perf_counter() - sched.t0
     gen = sum(len(r.out) - 1 for r in requests)
     return dict(wall_s=wall, generated=gen, agg_tok_s=gen / wall if wall else 0.0,
                 accept_per_round=sum(r.accepted for r in requests) / max(1, sum(r.rounds for r in requests)),
                 ttft_s=[round(r.t_first, 2) for r in requests], done_s=[round(r.t_done, 2) for r in requests],
-                **stats)
+                **sched.stats)
