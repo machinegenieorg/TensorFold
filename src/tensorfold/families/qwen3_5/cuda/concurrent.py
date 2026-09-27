@@ -24,7 +24,8 @@ class ConcurrentEngine:
 
     def __init__(self, model_dir: Path, draft_dir: Path | None, *, concurrency: int = 16, max_rows: int = 6,
                  row_budget: int = 128, prefill_reserve: int = 32, kv_budget_gib: float | None = None,
-                 cache_entries: int = 4, cache_gib: float | None = 8.0, allow_copy: bool = True):
+                 cache_entries: int = 4, cache_gib: float | None = 10.0, followup_gib: float | None = 4.0,
+                 allow_copy: bool = True):
         import torch
 
         from .sched import PrefixCache, Scheduler
@@ -42,14 +43,15 @@ class ConcurrentEngine:
             self.draft = DFlash2(draft_dir, self.w)
         torch.cuda.empty_cache()
         self.eos = tuple(self.w.config.eos)
-        # cached states hold their attention rows: ~64 KiB a token, so a 24k-token agent prompt is ~1.5 GiB. A
-        # quarter of the budget for shared prefixes, a quarter for agents' system blocks, half for their turns.
+        # cached states hold their attention rows (~64 KiB a token) and the drafter's context, so a 24k-token agent
+        # block is ~1.9 GiB. A fifth of the budget for shared prefixes, 3/10 for system blocks (an agent's and the
+        # short ones of batch work side by side), half for agents' turns.
         budget = None if cache_gib is None else int(cache_gib * 2**30)
-        shared, blocks, turns = (None, None, None) if budget is None else (budget // 4, budget // 4, budget // 2)
+        shared, blocks, turns = (None, None, None) if budget is None else (budget // 5, budget * 3 // 10, budget // 2)
         self.sched = Scheduler(self.w, self.draft, concurrency=concurrency, row_budget=row_budget, max_rows=max_rows,
                                allow_copy=allow_copy, prefill_reserve=prefill_reserve,
                                cache=PrefixCache(cache_entries, shared), kv_budget_gib=kv_budget_gib, turn_budget=turns,
-                               block_budget=blocks,
+                               block_budget=blocks, followup_budget=None if followup_gib is None else int(followup_gib * 2**30),
                                log=lambda m: print(f"[tensorfold] {m}", flush=True))
         self.wake = threading.Condition()
         self.thread = threading.Thread(target=self._loop, name="tensorfold-scheduler", daemon=True)
@@ -101,7 +103,7 @@ class ConcurrentEngine:
         return self.grammars.constraint(spec, after_think=after_think)
 
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens: Callable[[list[int]], bool | None],
-                 draft: bool = True, constraint=None, checkpoint: int = 0) -> dict:
+                 draft: bool = True, constraint=None, checkpoint: int = 0, tail: int = 0) -> dict:
         """``draft=False``: one token a round, no drafts and no copies (the serial reference). ``constraint``: a
         grammar the reply must follow (see ``grammar.py``)."""
 
@@ -109,7 +111,7 @@ class ConcurrentEngine:
 
         inbox: queue.SimpleQueue = queue.SimpleQueue()
         r = Request(list(prompt), int(max_tokens), sampling, serial=not draft, emit=inbox.put, constraint=constraint,
-                    checkpoint=int(checkpoint))
+                    checkpoint=int(checkpoint), tail=int(tail))
         t0 = time.perf_counter()
         with self.wake:
             self.sched.submit(r)

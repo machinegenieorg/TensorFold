@@ -57,6 +57,7 @@ class Request:
     error: str = ""
     cached: int = 0               # prompt tokens resumed from a cached state
     checkpoint: int = 0           # end of the prompt's leading system-and-tools block (cache it for the next call)
+    tail: int = 0                 # just inside the end of the last user message (a follow-up may append to it)
     cache_points: list = field(default_factory=list)
 
 
@@ -118,7 +119,8 @@ class Scheduler:
     def __init__(self, w: Weights, draft=None, *, concurrency: int = 16, row_budget: int = 128, max_rows: int = 6,
                  allow_copy: bool = True, stop_eos: bool = True, min_prefix: int = 64, prefill_reserve: int = 32,
                  cache: PrefixCache | None = None, kv_budget_gib: float | None = None, turn_entries: int = 4,
-                 turn_min: int = 8192, turn_budget: int | None = None, block_budget: int | None = None, log=None):
+                 turn_min: int = 8192, turn_budget: int | None = None, block_budget: int | None = None,
+                 followup_entries: int = 24, followup_budget: int | None = None, log=None):
         from .batch_draft import BatchDraft
 
         self.log = log
@@ -133,7 +135,10 @@ class Scheduler:
         self.turns = PrefixCache(turn_entries, turn_budget)
         # the system-and-tools blocks the server marks (``checkpoint``): every new agent conversation starts with
         # one, and bursts of other requests or the agent's own turns must not push it out
-        self.blocks = PrefixCache(2, block_budget)
+        self.blocks = PrefixCache(8, block_budget)
+        # states just inside the end of a prompt's last user message: a follow-up call that appends to that message
+        # (a second pass over the same document, asking only for what the first missed) resumes from here
+        self.followups = PrefixCache(followup_entries, followup_budget)
         self.turn_min = turn_min
         self.last_step = time.perf_counter()
         self.failed_steps = 0
@@ -217,7 +222,7 @@ class Scheduler:
                   + list(self.recent) + list(self.recent_long))
         share = max([_lcp(r.prompt, o) for o in others] + [0])
         share = min(share, len(r.prompt) - 1)
-        points = [p for p in (share, r.checkpoint) if self.min_prefix <= p < len(r.prompt) and p > r.pos]
+        points = [p for p in (share, r.checkpoint, r.tail) if self.min_prefix <= p < len(r.prompt) and p > r.pos]
         r.cache_points = sorted(set(points))
         r.cache_at = r.cache_points[0] if r.cache_points else 0
         self.recent.append(r.prompt)
@@ -228,7 +233,8 @@ class Scheduler:
                      f"live {len(self.live) + 1}, waiting {len(self.waiting)}")
 
     def _best(self, prompt: list[int]):
-        hits = [h for h in (self.cache.best(prompt), self.turns.best(prompt), self.blocks.best(prompt)) if h is not None]
+        hits = [h for h in (self.cache.best(prompt), self.turns.best(prompt), self.blocks.best(prompt),
+                            self.followups.best(prompt)) if h is not None]
         return max(hits, key=lambda h: len(h[0])) if hits else None
 
     @torch.no_grad()
@@ -390,8 +396,8 @@ class Scheduler:
             if r.cache_at and r.pos == r.cache_at:
                 hit = self._best(r.prompt[:r.pos + 1])
                 if hit is None or len(hit[0]) < r.pos:
-                    (self.blocks if r.pos == r.checkpoint else cache).add(
-                        r.prompt[:r.pos], private_clone(r.st), bd.snapshot(r.slot) if bd is not None else None)
+                    where = self.blocks if r.pos == r.checkpoint else self.followups if r.pos == r.tail else cache
+                    where.add(r.prompt[:r.pos], private_clone(r.st), bd.snapshot(r.slot) if bd is not None else None)
                 later = [p for p in r.cache_points if p > r.pos]
                 r.cache_at = later[0] if later else 0
             if r.pos == len(r.prompt) and len(r.prompt) >= self.turn_min:
@@ -435,8 +441,8 @@ class Scheduler:
         return {"live": live, "waiting": waiting, "last_step_age_s": round(time.perf_counter() - self.last_step, 1),
                 "failed_steps": self.failed_steps, "rounds": self.stats["rounds"],
                 "shared_prefixes": len(self.cache.entries), "turn_states": len(self.turns.entries),
-                "system_blocks": len(self.blocks.entries),
-                "cache_gib": round((self.cache.bytes() + self.turns.bytes() + self.blocks.bytes()) / 2**30, 2)}
+                "system_blocks": len(self.blocks.entries), "followups": len(self.followups.entries),
+                "cache_gib": round(sum(c.bytes() for c in (self.cache, self.turns, self.blocks, self.followups)) / 2**30, 2)}
 
 
 @torch.no_grad()

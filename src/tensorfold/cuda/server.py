@@ -288,9 +288,10 @@ class App:
 
         draft = body.get("draft", True) is not False
         extra: dict[str, Any] = {} if draft else {"draft": False}
-        # a concurrent engine checkpoints a long prompt's leading system-and-tools block, so the next conversation
-        # that starts with the same block (an agent's next call) resumes from it
-        if chat and getattr(self.engine, "concurrent", False) and len(prompt) >= 8192:
+        # a concurrent engine checkpoints a prompt's leading system-and-tools block, so the next call that starts
+        # with the same block (an agent's next conversation, the next document under the same instructions) resumes
+        # from it
+        if chat and getattr(self.engine, "concurrent", False) and len(prompt) >= 1024:
             lead = []
             for m in body["messages"]:
                 if m.get("role") not in ("system", "developer"):
@@ -312,6 +313,13 @@ class App:
                         extra["checkpoint"] = same
                 except Exception:
                     pass
+            # and a point just inside the end of the last message (16 tokens back: text appended to it can
+            # tokenise its last few characters differently), for a follow-up call that appends to that message
+            end = self.tok.token_to_id("<|im_end|>")
+            if end is not None and len(prompt) < 8192 and end in prompt:
+                tail = len(prompt) - 1 - prompt[::-1].index(end) - 16
+                if tail >= 1024 and tail - extra.get("checkpoint", 0) >= 256:
+                    extra["tail"] = tail
         # structured output (``response_format``): only engines that can enforce it build a constraint
         make = getattr(self.engine, "make_constraint", None)
         constraint = make(body, after_think=chat and thinking) if make is not None else None
