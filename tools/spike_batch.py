@@ -19,7 +19,7 @@ import torch
 from tokenizers import Tokenizer
 
 from tensorfold.cuda.server import ChatTemplate
-from tensorfold.families.qwen3_5.cuda.batch import Job, batch_decode
+from tensorfold.families.qwen3_5.cuda.batch import PROF, Job, batch_decode
 from tensorfold.families.qwen3_5.cuda.decode import prefill, serial_decode
 from tensorfold.families.qwen3_5.cuda.weights import load
 from tensorfold.hub import resolve
@@ -41,8 +41,17 @@ def main():
     ap.add_argument("--max-rows", type=int, default=12)
     ap.add_argument("--row-budget", type=int, default=128)
     ap.add_argument("--no-draft", action="store_true")
+    ap.add_argument("--serial-draft", action="store_true", help="draft each request on its own (the old path)")
+    ap.add_argument("--no-multi", action="store_true", help="per-request GDN launches and commits (the old path)")
+    ap.add_argument("--variants", default="new", help="comma list of: new (all batched), old (per-request draft, "
+                    "GDN, attention and commit), noattn (new without multi-request attention)")
     ap.add_argument("--out", default="spike-batch.json")
+    ap.add_argument("--profile", action="store_true", help="CUDA-event section times inside the verify forward")
     a = ap.parse_args()
+    VARIANTS = {"new": dict(batch_draft=True, multi=True, multi_attention=True),
+                "old": dict(batch_draft=False, multi=False, multi_attention=False),
+                "noattn": dict(batch_draft=True, multi=True, multi_attention=False)}
+    variants = a.variants.split(",")
 
     model_dir = resolve(a.model, download=False)
     torch.cuda.set_device(0)
@@ -64,19 +73,25 @@ def main():
             st, pending = prefill(w, p, None)
             refs.append(serial_decode(w, st, pending, a.exact_count, None).tokens)
         jobs = [Job(p, a.exact_count) for p in prompts[:a.exact]]
-        batch_decode(w, jobs, draft, row_budget=a.row_budget, max_rows=a.max_rows)
+        batch_decode(w, jobs, draft, row_budget=a.row_budget, max_rows=a.max_rows, **VARIANTS[variants[0]])
         for i, (r, j) in enumerate(zip(refs, jobs)):
             same = r == j.out
             report["exact"].append({"prompt": i, "serial": h(r), "batched": h(j.out), "identical": same, "len": len(r)})
             print(f"exact prompt {i}: serial {h(r)} batched {h(j.out)} -> {'IDENTICAL' if same else 'DIFFERENT'}", flush=True)
 
-    for n in [int(x) for x in a.n.split(",")]:
+    # warm-up: compile every kernel bucket once so the timed runs measure steady state
+    for v in variants:
+        batch_decode(w, [Job(p, 48) for p in prompts[:8]], draft, row_budget=a.row_budget, max_rows=a.max_rows,
+                     **VARIANTS[v])
+    for n, v in [(int(x), v) for x in a.n.split(",") for v in variants]:
         jobs = [Job(p, a.count) for p in prompts[:n]]
-        r = batch_decode(w, jobs, draft, row_budget=a.row_budget, max_rows=a.max_rows)
-        r.update(n=n, tokens_per_job=[len(j.out) - 1 for j in jobs],
+        PROF.on, PROF.totals = a.profile, {}
+        r = batch_decode(w, jobs, draft, row_budget=a.row_budget, max_rows=a.max_rows, **VARIANTS[v])
+        r.update(variant=v, n=n, tokens_per_job=[len(j.out) - 1 for j in jobs],
                  accept_per_round=round(sum(j.accepted for j in jobs) / max(1, sum(j.rounds for j in jobs)), 2),
                  rows_per_round=round(r["rows"] / max(1, r["rounds"]), 1),
-                 e2e_tok_s=round(r["generated"] / (r["prefill_s"] + r["decode_s"]), 1))
+                 e2e_tok_s=round(r["generated"] / (r["prefill_s"] + r["decode_s"]), 1),
+                 gpu_sections_s={k: round(v, 2) for k, v in PROF.totals.items()})
         report["runs"].append(r)
         print(json.dumps({k: (round(v, 2) if isinstance(v, float) else v) for k, v in r.items()}), flush=True)
     json.dump(report, open(a.out, "w"), indent=1)
