@@ -45,6 +45,8 @@ def main():
     ap.add_argument("--row-budget", type=int, default=128)
     ap.add_argument("--prefill-reserve", type=int, default=32)
     ap.add_argument("--profile", action="store_true")
+    ap.add_argument("--sweep", default="", help="comma list of C:max_rows:prefill_reserve; the first is run once "
+                    "untimed as a warm-up")
     ap.add_argument("--repeat", type=int, default=1, help="run each concurrency this many times (the first run "
                     "after start-up is slow: first-shape compiles)")
     ap.add_argument("--out", default="spike-serve.json")
@@ -78,14 +80,22 @@ def main():
     # warm-up: compile every kernel bucket
     run(w, [Request(p, 48) for p in prompts[:8]], draft, concurrency=8, **kw)
     n = min(a.requests, len(prompts))
-    for c in [int(x) for x in a.concurrency.split(",") for _ in range(a.repeat)]:
+    if a.sweep:
+        plan = [tuple(int(v) for v in x.split(":")) for x in a.sweep.split(",")]
+        plan = [(*plan[0], False)] + [(*p, True) for p in plan]
+    else:
+        plan = [(int(x), a.max_rows, a.prefill_reserve, True) for x in a.concurrency.split(",") for _ in range(a.repeat)]
+    for c, mr, res, timed_run in plan:
         reqs = [Request(prompts[i % len(prompts)], a.count) for i in range(n)]
         PROF.on, PROF.totals = a.profile, {}
         DPROF.on, DPROF.totals = a.profile, {}
-        r = run(w, reqs, draft, concurrency=c, **kw)
+        r = run(w, reqs, draft, concurrency=c, row_budget=a.row_budget, max_rows=mr, prefill_reserve=res)
+        if not timed_run:
+            print(json.dumps({"warmup_tok_s": round(r["agg_tok_s"], 1)}), flush=True)
+            continue
         lat = [d - 0 for d in r["done_s"]]
         summary = {k: (round(v, 2) if isinstance(v, float) else v) for k, v in r.items() if k not in ("ttft_s", "done_s")}
-        summary.update(concurrency=c, requests=n, median_ttft_s=statistics.median(r["ttft_s"]),
+        summary.update(concurrency=c, max_rows=mr, prefill_reserve=res, requests=n, median_ttft_s=statistics.median(r["ttft_s"]),
                        median_done_s=statistics.median(lat), gpu_sections_s={k: round(v, 2) for k, v in PROF.totals.items()},
                        draft_sections_s={k: round(v, 2) for k, v in DPROF.totals.items()})
         report["runs"].append({**summary, "ttft_s": r["ttft_s"], "done_s": r["done_s"]})

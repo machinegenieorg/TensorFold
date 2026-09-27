@@ -13,6 +13,7 @@ import torch
 
 from tensorfold.families.qwen3_5.cuda.qmm import bucket
 from tensorfold.families.qwen3_5.cuda.qmm_fast import lane_matmul_tiled, tile
+from tensorfold.families.qwen3_5.cuda.qmm_wide import lane_matmul_wide
 from tensorfold.families.qwen3_5.cuda.weights import QLinear
 
 # (n, k, count per forward): 48 GDN layers + 16 attention layers + 64 MLPs
@@ -64,7 +65,28 @@ def main():
                 best = row
             if (bm, gpi, nw, ns) == (bucket(m), *{16: (4, 4, 2), 32: (2, 4, 2), 64: (1, 4, 2), 128: (1, 4, 3)}[bucket(m)]):
                 default = row
-        out.append({"m": m, "default": default, "best": best})
+        # multi-tile programs: same bits? faster?
+        wide_best = None
+        for tpp, nw, ns in itertools.product((2, 4), (4, 8), (2, 3)):
+            total, same = 0.0, True
+            try:
+                for n, k, cnt in SHAPES:
+                    q = ws[(n, k)]
+                    x = torch.randn((m, k), device="cuda").to(torch.bfloat16)
+                    ref = lane_matmul_tiled(x, q.weight, q.scales, q.biases, q.n, None)
+                    got = lane_matmul_wide(x, q.weight, q.scales, q.biases, q.n, None, tpp=tpp, num_warps=nw, num_stages=ns)
+                    same = same and torch.equal(ref, got)
+                    total += cnt * timed(lambda: lane_matmul_wide(x, q.weight, q.scales, q.biases, q.n, None, tpp=tpp,
+                                                                  num_warps=nw, num_stages=ns), reps=5)
+            except Exception as exc:
+                print("wide", tpp, nw, ns, "failed:", str(exc)[:120], flush=True)
+                continue
+            flops = sum(2 * m * n * k * cnt for n, k, cnt in SHAPES)
+            row = dict(tpp=tpp, warps=nw, stages=ns, ms=round(total, 2), tflops=round(flops / total / 1e9, 1), same_bits=same)
+            print("  wide", json.dumps(row), flush=True)
+            if same and (wide_best is None or total < wide_best["ms"]):
+                wide_best = row
+        out.append({"m": m, "default": default, "best": best, "wide_best": wide_best})
         print(json.dumps(out[-1]), flush=True)
 
 
