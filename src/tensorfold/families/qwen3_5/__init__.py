@@ -392,6 +392,7 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
         from .cuda.concurrent import ConcurrentEngine
 
         return ConcurrentEngine(Path(model_dir), draft, concurrency=concurrency,
-                                kv_budget_gib=options.get("kv_budget_gib"), allow_copy=not no_drafts)
+                                kv_budget_gib=options.get("kv_budget_gib"), cache_gib=options.get("cache_gib", 6.0),
+                                allow_copy=not no_drafts)
     return Qwen27Engine(Path(model_dir), draft, max_rows=12, tp=tp, rank=rank, master=master, port=master_port,
                         split_head=tp == 2, tp_draft=tp == 2 and draft is not None, allow_copy=not no_drafts)

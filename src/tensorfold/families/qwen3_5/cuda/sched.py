@@ -54,6 +54,9 @@ class Request:
     emit: object = None           # emit(new_ids) after each round; emit(None) when the request is finished
     constraint: object = None     # grammar: masks the rows' logits and follows the accepted tokens
     error: str = ""
+    cached: int = 0               # prompt tokens resumed from a cached state
+    checkpoint: int = 0           # end of the prompt's leading system-and-tools block (cache it for the next call)
+    cache_points: list = field(default_factory=list)
 
 
 def _lcp(a: list[int], b: list[int]) -> int:
@@ -64,12 +67,24 @@ def _lcp(a: list[int], b: list[int]) -> int:
     return i
 
 
-class PrefixCache:
-    """Committed states (and drafter contexts) for prompt prefixes, longest match wins."""
+def _nbytes(x) -> int:
+    if isinstance(x, torch.Tensor):
+        return x.numel() * x.element_size()
+    if isinstance(x, (list, tuple)):
+        return sum(_nbytes(y) for y in x)
+    if isinstance(x, State):
+        return _nbytes(x.kv) + _nbytes(x.rec) + _nbytes(x.conv)
+    return 0
 
-    def __init__(self, limit: int = 16):
+
+class PrefixCache:
+    """Committed states (and drafter contexts) for prompt prefixes, longest match wins. Holds at most ``limit``
+    entries and ``budget`` bytes (None: no byte limit), dropping the least recently used first."""
+
+    def __init__(self, limit: int = 16, budget: int | None = None):
         self.entries: list[tuple[list[int], State, object]] = []
-        self.limit = limit
+        self.limit, self.budget = limit, budget
+        self.sizes: dict[int, int] = {}
 
     def best(self, prompt: list[int]):
         hit = None
@@ -82,10 +97,18 @@ class PrefixCache:
             self.entries.append(hit)
         return hit
 
+    def bytes(self) -> int:
+        return sum(self.sizes.values())
+
     def add(self, tokens: list[int], st: State, snap) -> None:
-        self.entries.append((tokens, st, snap))
-        if len(self.entries) > self.limit:
-            self.entries.pop(0)
+        size = _nbytes(st) + _nbytes(snap)
+        if self.budget is not None and size > self.budget:
+            return                                # larger than the whole cache: keep what is there
+        e = (tokens, st, snap)
+        self.entries.append(e)
+        self.sizes[id(e)] = size
+        while len(self.entries) > self.limit or (self.budget is not None and self.bytes() > self.budget):
+            self.sizes.pop(id(self.entries.pop(0)), None)
 
 
 class Scheduler:
@@ -93,17 +116,29 @@ class Scheduler:
 
     def __init__(self, w: Weights, draft=None, *, concurrency: int = 16, row_budget: int = 128, max_rows: int = 6,
                  allow_copy: bool = True, stop_eos: bool = True, min_prefix: int = 64, prefill_reserve: int = 32,
-                 cache: PrefixCache | None = None, kv_budget_gib: float | None = None):
+                 cache: PrefixCache | None = None, kv_budget_gib: float | None = None, turn_entries: int = 4,
+                 turn_min: int = 8192, turn_budget: int | None = None, log=None):
         from .batch_draft import BatchDraft
+
+        self.log = log
 
         self.w, self.draft = w, draft
         self.bd = BatchDraft(draft, concurrency) if draft is not None else None
         self.cache = cache if cache is not None else PrefixCache()
         self.concurrency, self.row_budget, self.max_rows = concurrency, row_budget, max_rows
         self.allow_copy, self.stop_eos, self.min_prefix, self.prefill_reserve = allow_copy, stop_eos, min_prefix, prefill_reserve
+        # states after a long prompt and after its reply: an agent loop sends the growing conversation again
+        # each call, and resumes from these. Kept apart so they cannot evict the shared-prefix entries.
+        self.turns = PrefixCache(turn_entries, turn_budget)
+        self.turn_min = turn_min
+        self.last_step = time.perf_counter()
+        self.failed_steps = 0
         self.waiting: deque[Request] = deque()
         self.live: list[Request] = []
         self.recent: deque[list[int]] = deque(maxlen=8)      # recent prompts: a shared prefix with them is cached too
+        # long prompts (agent calls) are rarer than bursts of short ones: keep their own history, so a new agent call
+        # still finds the system-and-tools prefix it shares with the last one
+        self.recent_long: deque[list[int]] = deque(maxlen=8)
         self.lock = threading.Lock()
         self.eos = set(w.config.eos)
         c = w.config
@@ -154,24 +189,39 @@ class Scheduler:
         w, bd = self.w, self.bd
         r.t_admit = time.perf_counter() - self.t0
         r.slot = bd.acquire() if bd is not None else -1
-        hit = self.cache.best(r.prompt)
+        hit = self._best(r.prompt)
         if hit is not None:
             tokens, st, snap = hit
             r.st, r.pos = private_clone(st), len(tokens)
             if bd is not None:
                 bd.load(r.slot, snap)
             self.stats["cached_tokens"] += len(tokens)
+            r.cached = len(tokens)
         else:
             r.st, r.pos = State(w), 0
             if bd is not None:
                 bd.load(r.slot, ([None] * self.draft.layers, [None] * self.draft.layers, 0, 0))
         reserve_kv(r.st, len(r.prompt) + r.count + 1)
         # the prefix this prompt shares with a request queued, running or just served: cache it on the way past
-        others = [o.prompt for o in list(self.waiting)[:4]] + [x.prompt for x in self.live if x is not r][:4] + list(self.recent)
+        others = ([o.prompt for o in list(self.waiting)[:4]] + [x.prompt for x in self.live if x is not r][:4]
+                  + list(self.recent) + list(self.recent_long))
         share = max([_lcp(r.prompt, o) for o in others] + [0])
         share = min(share, len(r.prompt) - 1)
-        r.cache_at = share if share >= self.min_prefix and share > r.pos else 0
+        points = [p for p in (share, r.checkpoint) if self.min_prefix <= p < len(r.prompt) and p > r.pos]
+        r.cache_points = sorted(set(points))
+        r.cache_at = r.cache_points[0] if r.cache_points else 0
         self.recent.append(r.prompt)
+        if len(r.prompt) >= self.turn_min:
+            self.recent_long.append(r.prompt)
+        if self.log is not None:
+            self.log(f"admit: prompt {len(r.prompt)} tokens, resumed {r.pos}, will cache at {r.cache_points or '-'}, "
+                     f"live {len(self.live) + 1}, waiting {len(self.waiting)}")
+
+    def _best(self, prompt: list[int]):
+        a, b = self.cache.best(prompt), self.turns.best(prompt)
+        if a is None or (b is not None and len(b[0]) > len(a[0])):
+            return b
+        return a
 
     @torch.no_grad()
     def step(self) -> bool:
@@ -228,11 +278,13 @@ class Scheduler:
         # covers more than it has committed; one that shares the prefix another is about to cache waits for it.
         leaders = []
         for r in prefilling:
-            hit = cache.best(r.prompt)
+            hit = self._best(r.prompt)
             if hit is not None and len(hit[0]) > r.pos:
                 tokens, st, snap = hit
-                r.st, r.pos = private_clone(st), len(tokens)
+                r.st, r.pos, r.cached = private_clone(st), len(tokens), len(tokens)
                 reserve_kv(r.st, len(r.prompt) + r.count + 1)
+                later = [p for p in r.cache_points if p > r.pos]
+                r.cache_at = later[0] if later else 0
                 if bd is not None:
                     bd.load(r.slot, snap)
                 stats["cached_tokens"] += len(tokens)
@@ -331,6 +383,10 @@ class Scheduler:
                 hit = cache.best(r.prompt[:r.pos + 1])
                 if hit is None or len(hit[0]) < r.pos:
                     cache.add(r.prompt[:r.pos], private_clone(r.st), bd.snapshot(r.slot) if bd is not None else None)
+                later = [p for p in r.cache_points if p > r.pos]
+                r.cache_at = later[0] if later else 0
+            if r.pos == len(r.prompt) and len(r.prompt) >= self.turn_min:
+                self.turns.add(list(r.prompt), private_clone(r.st), bd.snapshot(r.slot) if bd is not None else None)
             if r.pos == len(r.prompt):
                 greedy = r.sampling is None or r.sampling.temperature <= 0
                 lr = last_row[id(r)]
@@ -353,11 +409,24 @@ class Scheduler:
                 r.emit(new)
         with self.lock:
             for r in [r for r in self.live if r.done]:
+                if not r.cancel and not r.error and r.st is not None and len(r.prompt) >= self.turn_min and len(r.out) > 1:
+                    committed = list(r.prompt) + r.out[:-1]          # the last token is not in the state yet
+                    if r.st.pos == len(committed):
+                        self.turns.add(committed, private_clone(r.st), bd.snapshot(r.slot) if bd is not None else None)
                 self._finish(r)
         stats["commit_s"] += time.perf_counter() - stage
         stats["rounds"] += 1
         stats["rows"] += sum(len(it.tokens) for it in items)
+        self.last_step = time.perf_counter()
         return True
+
+    def health(self) -> dict:
+        with self.lock:
+            live, waiting = len(self.live), len(self.waiting)
+        return {"live": live, "waiting": waiting, "last_step_age_s": round(time.perf_counter() - self.last_step, 1),
+                "failed_steps": self.failed_steps, "rounds": self.stats["rounds"],
+                "shared_prefixes": len(self.cache.entries), "turn_states": len(self.turns.entries),
+                "cache_gib": round((self.cache.bytes() + self.turns.bytes()) / 2**30, 2)}
 
 
 @torch.no_grad()

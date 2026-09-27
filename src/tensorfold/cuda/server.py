@@ -173,7 +173,7 @@ class ChatTemplate:
                          for k, v in cfg.items() if k in ("bos_token", "eos_token", "pad_token", "unk_token")}
 
     def render(self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None,
-               enable_thinking: bool, extra: dict[str, Any] | None = None) -> str:
+               enable_thinking: bool, extra: dict[str, Any] | None = None, generation_prompt: bool = True) -> str:
         for m in messages:                       # tool_call arguments arrive as JSON strings
             for call in m.get("tool_calls") or []:
                 fn = call.get("function") or {}
@@ -182,7 +182,7 @@ class ChatTemplate:
                         fn["arguments"] = json.loads(fn["arguments"])
                     except json.JSONDecodeError:
                         pass
-        kwargs = dict(self.specials, messages=messages, tools=tools or None, add_generation_prompt=True,
+        kwargs = dict(self.specials, messages=messages, tools=tools or None, add_generation_prompt=generation_prompt,
                       enable_thinking=enable_thinking)
         kwargs.update(extra or {})
         return self.template.render(**kwargs)
@@ -244,8 +244,22 @@ class App:
         sampling = self.sampling_for(body, prompt)
         out: list[int] = []
         sent = {"reasoning": 0, "content": 0}
-        stopped = {"client": False}
+        stopped = {"client": False, "stop": False}
         stream = StreamDecoder(self.tok, tuple(self.engine.eos))
+        stops = body.get("stop")
+        stops = [stops] if isinstance(stops, str) else [x for x in (stops or []) if isinstance(x, str) and x]
+        hold = max((len(x) for x in stops), default=1) - 1
+
+        def cut(text: str, finished: bool) -> str:
+            """The answer up to the first stop string; while streaming, hold back what could start one."""
+
+            if not stops:
+                return text
+            at = min((i for i in (text.find(x) for x in stops) if i >= 0), default=-1)
+            if at >= 0:
+                stopped["stop"] = True
+                return text[:at]
+            return text if finished or not hold else text[:max(0, len(text) - hold)]
 
         def visible(finished: bool) -> tuple[str, str]:
             raw = stream.final() if finished else stream.text
@@ -255,7 +269,7 @@ class App:
                 reasoning, answer = "", raw
             if tools:
                 answer = hide_tool_calls(answer, finished=finished)
-            return reasoning, answer
+            return reasoning, cut(answer, finished)
 
         def on_tokens(new: list[int]) -> bool:
             out.extend(new)
@@ -270,10 +284,34 @@ class App:
                 sent["content"] = len(answer)
             if delta and not emit(delta):
                 stopped["client"] = True
-            return stopped["client"]
+            return stopped["client"] or stopped["stop"]
 
         draft = body.get("draft", True) is not False
         extra: dict[str, Any] = {} if draft else {"draft": False}
+        # a concurrent engine checkpoints a long prompt's leading system-and-tools block, so the next conversation
+        # that starts with the same block (an agent's next call) resumes from it
+        if chat and getattr(self.engine, "concurrent", False) and len(prompt) >= 8192:
+            lead = []
+            for m in body["messages"]:
+                if m.get("role") not in ("system", "developer"):
+                    break
+                lead.append(m)
+            if lead or tools:
+                # templates that need a user turn (Qwen's) render the block with a stand-in one; the checkpoint is
+                # where that render and the prompt part ways, just inside the real user turn
+                try:
+                    head = self.tok.encode(self.template.render(lead + [{"role": "user", "content": "."}], tools=tools,
+                                                                enable_thinking=thinking, extra=kwargs,
+                                                                generation_prompt=False), add_special_tokens=False).ids
+                    same = 0
+                    for a, b in zip(head, prompt):
+                        if a != b:
+                            break
+                        same += 1
+                    if 1024 <= same < len(prompt):
+                        extra["checkpoint"] = same
+                except Exception:
+                    pass
         # structured output (``response_format``): only engines that can enforce it build a constraint
         make = getattr(self.engine, "make_constraint", None)
         constraint = make(body, after_think=chat and thinking) if make is not None else None
@@ -290,11 +328,13 @@ class App:
                                                     skip_special_tokens=False), finished=True)[1] \
             if chat and thinking else self.tok.decode([t for t in out if t not in self.engine.eos],
                                                       skip_special_tokens=False)
+        raw_answer = cut(raw_answer, True)
         content, calls = parse_tool_calls(raw_answer, tools) if tools else (answer, None)
         tail = content[sent["content"]:] if content.startswith(answer[:sent["content"]]) else ""
         if tail:
             final["content"] = tail
-        finish = "tool_calls" if calls else ("stop" if out and out[-1] in self.engine.eos else "length")
+        finish = "tool_calls" if calls else ("stop" if stopped["stop"] or (out and out[-1] in self.engine.eos)
+                                             else "length")
         return {"final": final, "calls": calls, "finish": finish, "content": content, "reasoning": reasoning,
                 "prompt_tokens": len(prompt), "completion_tokens": len(out), "stats": stats}
 
@@ -318,7 +358,12 @@ def make_handler(app: App):
             if self.path.rstrip("/") in ("/v1/models", "/models"):
                 self._json(200, {"object": "list", "data": [{"id": app.served, "object": "model", "owned_by": "tensorfold"}]})
             elif self.path.rstrip("/") in ("/health", "/v1/health"):
-                self._json(200, {"ok": True})
+                check = getattr(app.engine, "health", None)
+                if check is None:
+                    self._json(200, {"ok": True})
+                else:                                  # a concurrent engine reports its scheduler, not just the process
+                    ok, detail = check()
+                    self._json(200 if ok else 503, {"ok": ok, **detail})
             else:
                 self._json(404, {"error": "not found"})
 

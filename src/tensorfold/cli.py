@@ -95,6 +95,9 @@ def build_parser() -> argparse.ArgumentParser:
     cuda.add_argument("--kv-budget-gib", type=float, default=None,
                       help="with --concurrency: admit a request only while every live request's attention rows "
                            "(prompt + max_tokens) and recurrent state fit this budget")
+    cuda.add_argument("--cache-gib", type=float, default=6.0,
+                      help="with --concurrency: memory for cached prompt prefixes and agent conversations to resume "
+                           "(~64 KiB a token)")
     serve.set_defaults(func=cmd_serve)
 
     pull = commands.add_parser("pull", help="download models (or draft models) from Hugging Face")
@@ -333,6 +336,7 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path) -> int:
         options["concurrency"] = int(args.concurrency)
         if args.kv_budget_gib is not None:
             options["kv_budget_gib"] = float(args.kv_budget_gib)
+        options["cache_gib"] = float(args.cache_gib)
     served = args.name or (args.model.rstrip("/").split("/")[-1] if hub.is_repo_id(args.model) else model_dir.name)
     where = f", rank {args.rank} of 2" if args.tp == 2 else ""
     print(f"[tensorfold] loading {served}: {family.title} ({family.model_type}) on CUDA{where}", flush=True)

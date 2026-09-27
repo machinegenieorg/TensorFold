@@ -24,7 +24,7 @@ class ConcurrentEngine:
 
     def __init__(self, model_dir: Path, draft_dir: Path | None, *, concurrency: int = 16, max_rows: int = 6,
                  row_budget: int = 128, prefill_reserve: int = 32, kv_budget_gib: float | None = None,
-                 cache_entries: int = 4, allow_copy: bool = True):
+                 cache_entries: int = 4, cache_gib: float | None = 6.0, allow_copy: bool = True):
         import torch
 
         from .sched import PrefixCache, Scheduler
@@ -42,9 +42,14 @@ class ConcurrentEngine:
             self.draft = DFlash2(draft_dir, self.w)
         torch.cuda.empty_cache()
         self.eos = tuple(self.w.config.eos)
+        # cached states (shared prompt prefixes, and agent conversations to resume) hold their attention rows:
+        # ~64 KiB a token, so a 24k-token agent prompt is ~1.5 GiB. 40% of the budget for prefixes, 60% for turns.
+        budget = None if cache_gib is None else int(cache_gib * 2**30)
+        shared, turns = (None, None) if budget is None else (budget * 2 // 5, budget - budget * 2 // 5)
         self.sched = Scheduler(self.w, self.draft, concurrency=concurrency, row_budget=row_budget, max_rows=max_rows,
                                allow_copy=allow_copy, prefill_reserve=prefill_reserve,
-                               cache=PrefixCache(cache_entries), kv_budget_gib=kv_budget_gib)
+                               cache=PrefixCache(cache_entries, shared), kv_budget_gib=kv_budget_gib, turn_budget=turns,
+                               log=lambda m: print(f"[tensorfold] {m}", flush=True))
         self.wake = threading.Condition()
         self.thread = threading.Thread(target=self._loop, name="tensorfold-scheduler", daemon=True)
         self.thread.start()
@@ -57,9 +62,21 @@ class ConcurrentEngine:
                     self.wake.wait()
             try:
                 self.sched.step()
+                self.sched.failed_steps = 0
             except Exception as exc:                  # end every request with the error, keep serving
                 traceback.print_exc()
+                self.sched.failed_steps += 1
                 self.sched.fail_all(f"{type(exc).__name__}: {exc}")
+
+    def health(self) -> tuple[bool, dict]:
+        """Unhealthy when the scheduler thread is gone, rounds keep failing, or work is waiting and no round has
+        finished for 5 minutes (a round is seconds; a stuck engine never finishes one)."""
+
+        h = self.sched.health()
+        h["thread_alive"] = self.thread.is_alive()
+        stuck = (h["live"] or h["waiting"]) and h["last_step_age_s"] > 300
+        ok = h["thread_alive"] and h["failed_steps"] < 3 and not stuck
+        return bool(ok), h
 
     def make_constraint(self, body: dict, *, after_think: bool = False):
         """The grammar a request asks for (``response_format`` json_schema / json_object, vLLM's ``guided_json``
@@ -75,14 +92,15 @@ class ConcurrentEngine:
         return self.grammars.constraint(spec, after_think=after_think)
 
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens: Callable[[list[int]], bool | None],
-                 draft: bool = True, constraint=None) -> dict:
+                 draft: bool = True, constraint=None, checkpoint: int = 0) -> dict:
         """``draft=False``: one token a round, no drafts and no copies (the serial reference). ``constraint``: a
         grammar the reply must follow (see ``grammar.py``)."""
 
         from .sched import Request
 
         inbox: queue.SimpleQueue = queue.SimpleQueue()
-        r = Request(list(prompt), int(max_tokens), sampling, serial=not draft, emit=inbox.put, constraint=constraint)
+        r = Request(list(prompt), int(max_tokens), sampling, serial=not draft, emit=inbox.put, constraint=constraint,
+                    checkpoint=int(checkpoint))
         t0 = time.perf_counter()
         with self.wake:
             self.sched.submit(r)
@@ -97,6 +115,6 @@ class ConcurrentEngine:
         if r.error:
             raise RuntimeError(r.error)
         waited = max(0.0, r.t_admit - (t0 - self.sched.t0))
-        return {"queued_s": round(waited, 3), "first_token_s": round(max(0.0, r.t_first - r.t_admit), 3),
+        return {"cached": r.cached, "queued_s": round(waited, 3), "first_token_s": round(max(0.0, r.t_first - r.t_admit), 3),
                 "decode_s": round(max(0.0, r.t_done - r.t_first), 3), "rounds": r.rounds, "drafts": draft,
                 "accepted": r.accepted}
