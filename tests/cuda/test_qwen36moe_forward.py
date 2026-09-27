@@ -405,3 +405,15 @@ def test_real_greedy_chat_reply_speed_and_memory(real):
     print(f"16-row window vs 16 serial steps: {sum(same)} of 16 rows bit-identical")
     assert all(same)
     assert [int(x) for x in window.argmax(-1).tolist()] == res.tokens[1:17]
+    # prefill throughput on a 2048-token prompt (eager; the second run of each chunk size is timed)
+    long = [t for ids, *_ in real.ref["passages"].values() for t in ids][:2048]
+    rates = []
+    for chunk in (128, 512):
+        for _ in range(2):
+            torch.cuda.synchronize()
+            t0 = time.time()
+            run_prompt(e, long, chunk=chunk)
+            torch.cuda.synchronize()
+            seconds = time.time() - t0
+        rates.append(f"{chunk}-row chunks {len(long) / seconds:.0f} tok/s")
+    print(f"prefill of {len(long)} tokens: " + ", ".join(rates))
