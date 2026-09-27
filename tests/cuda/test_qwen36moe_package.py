@@ -88,11 +88,14 @@ import sys
 from tensorfold.families import qwen3_5_moe as family
 family.check({str(folder)!r})
 assert family.eos_ids({str(folder)!r})[0] == 248046
-for kwargs in ({{"tp": 2}}, {{}}):
+for kwargs in ({{"tp": 2}}, {{"rank": 1}}, {{"mtp_drafts": 3}}, {{"mtp_drafts": -1}}, {{"context": -1}},
+               {{"context": 300000}}):
     try:
         family.cuda_engine({str(folder)!r}, **kwargs)
-    except (ValueError, NotImplementedError):
+    except ValueError:
         pass
+    else:
+        raise AssertionError(kwargs)
 assert "torch" not in sys.modules and "mlx" not in sys.modules, sorted(m for m in sys.modules if m.split(".")[0] in ("torch", "mlx"))
 print("clean")
 """
@@ -108,13 +111,39 @@ def test_cuda_engine_refuses_more_than_one_gpu(tmp_path, kwargs):
         family.cuda_engine(_write(tmp_path / "main", _config()), **kwargs)
 
 
-def test_cuda_engine_checks_everything_then_says_the_engine_is_not_built_yet(tmp_path):
+class _FakeEngine:
+    """Stands in for cuda/engine.py's Qwen36Engine (which imports torch and loads the checkpoint)."""
+
+    def __init__(self, model_dir, **kwargs):
+        self.model_dir, self.kwargs = Path(model_dir), kwargs
+
+
+def test_cuda_engine_checks_everything_then_builds_the_engine_as_the_recipe_runs_it(tmp_path, monkeypatch):
+    """What `tensorfold serve` passes reaches the engine: no flags give the recipe (a 32,768-token context, the
+    drafter when pulled); --context 0 is the model's whole window; --no-drafts drops the drafter."""
+
+    import types
+
+    fake = types.ModuleType("tensorfold.families.qwen3_5_moe.cuda.engine")
+    fake.Qwen36Engine = _FakeEngine
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
     folder = _write(tmp_path / "main", _config())
     drafter = _write(tmp_path / "mtp", _drafter_config(), generation=None)
-    for kwargs in ({}, {"no_drafts": True}, {"drafter": str(drafter)}, {"drafter": str(drafter), "mtp_drafts": 3},
-                   {"mtp_drafts": 0}, {"mtp_drafts": 3, "no_drafts": True}):
-        with pytest.raises(NotImplementedError, match="not built yet"):
-            family.cuda_engine(folder, **kwargs)
+    plain = {"drafter": "", "capacity": 32768, "no_drafts": False, "mtp_drafts": None}
+    for kwargs, want in (({}, plain),
+                         ({"drafter": str(drafter)}, {**plain, "drafter": str(drafter)}),
+                         ({"drafter": str(drafter), "mtp_drafts": 3}, {**plain, "drafter": str(drafter), "mtp_drafts": 3}),
+                         ({"drafter": str(drafter), "no_drafts": True}, {**plain, "no_drafts": True}),
+                         ({"no_drafts": True, "mtp_drafts": 3}, {**plain, "no_drafts": True, "mtp_drafts": 3}),
+                         ({"mtp_drafts": 0}, {**plain, "mtp_drafts": 0}),
+                         ({"context": 0}, {**plain, "capacity": 262144}),
+                         ({"context": 4096, "master_port": 29552}, {**plain, "capacity": 4096})):
+        engine = family.cuda_engine(folder, **kwargs)
+        assert isinstance(engine, _FakeEngine) and engine.model_dir == folder, kwargs
+        assert engine.kwargs == want, kwargs
+    assert family.CONTEXT == 32768 and family.context_of(folder, None) == 32768
+    with pytest.raises(ValueError, match="exceeds"):
+        family.cuda_engine(folder, context=262145)
 
 
 def _bad_quant(**changes) -> dict:
