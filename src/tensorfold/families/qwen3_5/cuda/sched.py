@@ -19,7 +19,7 @@ import torch
 
 from tensorfold.engine.exact_sampling import Sampling
 
-from .batch import PROF, Item, batch_forward_multi, commit_many, private_clone
+from .batch import PROF, Item, batch_forward_multi, commit_many, private_clone, reserve_kv
 from .decode import CopyIndex
 from .forward import State, _paths
 from .sampling import sample_rows
@@ -112,6 +112,7 @@ def run(w: Weights, requests: list[Request], draft=None, *, concurrency: int = 8
             r.st, r.pos = State(w), 0
             if bd is not None:
                 bd.load(r.slot, ([None] * draft.layers, [None] * draft.layers, 0, 0))
+        reserve_kv(r.st, len(r.prompt) + r.count + 1)
         # the prefix this prompt shares with a request not yet served: cache it on the way past
         others = list(waiting)[:4] + [x for x in live if x is not r][:4]
         share = max([_lcp(r.prompt, o.prompt) for o in others] + [0])
@@ -160,6 +161,7 @@ def run(w: Weights, requests: list[Request], draft=None, *, concurrency: int = 8
             if hit is not None and len(hit[0]) > r.pos:
                 tokens, st, snap = hit
                 r.st, r.pos = private_clone(st), len(tokens)
+                reserve_kv(r.st, len(r.prompt) + r.count + 1)
                 if bd is not None:
                     bd.load(r.slot, snap)
                 stats["cached_tokens"] += len(tokens)

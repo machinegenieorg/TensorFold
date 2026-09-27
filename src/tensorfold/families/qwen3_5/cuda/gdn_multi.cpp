@@ -38,7 +38,7 @@ std::vector<at::Tensor> tree_multi(const at::Tensor& q, const at::Tensor& k, con
     auto depths = at::empty_like(parents);
     gdn_preorder_multi_cuda(parents, offsets, chain, order, depths, items);
     auto out = at::empty({q.size(0), v.size(1), v.size(2)}, q.options());
-    auto finals = n_final > 0 ? at::empty({n_final, v.size(1), v.size(2), 128}, g.options()) : at::empty({1}, g.options());
+    auto finals = at::empty({1}, g.options());      // unused: committed chains update their state in place
     gdn_tree_multi_cuda(q, k, v, g, beta, states, parents, offsets, chain, order, depths, out, items, final_idx, finals);
     return {out, finals};
 }
@@ -54,7 +54,7 @@ at::Tensor replay_multi(const at::Tensor& table, const at::Tensor& rows, const a
     TORCH_CHECK(rows.dim() == 2 && rows.size(1) == 128 && counts.numel() == rows.size(0), "rows (requests, 128)");
     c10::cuda::CUDAGuard guard(table.device());
     const int pairs = static_cast<int>(table.size(1));
-    auto out = at::empty({pairs, hv, dv, 128}, table.options().dtype(at::kFloat));
+    auto out = at::empty({1}, table.options().dtype(at::kFloat));      // unused: states are updated in place
     gdn_replay_multi_cuda(table, pairs, rows, counts, out, static_cast<int>(hk), static_cast<int>(hv),
                           static_cast<int>(dv));
     return out;

@@ -22,7 +22,7 @@ from tensorfold.cuda.server import ChatTemplate
 from tensorfold.families.qwen3_5.cuda.batch import PROF
 from tensorfold.families.qwen3_5.cuda.batch_draft import DPROF
 from tensorfold.families.qwen3_5.cuda.decode import prefill, serial_decode
-from tensorfold.families.qwen3_5.cuda.sched import Request, run
+from tensorfold.families.qwen3_5.cuda.sched import PrefixCache, Request, run
 from tensorfold.families.qwen3_5.cuda.weights import load
 from tensorfold.hub import resolve
 
@@ -45,8 +45,8 @@ def main():
     ap.add_argument("--row-budget", type=int, default=128)
     ap.add_argument("--prefill-reserve", type=int, default=32)
     ap.add_argument("--profile", action="store_true")
-    ap.add_argument("--sweep", default="", help="comma list of C:max_rows:prefill_reserve; the first is run once "
-                    "untimed as a warm-up")
+    ap.add_argument("--sweep", default="", help="comma list of C:max_rows:prefill_reserve[:cache_limit]; the first "
+                    "is run once untimed as a warm-up")
     ap.add_argument("--repeat", type=int, default=1, help="run each concurrency this many times (the first run "
                     "after start-up is slow: first-shape compiles)")
     ap.add_argument("--out", default="spike-serve.json")
@@ -82,14 +82,25 @@ def main():
     n = min(a.requests, len(prompts))
     if a.sweep:
         plan = [tuple(int(v) for v in x.split(":")) for x in a.sweep.split(",")]
+        plan = [p if len(p) == 4 else (*p, 16) for p in plan]
         plan = [(*plan[0], False)] + [(*p, True) for p in plan]
     else:
-        plan = [(int(x), a.max_rows, a.prefill_reserve, True) for x in a.concurrency.split(",") for _ in range(a.repeat)]
-    for c, mr, res, timed_run in plan:
+        plan = [(int(x), a.max_rows, a.prefill_reserve, 16, True) for x in a.concurrency.split(",") for _ in range(a.repeat)]
+    torch.cuda.synchronize()
+    base_alloc = torch.cuda.memory_allocated() / 2**30
+    print(json.dumps({"after_load_and_warmup_allocated_gib": round(base_alloc, 2),
+                      "reserved_gib": round(torch.cuda.memory_reserved() / 2**30, 2)}), flush=True)
+    for c, mr, res, limit, timed_run in plan:
         reqs = [Request(prompts[i % len(prompts)], a.count) for i in range(n)]
         PROF.on, PROF.totals = a.profile, {}
         DPROF.on, DPROF.totals = a.profile, {}
-        r = run(w, reqs, draft, concurrency=c, row_budget=a.row_budget, max_rows=mr, prefill_reserve=res)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        r = run(w, reqs, draft, concurrency=c, row_budget=a.row_budget, max_rows=mr, prefill_reserve=res,
+                cache=PrefixCache(limit))
+        r["peak_allocated_gib"] = round(torch.cuda.max_memory_allocated() / 2**30, 2)
+        r["peak_reserved_gib"] = round(torch.cuda.max_memory_reserved() / 2**30, 2)
+        r["cache_limit"] = limit
         if not timed_run:
             print(json.dumps({"warmup_tok_s": round(r["agg_tok_s"], 1)}), flush=True)
             continue

@@ -130,10 +130,11 @@ __global__ void tree_multi_kernel(const __nv_bfloat16* q, const __nv_bfloat16* k
         out = warp_sum(out);
         if (lane == 0) y[value_base] = __float2bfloat16_rn(out);
     }
-    // a chain whose rows are all committed (a prompt chunk): its last state is replay's result, same arithmetic
+    // a chain whose rows are all committed (a prompt chunk): its last state is replay's result (same arithmetic),
+    // written over the request's own state. Each block reads and writes only its own (head, value) slice.
     const int fi = final_idx[item];
     if (is_chain && fi >= 0 && nodes > 0) {
-        float* dst = finals + static_cast<long long>(fi) * hv * dv * 128;
+        float* dst = const_cast<float*>(state0);
 #pragma unroll
         for (int i = 0; i < 4; ++i) dst[state_base + lane * 4 + i] = cur[i];
     }
@@ -151,7 +152,8 @@ __global__ void replay_multi_kernel(const long long* table, int pairs, const int
     const auto* state0 = reinterpret_cast<const float*>(table[4 * pairs + pair]);
     const int job = static_cast<int>(table[5 * pairs + pair]);
     const int* path = rows + job * 128;
-    float* out = state_out + static_cast<long long>(pair) * hv * dv * 128;
+    // in place: each block reads its own (head, value) slice of the state first and writes it back last
+    float* out = const_cast<float*>(state0);
     const int key_head = head / (hv / hk);
     const int state_base = (head * dv + value) * 128;
     float s[4];

@@ -333,11 +333,9 @@ def commit_many(w: Weights, items: Sequence[Item], f: Forward, paths: Sequence[S
     take_d = ints[n * 128 + n + ns:]
     gl = sorted(f.gdn)
     for j, it in enumerate(items):
-        if f.finals[j] >= 0:
-            if list(paths[j]) != list(range(len(it.tokens))):
-                raise ValueError("a committed chain must commit every row")
-            for i in gl:
-                it.st.rec[i] = f.gdn[i][5][f.finals[j]]
+        # a committed chain's states were already updated in place by the tree walk
+        if f.finals[j] >= 0 and list(paths[j]) != list(range(len(it.tokens))):
+            raise ValueError("a committed chain must commit every row")
     replay_jobs = [j for j in range(n) if f.finals[j] < 0]
     if gl and replay_jobs:
         # pair (request j, GDN layer li) -> column index(j) * len(gl) + li; each request's rows start at its span
@@ -352,10 +350,7 @@ def commit_many(w: Weights, items: Sequence[Item], f: Forward, paths: Sequence[S
                              beta.data_ptr() + r0 * beta.stride(0) * beta.element_size(),
                              f.states[i][j], j))
         table = torch.tensor(cols, dtype=torch.int64).t().contiguous().to(dev)
-        states = gdn_multi.replay(table, rows_d, counts_d, c.k_heads, c.v_heads, c.dv).unbind(0)
-        for x, j in enumerate(replay_jobs):
-            for li, i in enumerate(gl):
-                items[j].st.rec[i] = states[x * len(gl) + li]
+        gdn_multi.replay(table, rows_d, counts_d, c.k_heads, c.v_heads, c.dv)
     for i in gl:
         conv = f.gdn[i][4].index_select(0, conv_d).split(keep)
         for j, it in enumerate(items):
@@ -392,7 +387,23 @@ def private_clone(st: State) -> State:
 
     o = clone_state(st)
     o.kv = [None if kv is None else (kv[0][:st.pos].clone(), kv[1][:st.pos].clone()) for kv in st.kv]
+    # own compact copies: commits update recurrent states in place, and a view would pin a whole round's block
+    o.rec = [None if r is None else r.clone() for r in st.rec]
+    o.conv = [None if x is None else x.clone() for x in st.conv]
     return o
+
+
+def reserve_kv(st: State, rows: int) -> None:
+    """Attention buffers of exactly ``rows`` rows (e.g. prompt + output): no doubling growth, no copies later."""
+
+    for i, kv in enumerate(st.kv):
+        if kv is None or kv[0].shape[0] >= rows:
+            continue
+        k, v = kv
+        grown_k, grown_v = k.new_empty((rows, *k.shape[1:])), v.new_empty((rows, *v.shape[1:]))
+        grown_k[:st.pos] = k[:st.pos]
+        grown_v[:st.pos] = v[:st.pos]
+        st.kv[i] = (grown_k, grown_v)
 
 
 @dataclass
