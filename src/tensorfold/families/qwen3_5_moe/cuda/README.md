@@ -31,6 +31,7 @@ with the SiLU gate, dense attention (`sparse=False`) and MLX's groups of 64.
 | | `_attn_gate` | `bf16(o * sigmoid(gate))` with the gate from the second half of each head's q_proj rows, and the 64-sums for `o_proj` | one program per row and head |
 | Flash Next's `attention.py` | `_chunks`, `_tile`, `_merge` | full attention of 16 query heads over 2 KV heads of 256: keys in fixed 512-key chunks by absolute position, eight 64-key tensor-core tiles each, the chunks merged in position order; long windows run in blocks of `attn_rows` rows | a row's chunks hold the same keys alone or in a window; `sparse=False` keeps Flash Next's sparse attention off at any context |
 | `decode.py` | `sample_rows` | the argmax (lowest id on ties), or the top-k plus a margin on the GPU and the keyed draw of `engine/exact_sampling.py` on the host | each row from its own logits and absolute position |
+| `mtp.py` | `_norm_into` | the MTP head's two pre-fc norms (the next token's embedding and the model's hidden row) into the one row its fc reads; the head then runs the same matmul, attention and MoE kernels over its own cache | draft-only: the head proposes and the verify window decides, so it needs no row invariance; it is deterministic, so drafts, and speeds, repeat |
 
 No cuBLAS, `torch.matmul` or `F.linear` on the verify path: their algorithms depend on the row count.
 
@@ -44,11 +45,18 @@ No cuBLAS, `torch.matmul` or `F.linear` on the verify path: their algorithms dep
 - `forward.py` regroups the loaded weights for the kernels (`prepare`), runs a window of rows per sequence
   (`forward`, `forward_many`) and keeps a prefix (`commit`); `State` is one sequence's committed caches, from a
   `Pool`, with `snapshot` and `restore`.
-- `decode.py` has `prefill` (512-row chunks), `serial_decode` and `score` (teacher-forced NLL).
-- `engine.py` is what `tensorfold serve` runs: the memory check before loading, prefix reuse from the last prompt
-  and reply, and the serial switch (`"draft": false`).
+- `mtp.py` runs the drafter's MTP head through the family's kernels: the fc over the normed embedding and hidden
+  row, one attention layer over the head's own cache, the 257-expert MoE, and a draft head cut from the model's head
+  at the 76,882 token ids in `draft_vocab.txt`.
+- `decode.py` has `prefill` (512-row chunks; with the head, it absorbs the prompt), `serial_decode` (the
+  reference), `mtp_decode` (a round verifies the pending token and a chain of MTP drafts in one window) and `score`
+  (teacher-forced NLL).
+- `graphs.py` captures a CUDA graph per decode window of up to 8 rows (per GDN buffer parity and state slot) and per
+  MTP step, replayed with eager's bits.
+- `engine.py` is what `tensorfold serve` runs: the memory check before loading, the head and graphs set up, MTP
+  drafting, prefix reuse from the last prompt and reply, and the serial switch (`"draft": false`).
 - `reference.py` is a plain fp32 PyTorch forward (with optional bf16 roundings) for the quality tests.
 
 The tests are in `tests/cuda/test_qwen36moe_*.py`: row invariance of every kernel, windows against serial
-steps, commit and resume against serial state, the forward against the fp32 reference, and the engine behind
-the server. The package and loader tests need no GPU. Measured numbers: [the recipe](../../../../../docs/recipes/qwen3.6-35b-a3b.md).
+steps, commit and resume against serial state, the forward and the MTP head against the fp32 reference, drafted
+against serial decoding, graphs against eager, and the engine behind the server. The package and loader tests need no GPU. Measured numbers: [the recipe](../../../../../docs/recipes/qwen3.6-35b-a3b.md).
