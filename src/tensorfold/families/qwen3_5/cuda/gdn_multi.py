@@ -20,13 +20,15 @@ def _ext():
     from torch.utils.cpp_extension import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_gdn_multi_v1", sources=[str(here / "gdn_multi.cpp"), str(here / "gdn_multi.cu")],
+    return load(name="tensorfold_gdn_multi_v3", sources=[str(here / "gdn_multi.cpp"), str(here / "gdn_multi.cu")],
                 extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
 
 
 def tree(q, k, v, g, beta, states: torch.Tensor, parents: torch.Tensor, offsets: torch.Tensor,
-         chain: torch.Tensor) -> torch.Tensor:
-    return _ext().tree_multi(q, k, v, g, beta, states, parents, offsets, chain)
+         chain: torch.Tensor, final_idx: torch.Tensor, n_final: int):
+    """(outputs, finals): finals[final_idx[j]] is chain j's last state when final_idx[j] >= 0."""
+
+    return _ext().tree_multi(q, k, v, g, beta, states, parents, offsets, chain, final_idx, n_final)
 
 
 def replay(table: torch.Tensor, rows: torch.Tensor, counts: torch.Tensor, hk: int, hv: int, dv: int) -> torch.Tensor:

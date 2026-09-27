@@ -56,7 +56,8 @@ __global__ void preorder_multi_kernel(const int* parents, const int* offsets, co
 __global__ void tree_multi_kernel(const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
                                   const float* g, const float* beta, const long long* states,
                                   const int* parents, const int* offsets, const int* chain,
-                                  const int* order, const int* depths, __nv_bfloat16* y, int hk, int hv, int dv) {
+                                  const int* order, const int* depths, __nv_bfloat16* y, int hk, int hv, int dv,
+                                  const int* final_idx, float* finals) {
     const int value = blockIdx.x, head = blockIdx.y, item = blockIdx.z, lane = threadIdx.x;
     const int r0 = offsets[item], nodes = offsets[item + 1] - r0;
     const bool is_chain = chain[item] != 0;
@@ -66,35 +67,75 @@ __global__ void tree_multi_kernel(const __nv_bfloat16* q, const __nv_bfloat16* k
     float initial[4], slots[32][4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) initial[i] = state0[state_base + lane * 4 + i];
-    for (int step_index = 0; step_index < nodes; ++step_index) {
-        const int node = is_chain ? step_index : order[r0 + step_index];
-        const int parent = parents[r0 + node];
-        const int depth = is_chain ? 0 : depths[r0 + node];
-        const int source = is_chain ? 0 : depth - 1;
-        const int destination = is_chain ? 0 : depth;
-        const int row = r0 + node;
+    // Node j + 1's inputs are loaded while node j computes (the walk is latency-bound); the arithmetic is
+    // unchanged. A chain keeps its state in registers.
+    float nq[4], nk[4], nv = 0.0f, ng = 0.0f, nb = 0.0f;
+    int nnode = 0;
+    auto fetch = [&](int step_index) {
+        nnode = is_chain ? step_index : order[r0 + step_index];
+        const int row = r0 + nnode;
         const int key_base = (row * hk + key_head) * 128 + lane * 4;
-        const int value_base = (row * hv + head) * dv + value;
-        const float decay = g[row * hv + head];
-        const float step = beta[row * hv + head];
-        float s[4], qi[4], ki[4], mem = 0.0f;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            s[i] = (parent < 0 ? initial[i] : slots[source][i]) * decay;
-            qi[i] = __bfloat162float(q[key_base + i]);
-            ki[i] = __bfloat162float(k[key_base + i]);
-            mem += s[i] * ki[i];
+            nq[i] = __bfloat162float(q[key_base + i]);
+            nk[i] = __bfloat162float(k[key_base + i]);
         }
-        const float delta = (__bfloat162float(v[value_base]) - warp_sum(mem)) * step;
+        nv = __bfloat162float(v[(row * hv + head) * dv + value]);
+        ng = g[row * hv + head];
+        nb = beta[row * hv + head];
+    };
+    if (nodes > 0) fetch(0);
+    float cur[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) cur[i] = initial[i];
+    for (int step_index = 0; step_index < nodes; ++step_index) {
+        const int node = nnode;
+        float qi[4], ki[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { qi[i] = nq[i]; ki[i] = nk[i]; }
+        const float vv = nv, decay = ng, step = nb;
+        if (step_index + 1 < nodes) fetch(step_index + 1);
+        const int value_base = ((r0 + node) * hv + head) * dv + value;
+        float s[4], mem = 0.0f;
+        if (is_chain) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                s[i] = cur[i] * decay;
+                mem += s[i] * ki[i];
+            }
+        } else {
+            const int parent = parents[r0 + node];
+            const int source = depths[r0 + node] - 1;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                s[i] = (parent < 0 ? initial[i] : slots[source][i]) * decay;
+                mem += s[i] * ki[i];
+            }
+        }
+        const float delta = (vv - warp_sum(mem)) * step;
         float out = 0.0f;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             s[i] += ki[i] * delta;
             out += s[i] * qi[i];
-            slots[destination][i] = s[i];
+        }
+        if (is_chain) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) cur[i] = s[i];
+        } else {
+            const int destination = depths[r0 + node];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) slots[destination][i] = s[i];
         }
         out = warp_sum(out);
         if (lane == 0) y[value_base] = __float2bfloat16_rn(out);
+    }
+    // a chain whose rows are all committed (a prompt chunk): its last state is replay's result, same arithmetic
+    const int fi = final_idx[item];
+    if (is_chain && fi >= 0 && nodes > 0) {
+        float* dst = finals + static_cast<long long>(fi) * hv * dv * 128;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) dst[state_base + lane * 4 + i] = cur[i];
     }
 }
 
@@ -116,19 +157,31 @@ __global__ void replay_multi_kernel(const long long* table, int pairs, const int
     float s[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) s[i] = state0[state_base + lane * 4 + i];
-    for (int j = 0; j < counts[job]; ++j) {
+    const int count = counts[job];
+    float nk[4], nv = 0.0f, ng = 0.0f, nb = 0.0f;
+    auto fetch = [&](int j) {
         const int node = path[j];
         const int key_base = (node * hk + key_head) * 128 + lane * 4;
-        const int value_base = (node * hv + head) * dv + value;
-        const float decay = g[node * hv + head];
-        float ki[4], mem = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) nk[i] = __bfloat162float(k[key_base + i]);
+        nv = __bfloat162float(v[(node * hv + head) * dv + value]);
+        ng = g[node * hv + head];
+        nb = beta[node * hv + head];
+    };
+    if (count > 0) fetch(0);
+    for (int j = 0; j < count; ++j) {
+        float ki[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) ki[i] = nk[i];
+        const float vv = nv, decay = ng, bb = nb;
+        if (j + 1 < count) fetch(j + 1);
+        float mem = 0.0f;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             s[i] *= decay;
-            ki[i] = __bfloat162float(k[key_base + i]);
             mem += s[i] * ki[i];
         }
-        const float delta = (__bfloat162float(v[value_base]) - warp_sum(mem)) * beta[node * hv + head];
+        const float delta = (vv - warp_sum(mem)) * bb;
 #pragma unroll
         for (int i = 0; i < 4; ++i) s[i] += ki[i] * delta;
     }
@@ -150,7 +203,8 @@ void gdn_preorder_multi_cuda(const at::Tensor& parents, const at::Tensor& offset
 void gdn_tree_multi_cuda(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& g,
                          const at::Tensor& beta, const at::Tensor& states, const at::Tensor& parents,
                          const at::Tensor& offsets, const at::Tensor& chain, const at::Tensor& order,
-                         const at::Tensor& depths, at::Tensor& out, int items) {
+                         const at::Tensor& depths, at::Tensor& out, int items, const at::Tensor& final_idx,
+                         at::Tensor& finals) {
     auto stream = at::cuda::getCurrentCUDAStream();
     const dim3 grid(v.size(2), v.size(1), items);
     tree_multi_kernel<<<grid, 32, 0, stream>>>(
@@ -160,7 +214,8 @@ void gdn_tree_multi_cuda(const at::Tensor& q, const at::Tensor& k, const at::Ten
         g.data_ptr<float>(), beta.data_ptr<float>(), reinterpret_cast<const long long*>(states.data_ptr<int64_t>()),
         parents.data_ptr<int>(), offsets.data_ptr<int>(), chain.data_ptr<int>(), order.data_ptr<int>(),
         depths.data_ptr<int>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
-        static_cast<int>(q.size(1)), static_cast<int>(v.size(1)), static_cast<int>(v.size(2)));
+        static_cast<int>(q.size(1)), static_cast<int>(v.size(1)), static_cast<int>(v.size(2)),
+        final_idx.data_ptr<int>(), finals.data_ptr<float>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

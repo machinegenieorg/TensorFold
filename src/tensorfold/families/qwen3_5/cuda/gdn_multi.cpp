@@ -4,7 +4,8 @@
 void gdn_preorder_multi_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&, int);
 void gdn_tree_multi_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                          const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
-                         const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int);
+                         const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int,
+                         const at::Tensor&, at::Tensor&);
 void gdn_replay_multi_cuda(const at::Tensor&, int, const at::Tensor&, const at::Tensor&, at::Tensor&, int, int, int);
 
 static void check_int(const at::Tensor& t, const at::Tensor& like, const char* what) {
@@ -14,9 +15,11 @@ static void check_int(const at::Tensor& t, const at::Tensor& like, const char* w
 // q, k (R, hk, 128) bf16; v (R, hv, dv) bf16; g, beta (R, hv) fp32: every request's rows back to back.
 // states: (items,) int64 device pointers to each request's (hv, dv, 128) fp32 state; parents (R,) item-local;
 // offsets (items + 1,) row starts; chain (items,) 1 if that request's rows are a chain.
-at::Tensor tree_multi(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& g,
-                      const at::Tensor& beta, const at::Tensor& states, const at::Tensor& parents,
-                      const at::Tensor& offsets, const at::Tensor& chain) {
+// final_idx (items,): >= 0 for a chain whose every row is committed; its last state goes to finals[final_idx].
+std::vector<at::Tensor> tree_multi(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& g,
+                                   const at::Tensor& beta, const at::Tensor& states, const at::Tensor& parents,
+                                   const at::Tensor& offsets, const at::Tensor& chain, const at::Tensor& final_idx,
+                                   int64_t n_final) {
     TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous() && g.is_contiguous() && beta.is_contiguous(),
                 "GDN inputs must be contiguous");
     TORCH_CHECK(q.scalar_type() == at::kBFloat16 && k.scalar_type() == at::kBFloat16 && v.scalar_type() == at::kBFloat16 &&
@@ -27,6 +30,7 @@ at::Tensor tree_multi(const at::Tensor& q, const at::Tensor& k, const at::Tensor
     check_int(parents, q, "parents: int32");
     check_int(offsets, q, "offsets: int32");
     check_int(chain, q, "chain: int32");
+    check_int(final_idx, q, "final_idx: int32");
     const int items = static_cast<int>(chain.numel());
     TORCH_CHECK(states.numel() == items && offsets.numel() == items + 1 && parents.numel() == q.size(0), "one entry per item");
     c10::cuda::CUDAGuard guard(q.device());
@@ -34,8 +38,9 @@ at::Tensor tree_multi(const at::Tensor& q, const at::Tensor& k, const at::Tensor
     auto depths = at::empty_like(parents);
     gdn_preorder_multi_cuda(parents, offsets, chain, order, depths, items);
     auto out = at::empty({q.size(0), v.size(1), v.size(2)}, q.options());
-    gdn_tree_multi_cuda(q, k, v, g, beta, states, parents, offsets, chain, order, depths, out, items);
-    return out;
+    auto finals = n_final > 0 ? at::empty({n_final, v.size(1), v.size(2), 128}, g.options()) : at::empty({1}, g.options());
+    gdn_tree_multi_cuda(q, k, v, g, beta, states, parents, offsets, chain, order, depths, out, items, final_idx, finals);
+    return {out, finals};
 }
 
 // table (6, pairs) int64 on the device: k, v, g, beta, state pointers and the request index of each

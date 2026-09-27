@@ -20,6 +20,7 @@ from tokenizers import Tokenizer
 
 from tensorfold.cuda.server import ChatTemplate
 from tensorfold.families.qwen3_5.cuda.batch import PROF, Job, batch_decode
+from tensorfold.families.qwen3_5.cuda.batch_draft import DPROF
 from tensorfold.families.qwen3_5.cuda.decode import prefill, serial_decode
 from tensorfold.families.qwen3_5.cuda.weights import load
 from tensorfold.hub import resolve
@@ -86,12 +87,14 @@ def main():
     for n, v in [(int(x), v) for x in a.n.split(",") for v in variants]:
         jobs = [Job(p, a.count) for p in prompts[:n]]
         PROF.on, PROF.totals = a.profile, {}
+        DPROF.on, DPROF.totals = a.profile, {}
         r = batch_decode(w, jobs, draft, row_budget=a.row_budget, max_rows=a.max_rows, **VARIANTS[v])
         r.update(variant=v, n=n, tokens_per_job=[len(j.out) - 1 for j in jobs],
                  accept_per_round=round(sum(j.accepted for j in jobs) / max(1, sum(j.rounds for j in jobs)), 2),
                  rows_per_round=round(r["rows"] / max(1, r["rounds"]), 1),
                  e2e_tok_s=round(r["generated"] / (r["prefill_s"] + r["decode_s"]), 1),
-                 gpu_sections_s={k: round(v, 2) for k, v in PROF.totals.items()})
+                 gpu_sections_s={k: round(v, 2) for k, v in PROF.totals.items()},
+                 draft_sections_s={k: round(v, 2) for k, v in DPROF.totals.items()})
         report["runs"].append(r)
         print(json.dumps({k: (round(v, 2) if isinstance(v, float) else v) for k, v in r.items()}), flush=True)
     json.dump(report, open(a.out, "w"), indent=1)

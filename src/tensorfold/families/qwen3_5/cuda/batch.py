@@ -176,11 +176,13 @@ class Forward:
     att: dict            # layer -> (key, value)
     states: list          # host (layers, items) int64 recurrent-state pointers
     keep: int
+    finals: list          # per item: index into a GDN layer's finals, or -1
 
 
 @torch.no_grad()
 def batch_forward_multi(w: Weights, items: Sequence[Item], *, capture_taps: bool = False,
-                        multi_attention: bool = True) -> Forward:
+                        multi_attention: bool = True, logit_rows: Sequence[int] | None = None,
+                        committed: Sequence[int] = ()) -> Forward:
     """``batch_forward`` with every request's GDN pre and tree in one launch each (gdn_multi), and every
     request's tree attention in one launch per kernel (attention_multi)."""
 
@@ -209,13 +211,19 @@ def batch_forward_multi(w: Weights, items: Sequence[Item], *, capture_taps: bool
         pos += [it.st.pos + d for d in depths]
         chains.append(int(chain))
         offsets.append(spans[j][1])
-    ints = torch.tensor(parents + wins + pos + offsets + chains, dtype=torch.int32).to(dev)
+    # ``committed``: items (chains) whose every row will be committed; their last GDN states come from the tree walk
+    fin = [-1] * n
+    for f_i, j in enumerate(j for j in committed if chains[j]):
+        fin[j] = f_i
+    n_final = sum(1 for x in fin if x >= 0)
+    ints = torch.tensor(parents + wins + pos + offsets + chains + fin, dtype=torch.int32).to(dev)
     parents_d = ints[:rows]
     wins_d = ints[rows:rows + rows * (keep + 1)].view(rows, keep + 1)
     at = rows * (keep + 2)
     pos_d = ints[at:at + rows]
     offsets_d = ints[at + rows:at + rows + n + 1]
-    chain_d = ints[at + rows + n + 1:]
+    chain_d = ints[at + rows + n + 1:at + rows + 2 * n + 1]
+    fin_d = ints[at + rows + 2 * n + 1:]
     states = [[it.st.rec[i].data_ptr() if layer.linear else 0 for it in items] for i, layer in enumerate(w.layers)]
     states_d = torch.tensor(states, dtype=torch.int64).to(dev)
     att_layers = [i for i, layer in enumerate(w.layers) if not layer.linear]
@@ -248,8 +256,8 @@ def batch_forward_multi(w: Weights, items: Sequence[Item], *, capture_taps: bool
             src = torch.cat([it.st.conv[i] for it in items] + [qkv])
             q, k, v, g, beta = gdn_multi.pre(src, gdn.conv, wins_d, a, b, gdn.A_log, gdn.dt_bias,
                                              kh=c.k_heads, vh=c.v_heads, dk=c.dk, nkeep=keep)
-            yr = gdn_multi.tree(q, k, v, g, beta, states_d[i], parents_d, offsets_d, chain_d)
-            gdn_out[i] = (k, v, g, beta, src)
+            yr, finals = gdn_multi.tree(q, k, v, g, beta, states_d[i], parents_d, offsets_d, chain_d, fin_d, n_final)
+            gdn_out[i] = (k, v, g, beta, src, finals)
             PROF.mark("dense")
             out, out_xs = glue.gated_norm(yr, z, gdn.norm, c.eps)
             r = _mm(out, gdn.out, out_xs)
@@ -289,9 +297,14 @@ def batch_forward_multi(w: Weights, items: Sequence[Item], *, capture_taps: bool
             taps.append((x.float() + pending.float()).to(torch.bfloat16))
     PROF.mark("head")
     _, h, xs = glue.add_rmsnorm(x, pending, w.norm, c.eps)
-    logits = _mm(h, w.head, xs)
+    if logit_rows is not None:
+        # only the rows whose next token is needed (rows are independent, so the same bits)
+        pick = torch.tensor(list(logit_rows), dtype=torch.int64).to(dev)
+        h, xs = h.index_select(0, pick), xs.index_select(0, pick)
+    logits = _mm(h, w.head, xs) if h.shape[0] else h.new_empty((0, 0))
     PROF.mark("end")
-    return Forward(logits, spans, torch.cat(taps, dim=-1) if capture_taps else None, gdn_out, att_out, states, keep)
+    return Forward(logits, spans, torch.cat(taps, dim=-1) if capture_taps else None, gdn_out, att_out, states, keep,
+                   fin)
 
 
 @torch.no_grad()
@@ -319,12 +332,20 @@ def commit_many(w: Weights, items: Sequence[Item], f: Forward, paths: Sequence[S
     conv_d = ints[n * 128 + n:n * 128 + n + ns]
     take_d = ints[n * 128 + n + ns:]
     gl = sorted(f.gdn)
-    if gl:
-        # pair (request j, GDN layer li) -> column j * len(gl) + li; each request's rows start at its span
-        cols = []
-        for j, (r0, _) in enumerate(f.spans):
+    for j, it in enumerate(items):
+        if f.finals[j] >= 0:
+            if list(paths[j]) != list(range(len(it.tokens))):
+                raise ValueError("a committed chain must commit every row")
             for i in gl:
-                k, v, g, beta, _ = f.gdn[i]
+                it.st.rec[i] = f.gdn[i][5][f.finals[j]]
+    replay_jobs = [j for j in range(n) if f.finals[j] < 0]
+    if gl and replay_jobs:
+        # pair (request j, GDN layer li) -> column index(j) * len(gl) + li; each request's rows start at its span
+        cols = []
+        for j in replay_jobs:
+            r0 = f.spans[j][0]
+            for i in gl:
+                k, v, g, beta = f.gdn[i][:4]
                 cols.append((k.data_ptr() + r0 * k.stride(0) * k.element_size(),
                              v.data_ptr() + r0 * v.stride(0) * v.element_size(),
                              g.data_ptr() + r0 * g.stride(0) * g.element_size(),
@@ -332,11 +353,13 @@ def commit_many(w: Weights, items: Sequence[Item], f: Forward, paths: Sequence[S
                              f.states[i][j], j))
         table = torch.tensor(cols, dtype=torch.int64).t().contiguous().to(dev)
         states = gdn_multi.replay(table, rows_d, counts_d, c.k_heads, c.v_heads, c.dv).unbind(0)
-        for li, i in enumerate(gl):
-            conv = f.gdn[i][4].index_select(0, conv_d).split(keep)
-            for j, it in enumerate(items):
-                it.st.rec[i] = states[j * len(gl) + li]
-                it.st.conv[i] = conv[j]
+        for x, j in enumerate(replay_jobs):
+            for li, i in enumerate(gl):
+                items[j].st.rec[i] = states[x * len(gl) + li]
+    for i in gl:
+        conv = f.gdn[i][4].index_select(0, conv_d).split(keep)
+        for j, it in enumerate(items):
+            it.st.conv[i] = conv[j]
     al = sorted(f.att)
     if al:
         keys = torch.stack([f.att[i][0] for i in al]).index_select(1, take_d)

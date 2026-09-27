@@ -21,6 +21,30 @@ from .qmm import group_sums
 from .qmm_fast import matmul
 
 
+class _Prof:
+    """CUDA-event sections of one propose/add_taps call (``DPROF.on``), summed into ``totals``."""
+
+    def __init__(self):
+        self.on, self.marks, self.totals = False, [], {}
+
+    def mark(self, name):
+        if self.on:
+            e = torch.cuda.Event(enable_timing=True)
+            e.record()
+            self.marks.append((name, e))
+
+    def flush(self):
+        if not self.marks:
+            return
+        torch.cuda.synchronize()
+        for (name, a), (_, b) in zip(self.marks, self.marks[1:]):
+            self.totals[name] = self.totals.get(name, 0.0) + a.elapsed_time(b) / 1000
+        self.marks = []
+
+
+DPROF = _Prof()
+
+
 @triton.jit
 def _dconv_seg_kernel(X, DYN, BASE, RES, OUT, SEG, D: tl.constexpr, G: tl.constexpr, GS: tl.constexpr,
                       BRANCH: tl.constexpr, HAS_RES: tl.constexpr, BLOCK: tl.constexpr):
@@ -122,6 +146,7 @@ class BatchDraft:
             x = taps
         for s, n in zip(slots, counts):
             self._room(s, n + d.block)
+        DPROF.mark("t_fc")
         projected = _norm(d._lin(x, "fc.weight"), d.weights["hidden_norm.weight"], d.eps)
         dev = d.device
         pos = torch.cat([torch.arange(self.end[s], self.end[s] + n, device=dev) for s, n in zip(slots, counts)])
@@ -129,10 +154,13 @@ class BatchDraft:
         cos, sin = phase.cos().contiguous(), phase.sin().contiguous()
         bi = torch.tensor([s for s, n in zip(slots, counts) for _ in range(n)], device=dev)
         ti = torch.cat([torch.arange(self.ptr[s], self.ptr[s] + n, device=dev) for s, n in zip(slots, counts)])
+        DPROF.mark("t_kv")
         for layer in range(d.layers):
             _, k, v = d._prep(d._lin(projected, f"layers.{layer}.self_attn.kv.weight"), layer, cos, sin, 0)
             self.kc[layer][bi, :, ti] = k.transpose(0, 1)
             self.vc[layer][bi, :, ti] = v.transpose(0, 1)
+        DPROF.mark("t_end")
+        DPROF.flush()
         for s, n in zip(slots, counts):
             self.ptr[s] += n
             self.ctx[s] = min(d.window, self.ctx[s] + n)
@@ -147,6 +175,7 @@ class BatchDraft:
         d = self.d
         dev = d.device
         b = len(slots)
+        DPROF.mark("d_setup")
         length = min(d.block, max_nodes + 1)
         for s in slots:
             self._room(s, length)
@@ -176,6 +205,7 @@ class BatchDraft:
         seg = length
         w = d.weights
         for i in range(d.layers):
+            DPROF.mark("d_proj")
             base = f"layers.{i}."
             normed = F.rms_norm(x, (d.hidden,), w[base + "input_layernorm.weight"], d.eps)
             dyn = d._lin(normed, base + "attention_conv.kernel_projection.weight")
@@ -184,6 +214,7 @@ class BatchDraft:
                               i, cos, sin, d.heads_local)
             self.kc[i][bi, :, ti] = k.transpose(0, 1)
             self.vc[i][bi, :, ti] = v.transpose(0, 1)
+            DPROF.mark("d_attn")
             # grouped attention without expanding the keys: the G query heads of a key head share one matmul
             qg = q.view(kv, G, b, length, d.head_dim).permute(2, 0, 1, 3, 4).reshape(b, kv, G * length, d.head_dim)
             keys, values = self.kc[i][sl], self.vc[i][sl]
@@ -192,6 +223,7 @@ class BatchDraft:
             out = torch.matmul(p, values).view(b, kv, G, length, d.head_dim)
             out = out.permute(0, 3, 1, 2, 4).reshape(b * length, d.heads_local * d.head_dim)
             x = _dconv(self._chunked(out, base + "self_attn.o_proj.weight"), dyn, conv, 1, d.group_size, seg, x)
+            DPROF.mark("d_mlp")
             normed = F.rms_norm(x, (d.hidden,), w[base + "post_attention_layernorm.weight"], d.eps)
             dyn = d._lin(normed, base + "mlp_conv.kernel_projection.weight")
             conv = w[base + "mlp_conv.base_kernel"]
@@ -199,13 +231,16 @@ class BatchDraft:
             act, act_xs = self._mlp(h, base)
             mlp = self._chunked(act, base + "mlp.down_proj.weight", act_xs)
             x = _dconv(mlp, dyn, conv, 1, d.group_size, seg, x)
+        DPROF.mark("d_head")
         h = x.view(b, length, d.hidden)[:, 1:].reshape(b * (length - 1), d.hidden)
         h = F.rms_norm(h, (d.hidden,), w["norm.weight"], d.eps)
         projected = d._lin(h, "candidate_selector.hidden_projection.weight").float()
         logits = torch.cat([matmul(h[r:r + 128].contiguous(), d.sub_head) for r in range(0, h.shape[0], 128)])
         values, local_ids = torch.topk(logits.float(), k=16, dim=-1, sorted=False)
         ids = d.head_ids[local_ids]
+        DPROF.mark("d_copy")
         ids, unary, hproj = (t.cpu().numpy() for t in (ids, values, projected))
+        DPROF.mark("d_tree")
         ids = ids.astype("int64").reshape(b, length - 1, 16)
         unary = unary.astype("float64").reshape(b, length - 1, 16)
         hproj = hproj.astype("float64").reshape(b, length - 1, -1)
@@ -214,6 +249,8 @@ class BatchDraft:
             out.append(_best_first(ids[j], unary[j], hproj[j], w["candidate_selector.predecessor_codebook"],
                                    w["candidate_selector.successor_codebook"], int(pending[j]), min(127, max_nodes),
                                    samplings[j], context_lengths[j]))
+        DPROF.mark("d_end")
+        DPROF.flush()
         return out
 
     def _mlp(self, h: torch.Tensor, base: str):
