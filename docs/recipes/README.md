@@ -7,6 +7,7 @@ Each family page describes its supported checkpoint, kernels and operating limit
 | Nemotron 3.5 Lightning | [MLX](nemotron-3.5.md) |
 | Qwen3.8-27B | [MLX, quantization and CUDA](qwen3.8-27b.md) |
 | Qwen3.8 Flash Next | [MLX prefill and CUDA](qwen3.8-flash-next.md) |
+| Qwen3.6-35B-A3B | [One-GPU CUDA](qwen3.6-35b-a3b.md) |
 | GLM-5.3-Flash | [Two-rank CUDA](glm-5.3-flash.md) |
 
 Contributor guides cover [adding an MLX family](adding-a-family.md),
