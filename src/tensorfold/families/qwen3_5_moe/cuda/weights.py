@@ -6,8 +6,8 @@ tensors. The layout contract with the kernels:
 - A projection is a ``QW``: MLX's arrays as stored. ``words`` [..., N, K*bits/32] int32 (the checkpoint's uint32
   bits: torch's uint32 supports few ops), ``scales`` and ``biases`` bf16 [..., N, K/64]. Input k of row n is the
   ``bits``-wide field ``k % (32/bits)`` of word ``k // (32/bits)``, lowest bits first, and its value is
-  scale * q + bias with group ``k // 64``'s scale and bias. ``QW.triple()`` is what glm5_next's ``make_q4`` and
-  ``make_experts`` take.
+  scale * q + bias with group ``k // 64``'s scale and bias. ``QW.triple()`` is what ``qwen3_5_moe.cuda.qmm``'s
+  ``make_q4``, ``make_experts`` and ``embed`` take (``forward.prepare`` regroups the model through them).
 - Projections that read the same input are stacked by rows, packing unchanged: Gated DeltaNet
   [in_proj_qkv | in_proj_z | in_proj_b | in_proj_a] and attention [q_proj | k_proj | v_proj] (row counts in
   ``Config.gdn_rows`` and ``Config.attn_rows``; ``QW.split`` gives each part as a view). in_proj_qkv's rows are
