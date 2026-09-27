@@ -75,7 +75,8 @@ def main():
         r = batch_decode(w, jobs, draft, row_budget=a.row_budget, max_rows=a.max_rows)
         r.update(n=n, tokens_per_job=[len(j.out) - 1 for j in jobs],
                  accept_per_round=round(sum(j.accepted for j in jobs) / max(1, sum(j.rounds for j in jobs)), 2),
-                 rows_per_round=round(r["rows"] / max(1, r["rounds"]), 1))
+                 rows_per_round=round(r["rows"] / max(1, r["rounds"]), 1),
+                 e2e_tok_s=round(r["generated"] / (r["prefill_s"] + r["decode_s"]), 1))
         report["runs"].append(r)
         print(json.dumps({k: (round(v, 2) if isinstance(v, float) else v) for k, v in r.items()}), flush=True)
     json.dump(report, open(a.out, "w"), indent=1)

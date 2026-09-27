@@ -21,7 +21,7 @@ from tensorfold.engine.exact_sampling import Sampling
 
 from . import gdn_tree, glue
 from .decode import CopyIndex, _tokens, clone_state, prefill
-from .forward import AttentionRecord, GDNRecord, State, _conv_windows, _mm, _paths, commit
+from .forward import AttentionRecord, GDNRecord, State, _conv_windows, _mm, _paths, commit, tree_forward
 from .sampling import sample_rows
 from .weights import Weights
 
@@ -123,6 +123,15 @@ def batch_forward(w: Weights, items: Sequence[Item], *, capture_taps: bool = Fal
     return [(logits[r0:r1], records[j], tap[r0:r1] if tap is not None else None) for j, (r0, r1) in enumerate(spans)]
 
 
+def private_clone(st: State) -> State:
+    """A clone whose attention buffers are its own: clones share KV buffers and a commit writes rows past
+    ``pos`` in place, so jobs resumed from one shared prefix would overwrite each other's rows."""
+
+    o = clone_state(st)
+    o.kv = [None if kv is None else (kv[0][:st.pos].clone(), kv[1][:st.pos].clone()) for kv in st.kv]
+    return o
+
+
 @dataclass
 class Job:
     prompt: list[int]
@@ -140,15 +149,39 @@ class Job:
 
 @torch.no_grad()
 def batch_decode(w: Weights, jobs: list[Job], draft=None, *, row_budget: int = 128, max_rows: int = 12,
-                 allow_copy: bool = True, stop_eos: bool = True) -> dict:
+                 allow_copy: bool = True, stop_eos: bool = True, share_prefix: bool = True) -> dict:
     """Prefill every job, then decode them together: each round every active job proposes a window
     (copies from its context, else a DFlash2 tree), all windows share one forward, each job commits its path."""
 
     t0 = time.perf_counter()
+    empty = ([None] * draft.layers, [None] * draft.layers, 0, 0) if draft is not None else None
+    # Shared prefix (e.g. one system prompt): commit it once and resume every job from it. ``prefill`` with a state
+    # processes only the rest, and rows never depend on their chain-mates, so this equals a fresh prefill.
+    base, base_snap, shared = None, empty, 0
+    if share_prefix and len(jobs) > 1:
+        first = jobs[0].prompt
+        shared = min(len(j.prompt) for j in jobs) - 1
+        for j in jobs[1:]:
+            shared = min(shared, next((i for i, (a, b) in enumerate(zip(first, j.prompt)) if a != b), shared))
+        if shared >= 64:
+            if draft is not None:
+                draft.restore(empty)
+            base = State(w)
+            for start in range(0, shared, 128):
+                chunk = first[start:min(start + 128, shared)]
+                logits, record, *tapped = tree_forward(w, _tokens(chunk, w.norm.device),
+                                                       list(range(-1, len(chunk) - 1)), base,
+                                                       capture_taps=draft is not None)
+                if draft is not None:
+                    draft.add_taps(tapped[0])
+                commit(base, record, list(range(len(chunk))))
+            base_snap = draft.snapshot() if draft is not None else None
+        else:
+            shared = 0
     for j in jobs:
         if draft is not None:
-            draft.restore(([None] * draft.layers, [None] * draft.layers, 0, 0))
-        j.st, pending = prefill(w, j.prompt, j.sampling, draft)
+            draft.restore(base_snap)
+        j.st, pending = prefill(w, j.prompt, j.sampling, draft, state=private_clone(base) if base is not None else None)
         j.snap = draft.snapshot() if draft is not None else None
         j.out = [pending]
         j.context = list(j.prompt) + [pending]
@@ -216,5 +249,5 @@ def batch_decode(w: Weights, jobs: list[Job], draft=None, *, row_budget: int = 1
         stats["rounds"] += 1
     decode_s = time.perf_counter() - t1
     gen = sum(len(j.out) - 1 for j in jobs)
-    return dict(prefill_s=prefill_s, decode_s=decode_s, generated=gen, agg_tok_s=gen / decode_s if decode_s else 0.0,
+    return dict(prefill_s=prefill_s, shared_prefix=shared, decode_s=decode_s, generated=gen, agg_tok_s=gen / decode_s if decode_s else 0.0,
                 **stats)
