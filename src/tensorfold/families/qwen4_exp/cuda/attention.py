@@ -13,6 +13,9 @@ row (fp32: the sum over the indexer heads of relu(q . k) over sqrt(d)); ``select
 best score exactly (a threshold search over order-preserving keys) and lists the blocks above it, then the
 lowest-numbered blocks equal to it, in block order, 4 keys each, then the tail. The attention kernels then
 read that list in fixed 512-entry chunks. A dense row keeps the dense path's arithmetic.
+
+A dense model (``AttnScratch(..., sparse=False)``: Qwen3.6, 16 query heads over 2 KV heads) never turns QSA on:
+every row reads all its keys at any capacity, and it has no indexer to select with.
 """
 
 from __future__ import annotations
@@ -106,16 +109,17 @@ def _merge(PO, PM, PL, POS0, OUT, NKR, SPR, H: tl.constexpr, HK: tl.constexpr, D
 
 class AttnScratch:
     def __init__(self, rows: int, heads: int, head_dim: int, capacity: int, device, *, budget: int = 2048,
-                 ratio: int = 4) -> None:
+                 ratio: int = 4, sparse: bool = True) -> None:
         self.nch = -(-capacity // CHUNK)
         self.po = torch.zeros((rows, self.nch, heads, head_dim), dtype=torch.float32, device=device)
         self.pm = torch.zeros((rows, self.nch, heads), dtype=torch.float32, device=device)
         self.pl = torch.zeros((rows, self.nch, heads), dtype=torch.float32, device=device)
         self.out = torch.empty((rows, heads, head_dim), dtype=torch.bfloat16, device=device)
-        # sparse attention (QSA): each row's key list, its length, whether it is sparse, block scores
+        # sparse attention (QSA): each row's key list, its length, whether it is sparse, block scores. Only a
+        # model with an indexer (sparse=True, Flash Next) turns it on, once the cache can pass the budget.
         self.budget, self.ratio = budget, ratio
         self.idw = budget + ratio
-        self.qsa = capacity > budget
+        self.qsa = sparse and capacity > budget
         self.nb = -(-capacity // ratio)
         self.ids = torch.zeros((rows, self.idw), dtype=torch.int32, device=device)
         self.nk = torch.zeros((rows,), dtype=torch.int32, device=device)
