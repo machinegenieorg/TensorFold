@@ -210,6 +210,8 @@ class Pool:
         self.kc = torch.zeros((seqs, na + mtp_layers, capacity, c.kv_heads, c.head_dim), dtype=torch.bfloat16,
                               device=dev)
         self.vc = torch.zeros_like(self.kc)
+        # with a draft head: each sequence's last hidden row the head has not absorbed yet (``mtp.py``)
+        self.tail = torch.zeros((seqs, c.hidden), dtype=torch.bfloat16, device=dev) if mtp_layers else None
         self.free = list(range(seqs - 1, -1, -1))
 
     def alloc(self) -> "State":
@@ -236,7 +238,11 @@ class Pool:
 
 
 class State:
-    """One sequence's committed caches: views of its pool slot, its length ``pos`` and GDN buffer parity ``cur``."""
+    """One sequence's committed caches: views of its pool slot, its length ``pos`` and GDN buffer parity ``cur``.
+
+    With a draft head (``Pool(mtp_layers=1)``) it also carries the head's bookkeeping (``mtp.py``): ``mtp_len``, the
+    positions the head's cache has absorbed, and ``mtp_tail``, the hidden row of position ``mtp_tail_at`` (-1: none)
+    that the head absorbs once the next token is known."""
 
     def __init__(self, pool: Pool, slot: int) -> None:
         self.pool, self.slot = pool, slot
@@ -248,8 +254,11 @@ class State:
         n_att = self.kc.shape[0] - pool.mtp_layers
         self.mtp_kc = self.kc[n_att:]         # the draft head's caches (empty without one)
         self.mtp_vc = self.vc[n_att:]
+        self.mtp_tail = pool.tail[slot] if pool.tail is not None else None
         self.cur = 0
         self.pos = 0
+        self.mtp_len = 0
+        self.mtp_tail_at = -1
 
     def reset(self) -> None:
         """An empty sequence (cache rows need no clearing: only rows below ``pos`` are ever read)."""
@@ -258,6 +267,8 @@ class State:
         self.rec[0].zero_()
         self.conv.zero_()
         self.pos = 0
+        self.mtp_len = 0
+        self.mtp_tail_at = -1
 
     def copy_(self, src: "State") -> None:
         """Copy ``src``'s committed sequence: its current GDN states, conv windows, and cache rows below its length."""
@@ -272,12 +283,20 @@ class State:
             self.kc[:, :p].copy_(src.kc[:, :p])
             self.vc[:, :p].copy_(src.vc[:, :p])
         self.pos = p
+        self.mtp_len, self.mtp_tail_at = min(src.mtp_len, p), src.mtp_tail_at
+        if self.mtp_tail is not None and src.mtp_tail is not None:
+            self.mtp_tail.copy_(src.mtp_tail)
+        else:
+            self.mtp_tail_at = -1
 
     def snapshot(self) -> dict:
-        """What the sequence keeps outside its cache rows (GDN states, conv windows, length): with the rows below
-        ``pos`` still in place, ``restore`` brings the sequence back (about 64 MB for 30 GDN layers)."""
+        """What the sequence keeps outside its cache rows (GDN states, conv windows, length, the draft head's
+        bookkeeping): with the rows below ``pos`` still in place, ``restore`` brings the sequence back (about 64 MB
+        for 30 GDN layers)."""
 
-        return {"pos": self.pos, "rec": self.rec[self.cur].clone(), "conv": self.conv.clone()}
+        tail = self.mtp_tail.clone() if self.mtp_tail is not None else None
+        return {"pos": self.pos, "rec": self.rec[self.cur].clone(), "conv": self.conv.clone(),
+                "mtp": (self.mtp_len, self.mtp_tail_at, tail)}
 
     def restore(self, snap: dict) -> None:
         if snap["pos"] > self.capacity:
@@ -286,6 +305,12 @@ class State:
         self.rec[0].copy_(snap["rec"])
         self.conv.copy_(snap["conv"])
         self.pos = int(snap["pos"])
+        mtp_len, tail_at, tail = snap.get("mtp", (0, -1, None))
+        self.mtp_len, self.mtp_tail_at = min(int(mtp_len), self.pos), int(tail_at)
+        if self.mtp_tail is not None and tail is not None:
+            self.mtp_tail.copy_(tail)
+        else:
+            self.mtp_tail_at = -1
 
 
 @dataclass
