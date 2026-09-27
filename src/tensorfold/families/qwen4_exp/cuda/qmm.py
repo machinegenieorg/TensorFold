@@ -1,5 +1,8 @@
 """Row-invariant 4-bit matmuls for MLX affine weights in groups of 32 (Flash Next), in Triton.
 
+The group size is a parameter (``gs``, 32 by default; Qwen3.6-35B-A3B passes 64): every formula below reads
+"GS inputs" for "32 inputs". Flash Next's calls never pass it and keep their bits.
+
 For weight group g (32 inputs, one scale s and one bias b per output column):
 
     P[m, n, g] = x[m, g-block] . q[n, g-block]     tensor cores, bf16 x integer-valued bf16 -> fp32
@@ -27,41 +30,43 @@ import triton
 import triton.language as tl
 
 BN = 64                   # columns per stored tile
-GS = 32                   # inputs per quantization group
+GS = 32                   # inputs per quantization group (the default; ``gs`` parameters override it)
 
 
 @triton.jit
-def _deq(words, shifts, ROWS: tl.constexpr):
-    """[ROWS, 4] int32 words -> [ROWS, 32] bf16 operand, q in 0..15 (exact in bf16)."""
+def _deq(words, shifts, ROWS: tl.constexpr, GS: tl.constexpr):
+    """[ROWS, GS / 8] int32 words -> [ROWS, GS] bf16 operand, q in 0..15 (exact in bf16)."""
 
     q = (words[:, :, None] >> shifts[None, None, :]) & 0xF
-    return tl.reshape(q, (ROWS, 32)).to(tl.bfloat16)
+    return tl.reshape(q, (ROWS, GS)).to(tl.bfloat16)
 
 
 @dataclass
 class Q4:
-    """A 4-bit group-32 matrix [n, k]: tiled words, group-major scales and biases (or the MLX layout)."""
+    """A 4-bit matrix [n, k] in groups of ``gs``: tiled words, group-major scales and biases (or the MLX layout)."""
 
-    weight: torch.Tensor      # tiled: [N/BN, K/32, BN, 4] int32; mlx: [N, K/8] int32
-    scales: torch.Tensor      # tiled: [K/32, N] bf16; mlx: [N, K/32]
+    weight: torch.Tensor      # tiled: [N/BN, K/GS, BN, GS/8] int32; mlx: [N, K/8] int32
+    scales: torch.Tensor      # tiled: [K/GS, N] bf16; mlx: [N, K/GS]
     biases: torch.Tensor
     n: int
     k: int
     layout: str = "tiled"
+    gs: int = GS
 
     def nbytes(self) -> int:
         return sum(t.numel() * t.element_size() for t in (self.weight, self.scales, self.biases))
 
 
-def tile_words(words: torch.Tensor) -> torch.Tensor:
-    """MLX (N, K/8) words -> [N/BN][K/32][BN][4] (N padded to BN with zeros). Works on stacked experts."""
+def tile_words(words: torch.Tensor, gs: int = GS) -> torch.Tensor:
+    """MLX (N, K/8) words -> [N/BN][K/GS][BN][GS/8] (N padded to BN with zeros). Works on stacked experts."""
 
     *lead, n, k8 = words.shape
     npad = -(-n // BN) * BN
     if npad != n:
         pad = words.new_zeros((*lead, npad - n, k8))
         words = torch.cat([words, pad], dim=-2)
-    out = words.reshape(*lead, npad // BN, BN, k8 // 4, 4)
+    wpg = gs // 8                                        # words per group
+    out = words.reshape(*lead, npad // BN, BN, k8 // wpg, wpg)
     nd = len(lead)
     perm = list(range(nd)) + [nd, nd + 2, nd + 1, nd + 3]
     return out.permute(*perm).contiguous()
@@ -74,51 +79,51 @@ def untile_words(tiled: torch.Tensor, n: int) -> torch.Tensor:
     return tiled.permute(*perm).reshape(*lead, t * bn, kg * four)[..., :n, :].contiguous()
 
 
-def make_q4(weight: torch.Tensor, scales: torch.Tensor, biases: torch.Tensor) -> Q4:
-    """From the checkpoint's arrays: weight (N, K/8) uint32 or int32, scales/biases (N, K/32) bf16."""
+def make_q4(weight: torch.Tensor, scales: torch.Tensor, biases: torch.Tensor, gs: int = GS) -> Q4:
+    """From the checkpoint's arrays: weight (N, K/8) uint32 or int32, scales/biases (N, K/GS) bf16."""
 
     w = weight.view(torch.int32) if weight.dtype != torch.int32 else weight
     n, k8 = w.shape
-    return Q4(tile_words(w), scales.t().contiguous(), biases.t().contiguous(), n, k8 * 8)
+    return Q4(tile_words(w, gs), scales.t().contiguous(), biases.t().contiguous(), n, k8 * 8, gs=gs)
 
 
-def stack_q4(parts: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]) -> Q4:
+def stack_q4(parts: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]], gs: int = GS) -> Q4:
     """Rows of several (weight, scales, biases) of the same K stacked in order, then tiled."""
 
     w = torch.cat([p[0].view(torch.int32) if p[0].dtype != torch.int32 else p[0] for p in parts])
     s = torch.cat([p[1] for p in parts])
     b = torch.cat([p[2] for p in parts])
-    return make_q4(w, s, b)
+    return make_q4(w, s, b, gs)
 
 
 def to_mlx(q: Q4) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The stored MLX layout again: (N, K/8) words, (N, K/32) scales and biases."""
+    """The stored MLX layout again: (N, K/8) words, (N, K/GS) scales and biases."""
 
     return untile_words(q.weight, q.n), q.scales.t().contiguous(), q.biases.t().contiguous()
 
 
-def dequantize(words: torch.Tensor, scales: torch.Tensor, biases: torch.Tensor) -> torch.Tensor:
-    """Reference: MLX (N, K/8) words -> (N, K) fp32 values s * q + b (group 32)."""
+def dequantize(words: torch.Tensor, scales: torch.Tensor, biases: torch.Tensor, gs: int = GS) -> torch.Tensor:
+    """Reference: MLX (N, K/8) words -> (N, K) fp32 values s * q + b (groups of ``gs``)."""
 
     n, k8 = words.shape[-2], words.shape[-1]
     w = words.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
     shifts = torch.arange(8, device=words.device, dtype=torch.int64) * 4
     q = ((w[..., None] >> shifts) & 0xF).reshape(*words.shape[:-1], k8 * 8).to(torch.float32)
-    s = scales.to(torch.float32).repeat_interleave(GS, dim=-1)
-    b = biases.to(torch.float32).repeat_interleave(GS, dim=-1)
+    s = scales.to(torch.float32).repeat_interleave(gs, dim=-1)
+    b = biases.to(torch.float32).repeat_interleave(gs, dim=-1)
     return q * s + b
 
 
 def dequantize_q4(q: Q4) -> torch.Tensor:
-    return dequantize(*to_mlx(q))
+    return dequantize(*to_mlx(q), gs=q.gs)
 
 
 # -- split-K by shape --------------------------------------------------------------------------
-def split_k(n: int, k: int, target: int = 160) -> int:
+def split_k(n: int, k: int, target: int = 160, gs: int = GS) -> int:
     """K slices for an (n, k) weight: a function of the shape only (never of the row count)."""
 
     tiles = -(-n // BN)
-    groups = k // GS
+    groups = k // gs
     sk = 1
     while sk < 32 and tiles * sk < target and groups % (sk * 2) == 0 and groups // (sk * 2) >= 8:
         sk *= 2
@@ -143,25 +148,26 @@ def bucket(m: int) -> int:
 
 # -- group sums ----------------------------------------------------------------------------------
 @triton.jit
-def _group_sums(X, XS, x_stride, K: tl.constexpr, GB: tl.constexpr):
+def _group_sums(X, XS, x_stride, K: tl.constexpr, GB: tl.constexpr, GS: tl.constexpr):
     m = tl.program_id(0)
     gb = tl.program_id(1)
-    KG: tl.constexpr = K // 32
+    KG: tl.constexpr = K // GS
     g = gb * GB + tl.arange(0, GB)
-    k = tl.arange(0, 32)
+    k = tl.arange(0, GS)
     ok = g < KG
-    x = tl.load(X + m * x_stride + g[:, None] * 32 + k[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
+    x = tl.load(X + m * x_stride + g[:, None] * GS + k[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
     tl.store(XS + m * KG + g, tl.sum(x, axis=1), mask=ok)
 
 
-def group_sums(x: torch.Tensor) -> torch.Tensor:
-    """(M, K) bf16 (rows may be strided) -> (M, K/32) fp32 sums of each 32-input group."""
+def group_sums(x: torch.Tensor, gs: int = GS, out: torch.Tensor | None = None) -> torch.Tensor:
+    """(M, K) bf16 (rows may be strided) -> (M, K/GS) fp32 sums of each GS-input group (one program per row
+    and 32 groups: a row's sums never depend on the other rows)."""
 
     m, k = x.shape
-    kg = k // GS
-    xs = torch.empty((m, kg), dtype=torch.float32, device=x.device)
+    kg = k // gs
+    xs = torch.empty((m, kg), dtype=torch.float32, device=x.device) if out is None else out
     gb = 32
-    _group_sums[(m, triton.cdiv(kg, gb))](x, xs, x.stride(0), K=k, GB=gb, num_warps=2)
+    _group_sums[(m, triton.cdiv(kg, gb))](x, xs, x.stride(0), K=k, GB=gb, GS=gs, num_warps=2)
     return xs
 
 
@@ -169,28 +175,29 @@ def group_sums(x: torch.Tensor) -> torch.Tensor:
 @triton.jit
 def _qmm(X, XS, W, S, B, OUT, PART, M, x_stride,
          N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
-         BLOCK_N: tl.constexpr, GPI: tl.constexpr, F32: tl.constexpr, SBN: tl.constexpr):
-    KG: tl.constexpr = K // 32
+         BLOCK_N: tl.constexpr, GPI: tl.constexpr, F32: tl.constexpr, SBN: tl.constexpr, GS: tl.constexpr):
+    KG: tl.constexpr = K // GS
+    WPG: tl.constexpr = GS // 8                          # words per group row
     PER: tl.constexpr = KG // SK
     pid_n = tl.program_id(1)
     pid_s = tl.program_id(2)
     rm = tl.program_id(0) * BM + tl.arange(0, BM)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    rk = tl.arange(0, 32)
-    rw = tl.arange(0, 4)
+    rk = tl.arange(0, GS)
+    rw = tl.arange(0, WPG)
     shifts = tl.arange(0, 8) * 4
     m_ok = rm < M
     n_ok = rn < N
     SUB: tl.constexpr = SBN // BLOCK_N                  # program tiles per stored tile
-    tile = W + (pid_n // SUB) * (KG * SBN * 4)
+    tile = W + (pid_n // SUB) * (KG * SBN * WPG)
     local = (pid_n % SUB) * BLOCK_N + tl.arange(0, BLOCK_N)
     acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
     for i in range(PER // GPI):
         for j in tl.static_range(GPI):
             g = pid_s * PER + i * GPI + j
-            words = tl.load(tile + g * (SBN * 4) + local[:, None] * 4 + rw[None, :])
-            x = tl.load(X + rm[:, None] * x_stride + (g * 32 + rk)[None, :], mask=m_ok[:, None], other=0.0)
-            q = _deq(words, shifts, BLOCK_N)
+            words = tl.load(tile + g * (SBN * WPG) + local[:, None] * WPG + rw[None, :])
+            x = tl.load(X + rm[:, None] * x_stride + (g * GS + rk)[None, :], mask=m_ok[:, None], other=0.0)
+            q = _deq(words, shifts, BLOCK_N, GS)
             p = tl.dot(x, tl.trans(q))
             s = tl.load(S + g * N + rn, mask=n_ok, other=0.0).to(tl.float32)
             b = tl.load(B + g * N + rn, mask=n_ok, other=0.0).to(tl.float32)
@@ -236,35 +243,38 @@ SHAPES16 = {
 }
 
 
-def split_for(n: int, k: int) -> int:
-    """The K slices of an (n, k) matrix: the tuned constant when there is one, else ``split_k``."""
+def split_for(n: int, k: int, shapes: dict | None = None, gs: int = GS) -> int:
+    """The K slices of an (n, k) matrix: the tuned constant when there is one (``shapes``, Flash Next's
+    SHAPES16 by default), else ``split_k``."""
 
-    got = SHAPES16.get((n, k))
-    return got[0] if got else split_k(n, k)
+    got = (SHAPES16 if shapes is None else shapes).get((n, k))
+    return got[0] if got else split_k(n, k, gs=gs)
 
 
 def matmul(x: torch.Tensor, q: Q4, xs: torch.Tensor | None = None, *, out: torch.Tensor | None = None,
            f32: bool = False, sk: int | None = None, part: torch.Tensor | None = None,
            gpi: int | None = None, num_warps: int | None = None, num_stages: int | None = None,
-           block_n: int | None = None, reduce: bool = True) -> torch.Tensor:
+           block_n: int | None = None, reduce: bool = True, shapes: dict | None = None) -> torch.Tensor:
     """x (M, K) bf16 (rows may be strided) @ q.T -> (M, N) bf16 (or fp32 sums with ``f32``). ``reduce=False``
-    with a split K returns the unreduced fp32 slices [SK, M, N] (the caller sums them in slice order)."""
+    with a split K returns the unreduced fp32 slices [SK, M, N] (the caller sums them in slice order).
+    ``shapes``: the per-shape table (K slices and <= 16-row settings, as SHAPES16) of the calling family."""
 
     if q.layout != "tiled":
         raise ValueError("matmul takes tiled weights")
     m, k = x.shape
     if k != q.k or x.stride(1) != 1:
         raise ValueError(f"matmul: x {tuple(x.shape)} does not match K={q.k}")
+    table = SHAPES16 if shapes is None else shapes
     bm = bucket(m)
     c_gpi, c_warps, c_stages = CONFIG[bm]
     c_bn = BN
-    tuned = SHAPES16.get((q.n, q.k)) if bm == 16 else None
+    tuned = table.get((q.n, q.k)) if bm == 16 else None
     if tuned is not None:
         _, c_gpi, c_warps, c_stages, c_bn = tuned
     if xs is None:
-        xs = group_sums(x)
-    sk = int(sk) if sk else split_for(q.n, q.k)
-    per = (k // GS) // sk
+        xs = group_sums(x, q.gs)
+    sk = int(sk) if sk else split_for(q.n, q.k, table, q.gs)
+    per = (k // q.gs) // sk
     g = gpi_for(per, gpi or c_gpi)
     if out is None:
         out = torch.empty((m, q.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
@@ -277,7 +287,7 @@ def matmul(x: torch.Tensor, q: Q4, xs: torch.Tensor | None = None, *, out: torch
     bn = block_n or c_bn
     grid = (triton.cdiv(m, bm), triton.cdiv(q.n, bn), sk)
     _qmm[grid](x, xs, q.weight, q.scales, q.biases, out, part if sk > 1 else out, m, x.stride(0),
-               N=q.n, K=k, SK=sk, BM=bm, BLOCK_N=bn, GPI=g, F32=f32, SBN=BN,
+               N=q.n, K=k, SK=sk, BM=bm, BLOCK_N=bn, GPI=g, F32=f32, SBN=BN, GS=q.gs,
                num_warps=num_warps or c_warps, num_stages=num_stages or c_stages)
     if sk > 1 and reduce:
         total = m * q.n
@@ -328,7 +338,7 @@ def _qmm_hcdown(H, PSS, SCALE, NORMED, W, S, B, OUT, PART, M, eps,
             tl.store(NORMED + rm[:, None] * K + (g * 32 + rk)[None, :], x, mask=m_ok[:, None] & (pid_n == 0))
             xs = tl.sum(x.to(tl.float32), axis=1)
             words = tl.load(tile + g * (SBN * 4) + local[:, None] * 4 + rw[None, :])
-            q = _deq(words, shifts, BLOCK_N)
+            q = _deq(words, shifts, BLOCK_N, 32)
             p = tl.dot(x, tl.trans(q))
             s = tl.load(S + g * N + rn, mask=n_ok, other=0.0).to(tl.float32)
             b = tl.load(B + g * N + rn, mask=n_ok, other=0.0).to(tl.float32)
@@ -386,7 +396,7 @@ def _qmm_upmix(X, XS, W, S, B, NORMED, MIXED, XSM, M,
                 g = i * GPI + jj
                 words = tl.load(tile + g * (SBN * 4) + local[:, None] * 4 + rw[None, :])
                 x = tl.load(X + rm[:, None] * K + (g * 32 + rk)[None, :], mask=m_ok[:, None], other=0.0)
-                q = _deq(words, shifts, DB)
+                q = _deq(words, shifts, DB, 32)
                 p = tl.dot(x, tl.trans(q))
                 s = tl.load(S + g * N + rn).to(tl.float32)
                 b = tl.load(B + g * N + rn).to(tl.float32)
@@ -420,20 +430,21 @@ def hc_upmix(act: torch.Tensor, xs_act: torch.Tensor, q: Q4, normed: torch.Tenso
 # -- experts ---------------------------------------------------------------------------------------
 @dataclass
 class Experts:
-    """E experts' gate, up and down (4-bit group 32, tiled per expert), the shared expert last."""
+    """E experts' gate, up and down (4-bit, groups of ``group_size``, tiled per expert), the shared expert last."""
 
-    gw: torch.Tensor          # [E, NI/BN, D/32, BN, 4]
-    gs: torch.Tensor          # [E, D/32, NI]
+    gw: torch.Tensor          # [E, NI/BN, D/GS, BN, GS/8]
+    gs: torch.Tensor          # [E, D/GS, NI] (gate scales)
     gb: torch.Tensor
     uw: torch.Tensor
     us: torch.Tensor
     ub: torch.Tensor
-    dw: torch.Tensor          # [E, D/BN, NI/32, BN, 4]
-    ds: torch.Tensor          # [E, NI/32, D]
+    dw: torch.Tensor          # [E, D/BN, NI/GS, BN, GS/8]
+    ds: torch.Tensor          # [E, NI/GS, D]
     db: torch.Tensor
     count: int                # E (routed experts + the shared one)
     width: int                # NI (the expert's intermediate width)
     dims: int                 # D
+    group_size: int = GS      # GS: inputs per quantization group
 
     def nbytes_per_expert(self) -> int:
         total = sum(t.numel() * t.element_size() for t in (self.gw, self.gs, self.gb, self.uw, self.us, self.ub,
@@ -441,9 +452,11 @@ class Experts:
         return total // self.count
 
 
-def make_experts(gate: tuple, up: tuple, down: tuple, shared: tuple | None = None) -> Experts:
-    """gate/up: (words [E, NI, D/8], scales [E, NI, D/32], biases); down: ([E, D, NI/8], ...); shared: three
+def make_experts(gate: tuple, up: tuple, down: tuple, shared: tuple | None = None, gs: int = GS) -> Experts:
+    """gate/up: (words [E, NI, D/8], scales [E, NI, D/GS], biases); down: ([E, D, NI/8], ...); shared: three
     (words, scales, biases) of one expert appended as expert E."""
+
+    group_size = gs                      # ``gs`` is reused below for the gate scales
 
     def cat(stack, one):
         w, s, b = stack
@@ -454,7 +467,7 @@ def make_experts(gate: tuple, up: tuple, down: tuple, shared: tuple | None = Non
             w = torch.cat([w, ow[None]])
             s = torch.cat([s, os_[None]])
             b = torch.cat([b, ob[None]])
-        return tile_words(w), s.transpose(-1, -2).contiguous(), b.transpose(-1, -2).contiguous()
+        return tile_words(w, group_size), s.transpose(-1, -2).contiguous(), b.transpose(-1, -2).contiguous()
 
     sg, su, sd = shared if shared is not None else (None, None, None)
     gw, gs, gb = cat(gate, sg)
@@ -462,18 +475,21 @@ def make_experts(gate: tuple, up: tuple, down: tuple, shared: tuple | None = Non
     dw, ds, db = cat(down, sd)
     count, width = int(gs.shape[0]), int(gs.shape[2])
     dims = int(ds.shape[2])
-    return Experts(gw, gs, gb, uw, us, ub, dw, ds, db, count, width, dims)
+    return Experts(gw, gs, gb, uw, us, ub, dw, ds, db, count, width, dims, group_size)
 
 
 @triton.jit
 def _moe_gateup(X, XS, GW, GS, GB, UW, US, UB, UIDS, UCOUNT, UMEM, ACT, AXS,
                 K: tl.constexpr, N: tl.constexpr, MAXM: tl.constexpr, SLOTS: tl.constexpr,
-                BM: tl.constexpr, BLOCK_N: tl.constexpr, GPI: tl.constexpr, SBN: tl.constexpr):
+                BM: tl.constexpr, BLOCK_N: tl.constexpr, GPI: tl.constexpr, SBN: tl.constexpr,
+                GSZ: tl.constexpr):
     """Program (u, column tile, member tile): the members of distinct expert u (codes row * 32 + slot) times
-    its gate and up rows -> bf16(silu(bf16(gate)) * bf16(up)) at ACT[row, slot], with the 32-input group
-    sums of those bf16 values (for the down projection) at AXS[row, slot]."""
+    its gate and up rows (weight groups of GSZ inputs) -> bf16(silu(bf16(gate)) * bf16(up)) at ACT[row, slot],
+    with the sums of each 32 of those bf16 values at AXS[row, slot] (whatever GSZ: the down projection adds
+    GSZ / 32 of them in order, so a program may be 32 columns wide at any group size)."""
 
-    KG: tl.constexpr = K // 32
+    KG: tl.constexpr = K // GSZ
+    WPG: tl.constexpr = GSZ // 8
     u = tl.program_id(0)
     pid_n = tl.program_id(1)
     mt = tl.program_id(2)
@@ -486,30 +502,30 @@ def _moe_gateup(X, XS, GW, GS, GB, UW, US, UB, UIDS, UCOUNT, UMEM, ACT, AXS,
     row = tl.where(live, code // 32, 0)
     slot = tl.where(live, code % 32, 0)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    rk = tl.arange(0, 32)
-    rw = tl.arange(0, 4)
+    rk = tl.arange(0, GSZ)
+    rw = tl.arange(0, WPG)
     shifts = tl.arange(0, 8) * 4
     SUB: tl.constexpr = SBN // BLOCK_N
     local = (pid_n % SUB) * BLOCK_N + tl.arange(0, BLOCK_N)
     NT: tl.constexpr = N // SBN
-    gtile = GW + (e * NT + pid_n // SUB) * (KG * SBN * 4)
-    utile = UW + (e * NT + pid_n // SUB) * (KG * SBN * 4)
+    gtile = GW + (e * NT + pid_n // SUB) * (KG * SBN * WPG)
+    utile = UW + (e * NT + pid_n // SUB) * (KG * SBN * WPG)
     gsb = e * KG * N
     acc_g = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
     acc_u = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
     for i in range(KG // GPI):
         for j in tl.static_range(GPI):
             g = i * GPI + j
-            x = tl.load(X + row[:, None] * K + (g * 32 + rk)[None, :], mask=live[:, None], other=0.0)
+            x = tl.load(X + row[:, None] * K + (g * GSZ + rk)[None, :], mask=live[:, None], other=0.0)
             xs = tl.load(XS + row * KG + g, mask=live, other=0.0)
-            wg = tl.load(gtile + g * (SBN * 4) + local[:, None] * 4 + rw[None, :])
-            qg = _deq(wg, shifts, BLOCK_N)
+            wg = tl.load(gtile + g * (SBN * WPG) + local[:, None] * WPG + rw[None, :])
+            qg = _deq(wg, shifts, BLOCK_N, GSZ)
             pg = tl.dot(x, tl.trans(qg))
             sg = tl.load(GS + gsb + g * N + rn).to(tl.float32)
             bg = tl.load(GB + gsb + g * N + rn).to(tl.float32)
             acc_g = acc_g + pg * sg[None, :] + xs[:, None] * bg[None, :]
-            wu = tl.load(utile + g * (SBN * 4) + local[:, None] * 4 + rw[None, :])
-            qu = _deq(wu, shifts, BLOCK_N)
+            wu = tl.load(utile + g * (SBN * WPG) + local[:, None] * WPG + rw[None, :])
+            qu = _deq(wu, shifts, BLOCK_N, GSZ)
             pu = tl.dot(x, tl.trans(qu))
             su = tl.load(US + gsb + g * N + rn).to(tl.float32)
             bu = tl.load(UB + gsb + g * N + rn).to(tl.float32)
@@ -529,11 +545,15 @@ def _moe_gateup(X, XS, GW, GS, GB, UW, US, UB, UIDS, UCOUNT, UMEM, ACT, AXS,
 @triton.jit
 def _moe_down(ACT, AXS, DW, DS, DB, UIDS, UCOUNT, UMEM, Y,
               NI: tl.constexpr, D: tl.constexpr, MAXM: tl.constexpr, SLOTS: tl.constexpr,
-              BM: tl.constexpr, BLOCK_N: tl.constexpr, GPI: tl.constexpr, SBN: tl.constexpr):
+              BM: tl.constexpr, BLOCK_N: tl.constexpr, GPI: tl.constexpr, SBN: tl.constexpr,
+              GSZ: tl.constexpr):
     """Program (u, column tile, member tile): Y[row, slot, :] (fp32) = down_e @ ACT[row, slot] for the members
-    of distinct expert u."""
+    of distinct expert u. A group's input sum is AXS's GSZ / 32 sums of 32 added in order."""
 
-    KG: tl.constexpr = NI // 32
+    KG: tl.constexpr = NI // GSZ
+    WPG: tl.constexpr = GSZ // 8
+    HX: tl.constexpr = GSZ // 32                        # AXS sums per group
+    KX: tl.constexpr = NI // 32
     u = tl.program_id(0)
     pid_n = tl.program_id(1)
     mt = tl.program_id(2)
@@ -545,22 +565,24 @@ def _moe_down(ACT, AXS, DW, DS, DB, UIDS, UCOUNT, UMEM, Y,
     live = code >= 0
     src = tl.where(live, (code // 32) * SLOTS + code % 32, 0)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    rk = tl.arange(0, 32)
-    rw = tl.arange(0, 4)
+    rk = tl.arange(0, GSZ)
+    rw = tl.arange(0, WPG)
     shifts = tl.arange(0, 8) * 4
     SUB: tl.constexpr = SBN // BLOCK_N
     local = (pid_n % SUB) * BLOCK_N + tl.arange(0, BLOCK_N)
     NT: tl.constexpr = D // SBN
-    tile = DW + (e * NT + pid_n // SUB) * (KG * SBN * 4)
+    tile = DW + (e * NT + pid_n // SUB) * (KG * SBN * WPG)
     sb = e * KG * D
     acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
     for i in range(KG // GPI):
         for j in tl.static_range(GPI):
             g = i * GPI + j
-            x = tl.load(ACT + src[:, None] * NI + (g * 32 + rk)[None, :], mask=live[:, None], other=0.0)
-            xs = tl.load(AXS + src * KG + g, mask=live, other=0.0)
-            w = tl.load(tile + g * (SBN * 4) + local[:, None] * 4 + rw[None, :])
-            q = _deq(w, shifts, BLOCK_N)
+            x = tl.load(ACT + src[:, None] * NI + (g * GSZ + rk)[None, :], mask=live[:, None], other=0.0)
+            xs = tl.load(AXS + src * KX + g * HX, mask=live, other=0.0)
+            for h in tl.static_range(1, HX):
+                xs = xs + tl.load(AXS + src * KX + g * HX + h, mask=live, other=0.0)
+            w = tl.load(tile + g * (SBN * WPG) + local[:, None] * WPG + rw[None, :])
+            q = _deq(w, shifts, BLOCK_N, GSZ)
             p = tl.dot(x, tl.trans(q))
             s = tl.load(DS + sb + g * D + rn).to(tl.float32)
             b = tl.load(DB + sb + g * D + rn).to(tl.float32)
@@ -578,7 +600,8 @@ def moe_gateup(x: torch.Tensor, xs: torch.Tensor, ex: Experts, group: "Group", a
     grid = (group.ids.shape[0], ex.width // block_n, triton.cdiv(maxm, bm))
     _moe_gateup[grid](x, xs, ex.gw, ex.gs, ex.gb, ex.uw, ex.us, ex.ub, group.ids, group.count, group.members,
                       act, axs, K=ex.dims, N=ex.width, MAXM=maxm, SLOTS=act.shape[1], BM=bm, BLOCK_N=block_n,
-                      GPI=gpi_for(ex.dims // GS, gpi), SBN=BN, num_warps=num_warps, num_stages=num_stages)
+                      GPI=gpi_for(ex.dims // ex.group_size, gpi), SBN=BN, GSZ=ex.group_size, num_warps=num_warps,
+                      num_stages=num_stages)
 
 
 def moe_down(act: torch.Tensor, axs: torch.Tensor, ex: Experts, group: "Group", y: torch.Tensor, *, bm: int = 16,
@@ -590,7 +613,8 @@ def moe_down(act: torch.Tensor, axs: torch.Tensor, ex: Experts, group: "Group", 
     grid = (group.ids.shape[0], ex.dims // block_n, triton.cdiv(maxm, bm))
     _moe_down[grid](act, axs, ex.dw, ex.ds, ex.db, group.ids, group.count, group.members, y,
                     NI=ex.width, D=ex.dims, MAXM=maxm, SLOTS=act.shape[1], BM=bm, BLOCK_N=block_n,
-                    GPI=gpi_for(ex.width // GS, gpi), SBN=BN, num_warps=num_warps, num_stages=num_stages)
+                    GPI=gpi_for(ex.width // ex.group_size, gpi), SBN=BN, GSZ=ex.group_size, num_warps=num_warps,
+                    num_stages=num_stages)
 
 
 @dataclass
