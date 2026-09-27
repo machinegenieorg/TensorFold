@@ -88,7 +88,27 @@ def fn_outputs(case: str) -> dict[str, str]:
 
 
 # recorded on the base commit (bb4b4a3, TensorFold 0.3.4.1) by this file's __main__, per compute capability
-FN_HASHES: dict[tuple[int, int], dict[str, dict[str, str]]] = {}
+FN_HASHES: dict[tuple[int, int], dict[str, dict[str, str]]] = {
+    (12, 0): {                   # RTX 5090, Triton 3.7.1 (NVIDIA PyTorch 26.07)
+        "dense": {
+            "prep": "42cf3a56d37c416a7e375b22d4d5cced1e05ff45a2dd5429c63924639a17ebec",
+            "attn": "b72122e02bad1049778f7feff0973c283f14f3a112e37a4aebf3f7fc78f8696e",
+            "gate": "1e90cbc40fe51d34c25a0db0a26bc68c61573f8473acc3f181529ee35c71e73d",
+        },
+        "mixed": {
+            "prep": "c7446018042986d880a37e41a70278a3a80e37637c09aaac54954ed3ae3acc1e",
+            "select": "f553d759760c1e8db7c668608dd099d4ac122d6f2aa72c4e5a947e8b5650585e",
+            "attn": "9c8b4399e8edd0970debdf84237bfefedc119a7267265a96e0b9dd587f198999",
+            "gate": "295f08dde8410a8e44180981a0901b835533666d0e3895ad7aa9e8b854cd406f",
+        },
+        "sparse": {
+            "prep": "dc2cc6b02a80bf60e6487429c796a6b0e3e291864cac9c5fb302e4c42acc1d88",
+            "select": "f0633a885d8bc7fc5d9c819ea8e7d2d778baea519d1be1c8d10498527f982e31",
+            "attn": "129d0448274ca9538bb99e817d55911ab5027211dabdb88751c4e5d8b681066d",
+            "gate": "947e3c71a83d5809f205635f9d9d5b6d62b358bcc136086e623d7c581d42cecf",
+        },
+    },
+}
 
 
 @pytest.mark.parametrize("case", sorted(FN_CASES))
