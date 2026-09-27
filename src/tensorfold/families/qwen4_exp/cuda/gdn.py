@@ -1,4 +1,9 @@
-"""Run a row-exact DeltaNet chain and retain normalized k, v, g and beta so replaying any accepted prefix reconstructs serial state with the same update routine."""
+"""Run a row-exact DeltaNet chain and retain normalized k, v, g and beta so replaying any accepted prefix reconstructs serial state with the same update routine.
+
+(key, value) heads: Flash Next's layer (16, 48) or a tensor-parallel rank's (8, 24), gated by sigmoid(z);
+Qwen3.6-35B-A3B's layer (16, 32), gated by silu(z) and without the 32-group sums (its out projection groups 64
+inputs).
+"""
 
 from __future__ import annotations
 
@@ -7,9 +12,14 @@ from pathlib import Path
 
 import torch
 
-NK, NV, DK, DV = 16, 48, 128, 128
+NK, NV, DK, DV = 16, 48, 128, 128  # Flash Next's layer
 CONV = 2 * NK * DK + NV * DV
 PW = CONV + NV * DV + 2 * NV
+HEADS = ((16, 48), (8, 24), (16, 32))
+GATES = {"sigmoid": 0, "silu": 1}
+# no FMA contraction: ``replay`` recomputes the chain's state update with the chain's bits
+CUDA_FLAGS = ("-O3", "--fmad=false")
+_NONE: dict = {}                   # a zero-size fp32 tensor a device: the kernel's "no group sums"
 
 
 def widths(nk: int, nv: int) -> tuple[int, int]:
@@ -25,7 +35,7 @@ def _ext():
 
     here = Path(__file__).parent
     return load(name="tensorfold_qwen4_exp_gdn", sources=[str(here / "gdn.cpp"), str(here / "gdn.cu")],
-                extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
+                extra_cuda_cflags=list(CUDA_FLAGS), verbose=False)
 
 
 class GDNScratch:
@@ -40,11 +50,19 @@ class GDNScratch:
 
 def chain(p: torch.Tensor, conv_state: torch.Tensor, conv_w: torch.Tensor, state_in: torch.Tensor,
           a_log: torch.Tensor, dt_bias: torch.Tensor, norm_w: torch.Tensor, eps: float, rows: int,
-          scratch: GDNScratch, state_out: torch.Tensor, out: torch.Tensor, xs: torch.Tensor) -> None:
-    """``out`` [rows, NV*DV] bf16 and ``xs`` (its 32-group sums) may be row views of a larger buffer."""
+          scratch: GDNScratch, state_out: torch.Tensor, out: torch.Tensor, xs: torch.Tensor | None, *,
+          gate: str = "sigmoid") -> None:
+    """``out`` [rows, NV*DV] bf16 and ``xs`` (its 32-group sums, or None to skip them) may be row views of a larger
+    buffer. ``gate``: "sigmoid" (Flash Next) or "silu" (Qwen3.6) on z in the gated RMSNorm."""
 
+    if gate not in GATES:
+        raise ValueError(f"gdn chain: gate must be one of {sorted(GATES)}, not {gate!r}")
+    if xs is None:
+        xs = _NONE.get(p.device)
+        if xs is None:
+            xs = _NONE[p.device] = torch.empty((0,), dtype=torch.float32, device=p.device)
     _ext().chain(p, conv_state, conv_w, state_in, a_log, dt_bias, norm_w, float(eps), int(rows), out, xs,
-                 state_out, scratch.k, scratch.v, scratch.g, scratch.b)
+                 state_out, scratch.k, scratch.v, scratch.g, scratch.b, GATES[gate])
 
 
 def replay(state_in: torch.Tensor, scratch: GDNScratch, rows: int, state_out: torch.Tensor) -> None:
