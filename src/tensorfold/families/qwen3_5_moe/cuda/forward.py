@@ -506,7 +506,8 @@ def _gdn_block(m: Model, layer: LayerK, b: Buffers, R: int, table: Sequence[Seq]
     return qmm.matmul(b.gdn_out[:R], g.out, b.gdn_xs[:R], out=b.branch[:R], part=b.part, reduce=False)
 
 
-def _attn_block(m: Model, layer: LayerK, b: Buffers, R: int, table: Sequence[Seq], full: bool) -> torch.Tensor:
+def _attn_block(m: Model, layer: LayerK, b: Buffers, R: int, table: Sequence[Seq], full: bool,
+                context: int | None) -> torch.Tensor:
     """Gated attention on b.normed[:R]: the stacked projection once; per sequence the q/k norms, RoPE and the cache
     write at the rows' positions, then attention and the output gate in blocks of ``attn_rows`` rows; the o
     projection once."""
@@ -525,7 +526,7 @@ def _attn_block(m: Model, layer: LayerK, b: Buffers, R: int, table: Sequence[Seq
                           None, None, c.eps, q_heads=c.heads, kv_heads=c.kv_heads, head_dim=c.head_dim)
         for r0 in range(lo, hi, block):
             n = min(block, hi - r0)
-            keys = None if full else s.pos + (r0 - lo) + n             # a prompt chunk's blocks: only their keys
+            keys = context if full else s.pos + (r0 - lo) + n          # a prompt chunk's blocks: only their keys
             o = attn_mod.attention(b.q[r0:r0 + n], kc, vc, b.pos[r0:r0 + 1], b.attn, n, scale, context=keys)
             fn_glue.attn_gate(o[:n], b.pa[r0:r0 + n], b.gated[r0:r0 + n], b.gated_xs[r0:r0 + n], q_heads=c.heads,
                               head_dim=c.head_dim, group=GS)
@@ -607,12 +608,17 @@ def stage(m: Model, b: Buffers, work: Sequence[tuple[State, Sequence[int]]]) -> 
     return R, table
 
 
-def compute(m: Model, b: Buffers, R: int, table: Sequence[Seq], *, logits: str = "all") -> torch.Tensor | None:
+def compute(m: Model, b: Buffers, R: int, table: Sequence[Seq], *, logits: str = "all",
+            context: int | None = None) -> torch.Tensor | None:
     """The GPU work of a forward on staged rows. ``logits``: "all" rows ([R, V]), "last" (each sequence's last row,
     [sequences, V]) or "none". The returned logits are a view of b.logits; b.hidden[:R] holds the rows' hidden
-    states after the final norm."""
+    states after the final norm. ``context`` (a captured graph's bucket): a bound on every window row's keys, so
+    attention launches only the key chunks below it (chunks past a row's keys write nothing either way, so the bits
+    are the same); None launches every chunk up to the capacity."""
 
     _check_logits(b, R, logits)
+    if context is not None and any(s.pos + s.rows > context for s in table):
+        raise ValueError(f"context {context} is below a window row's keys")
     c = m.cfg
     full = R <= b.window_rows
     qmm.embed(b.ids[:R], *m.embed.triple(), out=b.h[:R])
@@ -622,7 +628,7 @@ def compute(m: Model, b: Buffers, R: int, table: Sequence[Seq], *, logits: str =
         if layer.linear:
             branch = _gdn_block(m, layer, b, R, table, full)
         else:
-            branch = _attn_block(m, layer, b, R, table, full)
+            branch = _attn_block(m, layer, b, R, table, full, context)
         _norm(b, R, layer.post_scale, c.eps, branch)
         _moe_block(m, layer, b, R, m.layers[i + 1].input_scale if i < last else m.norm)
     return _head(m, b, R, table, logits)
