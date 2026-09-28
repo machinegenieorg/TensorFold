@@ -1,7 +1,4 @@
-"""Qwen3.6-35B-A3B's loader on CPU: the key map against the real checkpoint's and drafter's safetensors headers (no
-weights read), the stored norm convention, and a small fake checkpoint through the loader (expert table, router
-dequantization, stacked projections, norms). Needs torch, no GPU; the real-checkpoint tests skip when the
-checkpoints are not in the Hugging Face cache."""
+"""Qwen3.6-35B-A3B's loader on CPU: the real checkpoints' key maps and norms (when cached) and fake checkpoints."""
 
 from __future__ import annotations
 
@@ -20,6 +17,7 @@ from tensorfold.families.qwen3_5_moe.cuda import checkpoint as C  # noqa: E402
 from tensorfold.families.qwen3_5_moe.cuda import weights as W  # noqa: E402
 
 ORIGINAL = "Qwen/Qwen3.6-35B-A3B"
+PARTS = ("weight", "scales", "biases")
 
 
 def _cached(repo: str) -> Path:
@@ -34,8 +32,7 @@ def _cached(repo: str) -> Path:
     return found
 
 
-# ---------------------------------------------------------------------------------------------------------------
-# the real checkpoints: headers and a few norm vectors only
+# -- the real checkpoints: headers and the norm vectors only -----------------------------------------------------
 
 
 def test_the_real_checkpoint_maps_every_tensor_and_leaves_only_the_vision_tower():
@@ -148,8 +145,7 @@ def test_the_stored_norms_are_the_original_plus_one_rounded_to_bf16(mlx_repo, ml
                            _read(_cached(ORIGINAL), "model.language_model." + name))
 
 
-# ---------------------------------------------------------------------------------------------------------------
-# a small fake checkpoint through the loader
+# -- a small fake checkpoint through the loader --------------------------------------------------------------------
 
 TINY = {"hidden_size": 128, "num_hidden_layers": 4, "full_attention_interval": 4, "vocab_size": 256,
         "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 64, "linear_num_key_heads": 2,
@@ -280,8 +276,8 @@ def test_the_loader_builds_the_layout_contract_from_a_fake_checkpoint(tmp_path):
             assert torch.equal(table.biases[:4], _bits(t[f"{base}.mlp.switch_mlp.{proj}.biases"][1]))
             assert _same(table, t, f"{base}.mlp.shared_expert.{proj}", 4)
         # the router: 8-bit rows dequantized to fp32, the shared expert's gate row last, exact against numpy
-        want = np.concatenate([_dequant_reference(*(t[f"{base}.mlp.{g}.{s}"][1] for s in ("weight", "scales", "biases")),
-                                                  8) for g in ("gate", "shared_expert_gate")])
+        want = np.concatenate([_dequant_reference(*(t[f"{base}.mlp.{g}.{s}"][1] for s in PARTS), 8)
+                               for g in ("gate", "shared_expert_gate")])
         assert m.router.dtype == torch.float32 and m.router.shape == (5, 128)
         assert np.array_equal(m.router.numpy(), want)
         assert torch.equal(layer.input_scale, torch.from_numpy(_bf16(t[f"{base}.input_layernorm.weight"][1])))
@@ -340,8 +336,8 @@ def test_the_drafter_loads_with_its_own_4bit_router(tmp_path):
     target = W.Config.read(main)
     folder = tmp_path / "mtp"
     folder.mkdir()
-    config = {"block_size": 3, "model_type": "qwen3_5_mtp", "quantization": {"group_size": 64, "bits": 4, "mode": "affine"},
-              "text_config": dict(TINY)}
+    config = {"block_size": 3, "model_type": "qwen3_5_mtp",
+              "quantization": {"group_size": 64, "bits": 4, "mode": "affine"}, "text_config": dict(TINY)}
     (folder / "config.json").write_text(json.dumps(config))
     t = _fill(W.mtp_layout(W.Config.read(folder)), np.random.default_rng(11), True, W.MTP_NORM_W)
     _write_safetensors(folder / "model.safetensors", t)                 # one file, no index
@@ -352,7 +348,7 @@ def test_the_drafter_loads_with_its_own_4bit_router(tmp_path):
     assert torch.equal(mtp.norm_h, torch.from_numpy(_bf16(t["pre_fc_norm_hidden.weight"][1])))
     layer = mtp.layer
     assert not layer.linear and layer.attn is not None
-    want = np.concatenate([_dequant_reference(*(t[f"layers.0.mlp.{g}.{s}"][1] for s in ("weight", "scales", "biases")), 4)
+    want = np.concatenate([_dequant_reference(*(t[f"layers.0.mlp.{g}.{s}"][1] for s in PARTS), 4)
                            for g in ("gate", "shared_expert_gate")])
     assert np.array_equal(layer.moe.router.numpy(), want)
     assert _same(layer.moe.down, t, "layers.0.mlp.shared_expert.down_proj", 4)

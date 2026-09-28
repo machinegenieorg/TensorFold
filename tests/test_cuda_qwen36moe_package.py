@@ -1,6 +1,4 @@
-"""Qwen3.6-35B-A3B's family package: registered for qwen3_5_moe as a CUDA-only family, and refusing what it cannot
-serve before any torch or GPU work. Loads nothing and needs neither a GPU nor torch, so it runs anywhere when named
-on the command line (tests/cuda/conftest.py skips the folder only when pytest collects it without a GPU)."""
+"""Qwen3.6-35B-A3B's package registers a CUDA-only family and refuses what it cannot serve before torch is imported."""
 
 from __future__ import annotations
 
@@ -96,13 +94,13 @@ for kwargs in ({{"tp": 2}}, {{"rank": 1}}, {{"mtp_drafts": 3}}, {{"mtp_drafts": 
         pass
     else:
         raise AssertionError(kwargs)
-assert "torch" not in sys.modules and "mlx" not in sys.modules, sorted(m for m in sys.modules if m.split(".")[0] in ("torch", "mlx"))
-print("clean")
+loaded = sorted(m for m in sys.modules if m.split(".")[0] in ("torch", "mlx"))
+assert not loaded, loaded
 """
     src = str(Path(family.__file__).resolve().parents[3])
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [src, os.environ.get("PYTHONPATH")]))}
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=120)
-    assert done.returncode == 0 and done.stdout.strip() == "clean", done.stderr
+    assert done.returncode == 0, done.stderr
 
 
 @pytest.mark.parametrize("kwargs", [{"tp": 2}, {"tp": 2, "rank": 1, "master": "10.0.0.1"}, {"rank": 1}])
@@ -119,9 +117,7 @@ class _FakeEngine:
 
 
 def test_cuda_engine_checks_everything_then_builds_the_engine_as_the_recipe_runs_it(tmp_path, monkeypatch):
-    """What `tensorfold serve` passes reaches the engine: no flags give the recipe (a 32,768-token context to admit,
-    shrunk if memory is short; the drafter when pulled); --context N is explicit (0: the model's whole window);
-    --no-drafts drops the drafter; --parallel N is passed on as streams."""
+    """What `tensorfold serve` passes reaches the engine: the recipe by default, --context, --no-drafts, --parallel."""
 
     import types
 
@@ -196,7 +192,7 @@ def test_the_drafter_must_be_the_mtp_drafter(tmp_path):
 
 
 def test_eos_includes_im_end(tmp_path):
-    # the shipped config.json lists [248046, 248044] at top level, but text_config alone names only 248044
+    # the shipped config.json lists [248046, 248044] at top level; text_config alone names only 248044
     shipped = _config()
     shipped["eos_token_id"] = [248046, 248044]
     assert family.eos_ids(_write(tmp_path / "shipped", shipped)) == (248046, 248044)

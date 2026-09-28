@@ -225,7 +225,7 @@ def _headers(folder, spec: dict) -> None:
 def _fake_checkpoint(folder, vision: bool = True):
     """The real config and header-only weights naming every tensor the loader reads (and a vision one)."""
 
-    from test_qwen36moe_package import _config, _write
+    from tests.test_cuda_qwen36moe_package import _config, _write
 
     from tensorfold.families.qwen3_5_moe.cuda.weights import layout
 
@@ -241,7 +241,7 @@ def _fake_checkpoint(folder, vision: bool = True):
 def _fake_drafter(folder):
     """The drafter's real config and header-only weights naming every tensor ``load_mtp`` reads."""
 
-    from test_qwen36moe_package import _drafter_config, _write
+    from tests.test_cuda_qwen36moe_package import _drafter_config, _write
 
     from tensorfold.families.qwen3_5_moe.cuda.weights import mtp_layout
 
