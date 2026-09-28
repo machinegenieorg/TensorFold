@@ -125,9 +125,9 @@ def rnd():
     return SimpleNamespace(w=w, mtpw=mtpw, m=m, k=prepare_mtp(mtpw, m, draft_vocab=None))
 
 
-def _decoder(r, *, graphs: bool = False, states: int = 2) -> Decoder:
+def _decoder(r, *, graphs: bool = False, states: int = 2, k=None) -> Decoder:
     return Decoder(r.m, capacity=1024, rows=512, window_rows=32, attn_rows=48, mtp_rows=16, states=states,
-                   mtp=r.k, graphs=graphs)
+                   mtp=r.k if k is None else k, graphs=graphs)
 
 
 def _serial(e: Decoder, prompt, count, sampling, constraint):
@@ -145,8 +145,17 @@ def _follows(toy, name: str, tokens: list[int]) -> bool:
 
 
 @pytest.mark.parametrize("sampling", SAMPLINGS)
-def test_drafted_constrained_decoding_emits_serial_tokens_eager_and_graphs(rnd, toy, sampling):
-    eager, graphs = _decoder(rnd), _decoder(rnd, graphs=True)
+def test_drafted_constrained_decoding_emits_serial_tokens_eager_and_graphs(rnd, toy, sampling, monkeypatch):
+    """Drafts from the head (redrawn under the grammar when it rejects one) verify to serial tokens."""
+
+    subset = prepare_mtp(rnd.mtpw, rnd.m, draft_vocab=list(range(1, V, 3)))     # a draft vocabulary: speed only
+    eager, graphs, sub = _decoder(rnd), _decoder(rnd, graphs=True), _decoder(rnd, graphs=True, k=subset)
+    cuts, redrawn = [], []
+    admissible, mask_draft = G.Constraint.admissible, G.Constraint.mask_draft
+    monkeypatch.setattr(G.Constraint, "admissible",
+                        lambda self, d: (cuts.append(len(d) - len(r := admissible(self, d))), r)[1])
+    monkeypatch.setattr(G.Constraint, "mask_draft",
+                        lambda self, lg, d, ids=None: (redrawn.append(ids is not None), mask_draft(self, lg, d, ids))[1])
     ended = 0
     for name, seed in (("labels", 31), ("small", 32), ("json", 33), ("small", 34)):
         prompt = _tokens(60, seed)
@@ -156,7 +165,7 @@ def test_drafted_constrained_decoding_emits_serial_tokens_eager_and_graphs(rnd, 
         assert _serial(graphs, prompt, 80, sampling, toy.fresh(name)).tokens == ref.tokens
         ended += ref.tokens[-1] == EOS
         for depth, conf in ((1, 0.0), (3, 0.0), (6, 0.5)):
-            for e in (eager, graphs):
+            for e in (eager, graphs, sub):
                 c = toy.fresh(name)
                 first = prefill(e, prompt, sampling, constraint=c)
                 got = mtp_decode(e, first, 80, sampling, depth=depth, confidence=conf, constraint=c)
@@ -164,6 +173,8 @@ def test_drafted_constrained_decoding_emits_serial_tokens_eager_and_graphs(rnd, 
                 assert got.committed == ref.tokens[:-1] and max(got.widths) <= depth + 1
                 assert c.finished == (ref.tokens[-1] == EOS)
     assert ended >= 1                                   # a reply the grammar ended, besides max_tokens ones
+    # verification's filter only drops what the chain cannot avoid: a draft that would end the reply is never drawn
+    assert sum(cuts) == 0 and True in redrawn and False in redrawn, (sum(cuts), len(redrawn))
 
 
 @pytest.mark.parametrize("sampling", SAMPLINGS)
@@ -182,8 +193,8 @@ def test_an_oracle_drafter_under_the_grammar_keeps_long_prefixes_and_ends_in_ser
     real = D.draft
     calls, bad = [], {"rejected": 0, "wrong": 0}
 
-    def oracle(e_, st, hidden, next_tokens, position, count, sampling_, confidence=0.0):
-        real(e_, st, hidden, next_tokens, position, count, sampling_, confidence)    # the head's bookkeeping
+    def oracle(e_, st, hidden, next_tokens, position, count, sampling_, confidence=0.0, constraint=None):
+        real(e_, st, hidden, next_tokens, position, count, sampling_, confidence, constraint)   # the head's bookkeeping
         base = position - len(prompt)
         out = [ref.tokens[base + j] if base + j < len(ref.tokens) else EOS for j in range(count)]
         calls.append(len(calls))
@@ -395,3 +406,24 @@ def test_real_bad_schema_is_a_400_and_the_server_keeps_serving(served):
     assert len(served.spy.calls) == n
     status, data = _post(served.port, _body("Say hi.", REAL_SAMPLINGS["greedy"], max_tokens=8))
     assert status == 200 and data["choices"][0]["message"]["content"]
+
+
+def test_real_thinking_reply_is_free_until_think_end_then_follows_the_schema(served):
+    eng, spy = served.eng, served.spy
+    if not eng.depth:
+        pytest.skip(f"{family.DRAFTER} is not in the Hugging Face cache: the engine serves without drafts")
+    schema = label_schema(1, 2, 1)
+    body = {**_body(OTHER_PROMPTS[1], REAL_SAMPLINGS["greedy"], max_tokens=3072),
+            "chat_template_kwargs": {"enable_thinking": True},
+            "response_format": {"type": "json_schema", "json_schema": {"name": "v", "schema": schema}}}
+    status, drafted = _post(served.port, body)
+    c_dr = spy.calls[-1]
+    status_s, serial = _post(served.port, {**body, "draft": False})
+    assert status == status_s == 200 and _sha(c_dr.tokens) == _sha(spy.calls[-1].tokens)
+    message = drafted["choices"][0]["message"]
+    assert message == serial["choices"][0]["message"] and message.get("reasoning_content")
+    think_end = served.app._grammars().think_end
+    if think_end not in c_dr.tokens:
+        assert drafted["choices"][0]["finish_reason"] == "length" and not c_dr.constraint.active
+        pytest.skip("the reasoning did not end within 3,072 tokens")
+    assert c_dr.constraint.finished and valid(json.loads(message["content"]), schema), message["content"]

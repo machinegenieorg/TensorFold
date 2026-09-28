@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Callable, Sequence
 
 import numpy as np
@@ -159,14 +160,24 @@ def _mtp_catch_up(e: Decoder, st: State, token: int | None) -> None:
 
 
 def draft(e: Decoder, st: State, hidden: torch.Tensor, next_tokens: Sequence[int], position: int, count: int,
-          sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
-    """Absorb the kept rows, then chain up to ``count`` drafts from ``position``, stopping on low ``confidence``."""
+          sampling: Sampling | None, confidence: float = 0.0, constraint=None) -> list[int]:
+    """Absorb the kept rows, then chain up to ``count`` drafts from ``position``, stopping on low ``confidence``.
+
+    With ``constraint``, a draft its grammar rejects is redrawn from the head's masked logits, and the chain ends
+    where none is allowed or the reply would end (a speed choice: verification masks the rows either way)."""
 
     k = e.mtp
     logits = _absorb(e, st, hidden, next_tokens, logits=True)
     drafts: list[int] = []
     for j in range(count):
         d, p = sample_draft(k, logits, position + j, sampling)
+        if constraint is not None and not constraint.draft_ok(drafts, d):
+            masked = constraint.mask_draft(logits, drafts, k.ids)
+            if masked is None:
+                break
+            d, p = sample_draft(k, masked, position + j, sampling)
+            if not p > 0 or not constraint.draft_ok(drafts, d):
+                break
         low = confidence > 0 and p < confidence
         if low and j > 0:
             break
@@ -295,6 +306,7 @@ def mtp_decode(e: Decoder, pending: int, count: int, sampling: Sampling | None =
         raise ValueError("drafted decoding needs the MTP head (Decoder(..., mtp=prepare_mtp(...)))")
     st = st or e.st
     stop_eos = stop_eos or constraint is not None
+    chain = draft if constraint is None else partial(draft, constraint=constraint)
     m, b = e.m, e.buf
     out = [pending]
     rounds = drafted = accepted = 0
@@ -306,7 +318,7 @@ def mtp_decode(e: Decoder, pending: int, count: int, sampling: Sampling | None =
     start = time.perf_counter()
     drafts: list[int] = []
     if len(out) < count and not (stop_eos and pending in e.eos) and _tail_ready(st):
-        drafts = draft(e, st, st.mtp_tail[None], [pending], st.pos + 1, min(depth, count - 2), sampling, confidence)
+        drafts = chain(e, st, st.mtp_tail[None], [pending], st.pos + 1, min(depth, count - 2), sampling, confidence)
     while len(out) < count and not (stop_eos and out[-1] in e.eos):
         if constraint is not None:
             drafts = constraint.admissible(drafts)
@@ -339,7 +351,7 @@ def mtp_decode(e: Decoder, pending: int, count: int, sampling: Sampling | None =
         if st.mtp_len < st.pos - keep:             # a round without drafts: the head had no tail to start from
             _zero_mtp(st, st.mtp_len, st.pos - keep)
             st.mtp_len = st.pos - keep
-        drafts = draft(e, st, b.hidden[:keep], kept, st.pos + 1, min(depth, count - len(out) - 1), sampling,
+        drafts = chain(e, st, b.hidden[:keep], kept, st.pos + 1, min(depth, count - len(out) - 1), sampling,
                        confidence)
         kept = []
     torch.cuda.synchronize()

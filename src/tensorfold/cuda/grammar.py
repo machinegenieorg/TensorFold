@@ -12,6 +12,8 @@ A request asks with OpenAI's ``response_format`` (``{"type": "json_schema", "jso
   row is masked), and a stop token ends the reply, so the drafts from either on are dropped before verification.
 - ``advance(tokens)``: the chosen (committed) tokens only. ``mask`` and ``admissible`` roll the matcher back to the
   committed state, so a partial keep needs nothing restored.
+- ``draft_ok`` / ``mask_draft``: for the drafter only (speed, never the reply): a draft the grammar rejects is
+  redrawn from the draft head's logits masked the same way, so the chain proposes tokens a verify row can keep.
 
 The grammar decides when a reply ends: the mask allows a stop token only once the JSON value is complete. With
 thinking on, the grammar applies from the token after ``</think>``.
@@ -178,6 +180,7 @@ class Constraint:
         self.think_end = think_end
         self.active = think_end is None               # with thinking on: from the token after </think>
         self._shifts: dict[Any, Any] = {}
+        self._columns: dict[Any, Any] = {}
 
     @property
     def finished(self) -> bool:
@@ -185,8 +188,10 @@ class Constraint:
 
         return self.active and self.m.is_terminated()
 
-    def _walk(self, drafts: Sequence[int], bitmask=None) -> tuple[int, list[int]]:
-        """Follow ``drafts`` from the committed state and roll back: (drafts it admits, rows whose mask it filled)."""
+    def _walk(self, drafts: Sequence[int], bitmask=None, *, last: bool = False) -> tuple[int, list[int]]:
+        """Follow ``drafts`` from the committed state and roll back: (drafts it admits, rows whose mask it filled).
+
+        ``last``: fill only the row after every draft, as the bitmask's row 0."""
 
         m = self.m
         active = self.active
@@ -207,8 +212,8 @@ class Constraint:
                             break
                     elif t == self.think_end:
                         active = True
-                if bitmask is not None and active and not m.is_terminated():
-                    m.fill_next_token_bitmask(bitmask, r)
+                if bitmask is not None and active and not m.is_terminated() and (not last or r == len(drafts)):
+                    m.fill_next_token_bitmask(bitmask, 0 if last else r)
                     filled.append(r)
         finally:
             if accepted:
@@ -246,6 +251,40 @@ class Constraint:
         if allowed.shape[1] < width:                  # logits past the tokenizer's vocabulary: never allowed
             allowed = torch.nn.functional.pad(allowed, (0, width - allowed.shape[1]), value=False)
         return logits.masked_fill(~allowed[:, :width], float("-inf"))
+
+    def draft_ok(self, drafts: Sequence[int], token: int) -> bool:
+        """Whether the grammar follows ``drafts`` and then ``token`` without the reply ending there."""
+
+        path = list(drafts) + [int(token)]
+        if not self.active and self.think_end not in path:
+            return True
+        return self._walk(path)[0] == len(path)
+
+    def mask_draft(self, logits, drafts: Sequence[int], ids=None):
+        """A draft head's first row [1, n] after ``drafts`` with disallowed tokens at -inf (column c is ``ids[c]``),
+        or None when the head has no column the grammar allows."""
+
+        import torch
+
+        if not self.active and self.think_end not in drafts:
+            return logits
+        bitmask = torch.full((1, self.words), -1, dtype=torch.int32, pin_memory=logits.is_cuda)
+        if not self._walk(drafts, bitmask, last=True)[1]:
+            return logits
+        dev, width = logits.device, logits.shape[1]
+        key = (dev, width, None if ids is None else ids.data_ptr())
+        cols = self._columns.get(key)
+        if cols is None:                              # each column's word and bit, and whether it is a token at all
+            t = torch.arange(width, device=dev, dtype=torch.int64) if ids is None else ids.to(dev, torch.int64)
+            real = t < self.vocab
+            t = torch.where(real, t, 0)
+            cols = self._columns[key] = (t >> 5, (t & 31).to(torch.int32), real)
+        word, bit, real = cols
+        bits = bitmask.to(dev, non_blocking=True)[0]
+        allowed = (((bits.index_select(0, word) >> bit) & 1).bool() & real)[None]
+        if not bool(allowed.any()):
+            return None
+        return logits[:1].masked_fill(~allowed, float("-inf"))
 
     def advance(self, tokens: Sequence[int]) -> None:
         """Follow chosen tokens (each chosen under this grammar's mask); after the stop token, nothing follows."""

@@ -141,6 +141,25 @@ def test_admissible_drops_rejected_drafts_and_the_stop_token(grammars):
         fresh.advance(_ids("x"))
 
 
+def test_the_drafter_is_steered_to_tokens_the_grammar_takes(grammars):
+    import torch
+
+    c = grammars.constraint(grammars.compile(grammar.Spec("json_schema", json.dumps(SCHEMA))))
+    c.advance(_ids('{"k'))
+    assert c.draft_ok([], ord('"')) and c.draft_ok(_ids('":'), ord("4")) and not c.draft_ok([], ord("x"))
+    assert c.draft_ok(_ids('":1'), ord("}")) and not c.draft_ok(_ids('":1}'), 0)   # the stop token is no draft
+    ids = torch.tensor([ord("x"), ord('"'), ord("4"), 200, ord(":")])           # a draft head's columns (200: none)
+    logits = torch.zeros(3, 5)
+    first = c.mask_draft(logits, [], ids)
+    assert first.shape == (1, 5) and torch.isfinite(first[0]).tolist() == [False, True, False, False, False]
+    assert c.mask_draft(logits, [], torch.tensor([ord("x"), 200])) is None      # no column the grammar allows
+    after = c.mask_draft(logits, _ids('":'), ids)
+    assert torch.isfinite(after[0]).tolist() == [False, False, True, False, False]
+    whole = c.mask_draft(torch.zeros(1, 130), _ids('":'))                        # no ids: column t is token t
+    assert set(torch.nonzero(torch.isfinite(whole[0])).flatten().tolist()) == _expected(grammars, _ids('{"k":'))
+    assert c.admissible(_ids('":1}')) == _ids('":1}')                          # the matcher is where it was
+
+
 def test_with_thinking_the_grammar_starts_after_think_end(grammars):
     import torch
 
