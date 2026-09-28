@@ -87,7 +87,9 @@ def _expected(grammars, prefix: list[int]) -> set[int]:
 
 def test_schemas_compile_or_are_refused_with_the_reason(grammars):
     assert grammars.compile(grammar.Spec("json_schema", json.dumps(SCHEMA))) is not None
-    assert grammars.compile(grammar.Spec("json")) is not None
+    obj = grammars.constraint(grammars.compile(grammar.Spec("json")))            # json_object: any object only
+    assert obj.admissible(_ids('{"any": [1, "x"]}') + [0]) == _ids('{"any": [1, "x"]}')
+    assert obj.admissible(_ids("[1]")) == []
     for bad, words in (({"type": "nonsense"}, 'Unsupported type "nonsense"'),
                        ({"$ref": "#/definitions/missing"}, "definitions/missing"),
                        ({"type": "string", "pattern": "("}, "parenthesis")):

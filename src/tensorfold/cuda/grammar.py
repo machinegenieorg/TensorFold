@@ -30,6 +30,7 @@ from tensorfold.server.errors import RequestError
 
 EXTRA = "tensorfold[grammar]"             # the optional dependency that brings xgrammar
 CACHE_BYTES = 256 << 20                   # compiled grammars kept for repeated schemas
+OBJECT = '{"type": "object"}'             # json_object: any JSON object (OpenAI's contract), not an array
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,7 @@ class Grammars:
         self.vocab_size = int(info.vocab_size)
         self.think_end = think_end
         self.compiler = xgr.GrammarCompiler(info, max_threads=8, cache_limit_bytes=CACHE_BYTES)
+        self.lock = threading.Lock()              # requests compile on their own HTTP threads
 
     @classmethod
     def for_model(cls, model_dir: str | Path, vocab_size: int, stop_ids: Sequence[int]) -> "Grammars":
@@ -127,9 +129,8 @@ class Grammars:
         """The compiled grammar, or RequestError naming what the schema gets wrong."""
 
         try:
-            if spec.kind == "json":
-                return self.compiler.compile_builtin_json_grammar()
-            return self.compiler.compile_json_schema(spec.schema)
+            with self.lock:
+                return self.compiler.compile_json_schema(OBJECT if spec.kind == "json" else spec.schema)
         except (RuntimeError, ValueError, TypeError) as exc:
             raise RequestError(f"{spec.field}: the JSON schema cannot be enforced: {_message(exc)}") from None
 
