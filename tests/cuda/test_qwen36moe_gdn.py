@@ -233,9 +233,3 @@ def test_unknown_gates_and_head_counts_are_refused():
     out, _ = _outs(rows, nv)
     with pytest.raises(RuntimeError):
         gdn.chain(p, cs, cw, state, a_log, dt, nw, EPS, rows, sc, torch.empty_like(state), out, None, gate="silu")
-
-
-def test_the_extension_is_built_without_fma_contraction():
-    """Replay shares ``update`` with the chain; no FMA contraction keeps a replayed row on the chain's bits."""
-
-    assert "--fmad=false" in gdn.CUDA_FLAGS

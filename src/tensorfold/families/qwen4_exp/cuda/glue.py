@@ -330,9 +330,6 @@ def _attn_prep(P, POS0, QW, KW, IW, INV, Q, KC, VC, IQ, IKC, eps,
 def attn_prep(p: torch.Tensor, pos0: torch.Tensor, q_scale, k_scale, i_scale, inv_freq, q, kc, vc, iq, ikc,
               eps: float, *, q_heads: int, kv_heads: int, head_dim: int, index_heads: int = 0,
               index_dim: int = 0) -> None:
-    """``index_heads`` 0 (a dense model, Qwen3.6): p is [q|gate pairs | k | v], no indexer-key program runs and
-    i_scale, iq and ikc are unused (None)."""
-
     rows, pw = p.shape
     indexed = index_heads > 0
     _attn_prep[(rows, q_heads + kv_heads + (index_heads + 1 if indexed else 0))](
@@ -343,8 +340,7 @@ def attn_prep(p: torch.Tensor, pos0: torch.Tensor, q_scale, k_scale, i_scale, in
 
 @triton.jit
 def _attn_gate(O, P, OUT, XS, PW: tl.constexpr, NQ: tl.constexpr, HD: tl.constexpr, GS: tl.constexpr):
-    """Program (r, h): bf16(o * sigmoid(gate)) (fp32 math), gate from the [q | gate] pairs, and the sums of each
-    GS-input group (the o projection's quantization group)."""
+    """Program (r, h): bf16(o * sigmoid(gate)) (fp32 math), gate from the [q | gate] pairs, and group sums."""
 
     r = tl.program_id(0)
     h = tl.program_id(1)
@@ -359,8 +355,6 @@ def _attn_gate(O, P, OUT, XS, PW: tl.constexpr, NQ: tl.constexpr, HD: tl.constex
 
 def attn_gate(o: torch.Tensor, p: torch.Tensor, out: torch.Tensor, xs: torch.Tensor, *, q_heads: int,
               head_dim: int, group: int = 32) -> None:
-    """xs [R, NQ HD / group] fp32: group 32 for Flash Next's checkpoint, 64 for Qwen3.6's MLX g64."""
-
     rows = o.shape[0]
     _attn_gate[(rows, q_heads)](o, p, out, xs, PW=p.shape[1], NQ=q_heads, HD=head_dim, GS=group, num_warps=2)
 

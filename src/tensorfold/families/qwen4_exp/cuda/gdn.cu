@@ -1,5 +1,4 @@
-// Gated DeltaNet on CUDA for Flash Next and Qwen3.6-35B-A3B: one block of 1024 threads per value head, a
-// chain of R rows.
+// Flash Next's Gated DeltaNet on CUDA: one block of 1024 threads per value head, a chain of R rows.
 //
 // Per row: the depthwise conv over [conv state; projection rows] (4 taps, fp32) with SiLU (one bf16
 // rounding), fp32 L2 norms of q and k (eps inside the sum, q times DK^-0.5), g = exp(-exp(A_log) *
@@ -18,8 +17,7 @@
 namespace {
 
 constexpr int DK = 128, DV = 128, TAPS = 4;
-// NK key heads and NV value heads: Flash Next's layer (16, 48) or one tensor-parallel rank's share (8, 24),
-// Qwen3.6-35B-A3B's layer (16, 32)
+// NK key heads and NV value heads: the whole layer (16, 48), a tensor-parallel rank's (8, 24) or Qwen3.6's (16, 32)
 
 __device__ __forceinline__ float bf(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
 

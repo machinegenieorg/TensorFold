@@ -1,8 +1,4 @@
-"""Attend each row over fixed absolute-position chunks, selecting QSA blocks by score with ties to lower block ids so window size never changes its bits.
-
-A dense model (``AttnScratch(..., sparse=False)``: Qwen3.6, 16 query heads over 2 KV heads) never turns QSA on: every
-row reads all its keys at any capacity, and it has no indexer to select with.
-"""
+"""Attend each row over fixed absolute-position chunks, selecting QSA blocks by score with ties to lower block ids so window size never changes its bits."""
 
 from __future__ import annotations
 
@@ -97,15 +93,13 @@ def _merge(PO, PM, PL, POS0, OUT, NKR, SPR, H: tl.constexpr, HK: tl.constexpr, D
 class AttnScratch:
     def __init__(self, rows: int, heads: int, head_dim: int, capacity: int, device, *, budget: int = 2048,
                  ratio: int = 4, sparse: bool = True) -> None:
-        # a row reads at most budget + ratio - 1 keys (dense below the budget, its selected blocks and tail past it);
-        # a dense model's row (sparse=False) reads every key it has
+        # a row reads at most budget + ratio - 1 keys (dense below the budget, its selected blocks and tail past it)
         self.nch = -(-(min(capacity, budget + ratio - 1) if sparse else capacity) // CHUNK)
         self.po = torch.zeros((rows, self.nch, heads, head_dim), dtype=torch.float32, device=device)
         self.pm = torch.zeros((rows, self.nch, heads), dtype=torch.float32, device=device)
         self.pl = torch.zeros((rows, self.nch, heads), dtype=torch.float32, device=device)
         self.out = torch.empty((rows, heads, head_dim), dtype=torch.bfloat16, device=device)
-        # sparse attention (QSA): each row's key list, its length, whether it is sparse, block scores. Only a model
-        # with an indexer (sparse=True, Flash Next) turns it on, once the cache can pass the budget.
+        # sparse attention (QSA): each row's key list, its length, whether it is sparse, block scores
         self.budget, self.ratio = budget, ratio
         self.idw = budget + ratio
         self.qsa = sparse and capacity > budget
