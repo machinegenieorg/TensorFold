@@ -27,18 +27,18 @@ def h(name, *ts):
     OUT[name] = m.hexdigest()
 
 
+# inputs are drawn on the CPU and moved: a GPU generator's draws depend on the SM count
 def mlx(n, k, seed, lead=(), gs=32):
-    g = torch.Generator(device=DEV).manual_seed(seed)
-    words = torch.randint(-(2**31), 2**31 - 1, (*lead, n, k // 8), generator=g, device=DEV,
-                          dtype=torch.int64).to(torch.int32)
-    scales = (torch.rand((*lead, n, k // gs), generator=g, device=DEV) * 0.02 + 0.001).to(torch.bfloat16)
-    biases = (torch.randn((*lead, n, k // gs), generator=g, device=DEV) * 0.02).to(torch.bfloat16)
-    return words, scales, biases
+    g = torch.Generator().manual_seed(seed)
+    words = torch.randint(-(2**31), 2**31 - 1, (*lead, n, k // 8), generator=g, dtype=torch.int64).to(torch.int32)
+    scales = (torch.rand((*lead, n, k // gs), generator=g) * 0.02 + 0.001).to(torch.bfloat16)
+    biases = (torch.randn((*lead, n, k // gs), generator=g) * 0.02).to(torch.bfloat16)
+    return words.to(DEV), scales.to(DEV), biases.to(DEV)
 
 
 def xin(m, k, seed):
-    g = torch.Generator(device=DEV).manual_seed(seed)
-    return torch.randn((m, k), generator=g, device=DEV).to(torch.bfloat16)
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn((m, k), generator=g).to(torch.bfloat16).to(DEV)
 
 
 # -- lane matmul -----------------------------------------------------------------------------------------------
@@ -71,17 +71,17 @@ S, D, LOW = 4, 2560, 320
 down = qmm.stack_q4([mlx(LOW, S * D, 5), mlx(S, S * D, 6)], "tiled")
 up = qmm.make_q4(*mlx(S * D, LOW, 7), "tiled")
 for rows in (1, 7, 16):
-    g = torch.Generator(device=DEV).manual_seed(rows)
-    hh = (torch.randn((rows, S * D), generator=g, device=DEV) * 3).to(torch.bfloat16)
-    pss = torch.rand((rows, D // 256, S), generator=g, device=DEV) * 10 + 1
-    scale = 1 + 0.05 * torch.randn((S * D,), generator=g, device=DEV)
+    g = torch.Generator().manual_seed(rows)
+    hh = (torch.randn((rows, S * D), generator=g) * 3).to(torch.bfloat16).to(DEV)
+    pss = (torch.rand((rows, D // 256, S), generator=g) * 10 + 1).to(DEV)
+    scale = (1 + 0.05 * torch.randn((S * D,), generator=g)).to(DEV)
     normed = torch.empty((rows, S * D), dtype=torch.bfloat16, device=DEV)
     sk = qmm.split_for(down.n, down.k)
     out = torch.empty((rows, down.n), dtype=torch.bfloat16, device=DEV)
     part = torch.empty((sk * rows * down.n,), dtype=torch.float32, device=DEV)
     got = qmm.hc_down(hh, pss, scale, normed, down, 1e-6, S, out=out, part=part)
     h(f"hc_down/{rows}", got, normed)
-    act = torch.randn((rows, LOW), generator=g, device=DEV).to(torch.bfloat16)
+    act = torch.randn((rows, LOW), generator=g).to(torch.bfloat16).to(DEV)
     xs = qmm.group_sums(act)
     mixed = torch.empty((rows, D), dtype=torch.bfloat16, device=DEV)
     xsm = torch.empty((rows, D // 32), dtype=torch.float32, device=DEV)
@@ -109,8 +109,8 @@ class Cfg:
     hidden_size = 2560
 
 
-g = torch.Generator(device=DEV).manual_seed(5)
-router_rows = (torch.randn((65, DD), generator=g, device=DEV) * 0.02).to(torch.bfloat16)
+g = torch.Generator().manual_seed(5)
+router_rows = (torch.randn((65, DD), generator=g) * 0.02).to(torch.bfloat16).to(DEV)
 for rows in (1, 2, 3, 4, 8, 16, 17, 40):
     x = xin(rows, DD, 1000 + rows)
     for prefill in (False, True):
@@ -160,8 +160,7 @@ for nk, nv in ((16, 48), (8, 24)):
             ptr = torch.tensor([cs.data_ptr()], dtype=torch.int64, device=DEV)
             q, k, v, gt, beta = gdn_io.front(p, ptr, sid, win, cw, a_log, dt, nk)
             h(f"gdn_io_front/{rows}", q, k, v, gt, beta)
-            y = torch.randn((rows, nv, 128), generator=torch.Generator(device=DEV).manual_seed(rows),
-                            device=DEV).to(torch.bfloat16)
+            y = torch.randn((rows, nv, 128), generator=torch.Generator().manual_seed(rows)).to(torch.bfloat16).to(DEV)
             bo = torch.empty((rows, nv * 128), dtype=torch.bfloat16, device=DEV)
             bx = torch.empty((rows, nv * 4), dtype=torch.float32, device=DEV)
             gdn_io.back(y, p, nw, 1e-6, bo, bx)

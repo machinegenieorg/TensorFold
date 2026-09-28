@@ -49,14 +49,14 @@ def fn_outputs(case: str) -> dict[str, str]:
     """Flash Next's attention path on fixed random inputs: prep, block selection, attention and gate, hashed."""
 
     cap, p0, rows = FN_CASES[case]
-    g = torch.Generator(device=DEV).manual_seed(1000 + p0)
+    g = torch.Generator().manual_seed(1000 + p0)   # on the CPU: a GPU generator's draws depend on the SM count
     pw = FN_H * 2 * FN_D + 2 * FN_HK * FN_D + (FN_NI + 1) * FN_DI
-    p = torch.randn((rows, pw), generator=g, device=DEV).to(BF)
-    kc = torch.randn((cap, FN_HK, FN_D), generator=g, device=DEV).to(BF)
-    vc = torch.randn((cap, FN_HK, FN_D), generator=g, device=DEV).to(BF)
-    ikc = torch.randn((cap, FN_DI), generator=g, device=DEV).to(BF)
-    qs, ks = ((1 + 0.05 * torch.randn((FN_D,), generator=g, device=DEV)).float() for _ in range(2))
-    iqs, iks = ((1 + 0.05 * torch.randn((FN_DI,), generator=g, device=DEV)).float() for _ in range(2))
+    p = torch.randn((rows, pw), generator=g).to(BF).to(DEV)
+    kc = torch.randn((cap, FN_HK, FN_D), generator=g).to(BF).to(DEV)
+    vc = torch.randn((cap, FN_HK, FN_D), generator=g).to(BF).to(DEV)
+    ikc = torch.randn((cap, FN_DI), generator=g).to(BF).to(DEV)
+    qs, ks = ((1 + 0.05 * torch.randn((FN_D,), generator=g)).to(DEV) for _ in range(2))
+    iqs, iks = ((1 + 0.05 * torch.randn((FN_DI,), generator=g)).to(DEV) for _ in range(2))
     inv, pos = _inv_freq(), _pos(p0)
     q = torch.zeros((rows, FN_H, FN_D), dtype=BF, device=DEV)
     iq = torch.zeros((rows, FN_NI, FN_DI), dtype=BF, device=DEV)
@@ -80,46 +80,28 @@ def fn_outputs(case: str) -> dict[str, str]:
     return out
 
 
-# per compute capability, fn_outputs() on v0.3.5 (a3274f1): tools/hash_flashnext.py's attn/ entries
+# per compute capability, fn_outputs() on v0.3.5.1 (beddbb7): tools/hash_flashnext.py's attn/ entries
 FN_HASHES: dict[tuple[int, int], dict[str, dict[str, str]]] = {
-    (12, 0): {                   # RTX 5090, Triton 3.7.1 (NVIDIA PyTorch 26.07)
+    (12, 0): {                   # RTX 5090 and RTX PRO 6000, the same bits; Triton 3.7.1 (NVIDIA PyTorch 26.07)
         "dense": {
-            "prep": "42cf3a56d37c416a7e375b22d4d5cced1e05ff45a2dd5429c63924639a17ebec",
-            "attn": "b72122e02bad1049778f7feff0973c283f14f3a112e37a4aebf3f7fc78f8696e",
-            "gate": "1e90cbc40fe51d34c25a0db0a26bc68c61573f8473acc3f181529ee35c71e73d",
+            "prep": "d98bd1f37a07ca1a87786dbda9132396ef1d6254f317880a9921701b5ea80fc9",
+            "attn": "194904cf7561dbe0c779ca649d40fb595713b26e7e711388583d8122da1fc74b",
+            "gate": "cd05ea6a91326d0119d6a9f35574ac448a07e6bdc90a560e5e57039e07bbdab6",
         },
         "mixed": {
-            "prep": "c7446018042986d880a37e41a70278a3a80e37637c09aaac54954ed3ae3acc1e",
-            "select": "f553d759760c1e8db7c668608dd099d4ac122d6f2aa72c4e5a947e8b5650585e",
-            "attn": "9c8b4399e8edd0970debdf84237bfefedc119a7267265a96e0b9dd587f198999",
-            "gate": "295f08dde8410a8e44180981a0901b835533666d0e3895ad7aa9e8b854cd406f",
+            "prep": "44f69e7b2f78d404952bd81b13a441da6f3c59070393e3d0c9b719c4bda6c82e",
+            "select": "55d5f96d8a415f280687a09ce678b334b105a6d7bdc4c33095488b4e5d47b212",
+            "attn": "5a8e4715bb81c4fae562e990fb4b7b5df7db834795ab70d3848aad604b3fa0d8",
+            "gate": "aadd8cc7a7e21ce579f9a33fb3d8b746a54079f62407e4006dbec17260a0a5f2",
         },
         "sparse": {
-            "prep": "dc2cc6b02a80bf60e6487429c796a6b0e3e291864cac9c5fb302e4c42acc1d88",
-            "select": "f0633a885d8bc7fc5d9c819ea8e7d2d778baea519d1be1c8d10498527f982e31",
-            "attn": "129d0448274ca9538bb99e817d55911ab5027211dabdb88751c4e5d8b681066d",
-            "gate": "947e3c71a83d5809f205635f9d9d5b6d62b358bcc136086e623d7c581d42cecf",
+            "prep": "00d3feae3ab0a7924d38bbaa82a845a3204239a875698b21f70dc96dc30d23e2",
+            "select": "85465b0b9eefe90ba5f18ffea2a244a8af739a2f3d21100fc611790828f3d028",
+            "attn": "9a67ae949f4eb16113c6ee6dee95a279d61b02be9a36338a79fbe61d899f0a0d",
+            "gate": "7b6a6747e5b6fab24210d6ab4b62d6c8d14d7a747c9054b7c5f284a1632b1557",
         },
     },
-    (12, 1): {                   # GB10, NVIDIA PyTorch 26.07, TORCH_CUDA_ARCH_LIST=12.1: v0.3.5.1 (CUDA as v0.3.5)
-        "dense": {
-            "prep": "a54f5f4b418e831bc8362d207a48ef9613fa09ae736d1dffc6472dad03b96b13",
-            "attn": "d0752055d2fe4422b48d03d1a36de7bfd71d0253995a584961977c4355ff7965",
-            "gate": "3831541e431952fc4daea20ef5ec0fcfdb47a4773a9dfd1e03b9d9d890d7f52e",
-        },
-        "mixed": {
-            "prep": "8a629f706dd78e1840b81ef16841a1229a638f58026ccf4eaa52bd9495655750",
-            "select": "acdbadd026e82742a1afe9879c475621484656f003865509ad806af25dd02152",
-            "attn": "9d9eb1ab474317d6c134c894a524d7e6dd999910b38c8e0058dfaa06034e1967",
-            "gate": "f9297c95dc44e3d5e60d990ddb81ccb3851818506425740515a353ea93e85fdd",
-        },
-        "sparse": {
-            "prep": "35ce85b917dee2b4ad3017e696c3bcbc03c5d3fd38cef611cc4d926d35081c66",
-            "select": "b5e2572c6e48fb86d5a82e97eac898b446d445e72d4141780960a35c6f88b3ef",
-            "attn": "19cf8b6f6304a20c46293687272a7bf346ea710132d1f900c3d0cf6c41811a46",
-            "gate": "8ca2a8cd90a77f0437497b6d60dd4d5323dedb3949667bd8f6dc1934e2dcb744",
-        },
-    },
+    # (12, 1), GB10: recorded by the GB10 run
 }
 
 
