@@ -334,11 +334,11 @@ def real():
         return app.tok.encode(app.template.render(messages, tools=None, enable_thinking=False),
                               add_special_tokens=False).ids
 
-    ns = SimpleNamespace(eng=eng, fresh=fresh, render=render)
-    del eng, fresh, app
+    ns = SimpleNamespace(eng=eng, fresh=fresh, app=app, render=render)
+    del eng, fresh
     yield ns
     ns.eng.e = ns.fresh.e = None
-    ns.eng = ns.fresh = None
+    ns.eng = ns.fresh = ns.app = ns.render = None
     gc.collect()
     torch.cuda.empty_cache()
 
