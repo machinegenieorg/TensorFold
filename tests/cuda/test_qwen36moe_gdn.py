@@ -1,7 +1,4 @@
-"""Qwen3.6-35B-A3B's Gated DeltaNet on the chain Flash Next uses (``qwen4_exp/cuda/gdn.cu``): 16 key and 32
-value heads, the read-out gated by SiLU(z), no 32-group sums. A window's rows and a replayed prefix give the
-bits of serial steps, the result tracks a plain fp32 recurrence, and Flash Next's outputs keep the bits they have
-on v0.3.5."""
+"""Qwen3.6-35B-A3B's Gated DeltaNet on Flash Next's chain: serial bits in windows and replays, fp32, FN's own bits."""
 
 import hashlib
 
@@ -19,8 +16,7 @@ EPS = 1e-6
 
 
 def _inputs(nk: int, nv: int, rows: int, seed: int):
-    """bf16 projection rows, conv state and weights, an fp32 state. Drawn on the CPU, so the inputs do not depend
-    on the GPU's generator. Odd heads decay slowly (about 0.98 a row), even heads fast."""
+    """Projection rows, conv state and weights, fp32 state, drawn on the CPU; odd heads decay slowly, even fast."""
 
     g = torch.Generator().manual_seed(seed)
     conv, pw = gdn.widths(nk, nv)
@@ -51,11 +47,7 @@ def _bytes(t: torch.Tensor) -> bytes:
     return t.detach().contiguous().reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
 
 
-# SHA-256 over a Flash Next window's outputs, group sums, replay inputs, final state and three replayed prefixes,
-# recorded with the kernel before it was shared (upstream v0.3.5, a3274f1), per compute capability. Another GPU
-# architecture, nvcc or PyTorch gives other bits: record both sides on the same GPU and build, from the repository
-# root, with
-#   python -c "import sys; sys.path[:0] = ['tests/cuda']; import test_qwen36moe_gdn as t; print(t.flashnext_digests())"
+# SHA-256 of Flash Next's chain outputs, replay inputs and replays per compute capability: flashnext_digests() on v0.3.5
 CASES = ((16, 48, 1), (16, 48, 6), (16, 48, 17), (8, 24, 5))
 FLASHNEXT = {
     (12, 0): {  # RTX 5090 (sm_120), tensorfold-dev:26.07: torch 2.13.0a0 nv26.07, CUDA 13.3
@@ -64,6 +56,7 @@ FLASHNEXT = {
         (16, 48, 17): "78d1a4274dca019060ec64392418be539b7d8b691f02d114852b9028ede86673",
         (8, 24, 5): "f2efd765f0ea895b4e06459bbfd242e38e453bc370c8a36fd3620e61ff2bebdf",
     },
+    # (12, 1), GB10: the entries come from the GB10 run of flashnext_digests() on v0.3.5
 }
 
 
@@ -167,9 +160,7 @@ def test_group_sums_are_optional_and_never_change_a_row():
 
 
 def _fp32_reference(p, cs, cw, state, a_log, dt, nw, rows: int, nk: int, nv: int, gate: str):
-    """The recurrence in fp32 with no intermediate rounding: conv (4 taps, no bias) and SiLU, q and k L2-normed
-    (eps 1e-6) and q times 128^-0.5, g = -exp(A_log) softplus(a + dt_bias), beta = sigmoid(b), the delta rule,
-    then RMSNorm(y) w gated by silu(z) or sigmoid(z). Value head h reads key head h // (nv / nk)."""
+    """The recurrence in fp32 without intermediate rounding, gated by silu(z) or sigmoid(z)."""
 
     F = torch.nn.functional
     conv = gdn.widths(nk, nv)[0]
@@ -211,8 +202,6 @@ def test_matches_an_fp32_recurrence():
     top = ref.abs().max().item()
     serr = (out_state - S).abs().max().item()
     stop = S.abs().max().item()
-    print(f"\nqwen3.6 gdn vs fp32, {rows} rows: out max err {err:.3e} (max |out| {top:.3e}, "
-          f"{err / top:.2%}), state max err {serr:.3e} (max |state| {stop:.3e})")
     assert err < 0.03 * top, (err, top)
     assert serr < max(1e-2, 0.01 * stop), (serr, stop)
     # the gate is SiLU, not Flash Next's sigmoid

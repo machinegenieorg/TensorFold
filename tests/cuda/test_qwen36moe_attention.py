@@ -1,10 +1,4 @@
-"""Qwen3.6-35B-A3B attention on Flash Next's CUDA kernels: dense at any context (no sparse attention, no indexer),
-a row's bits never depend on the window, and the prep, attention and gate match an fp32 reference. Flash Next's
-own outputs keep their bits (SHA-256 of fixed random inputs, recorded on v0.3.5 for each GPU).
-
-Recording Flash Next's hashes on a new GPU or after a Triton upgrade: on v0.3.5 (a3274f1) run
-``python tests/cuda/test_qwen36moe_attention.py`` and add its output to ``FN_HASHES`` under the device's
-compute capability."""
+"""Qwen3.6-35B-A3B attention on Flash Next's kernels: dense at any context, row-invariant, fp32-close; FN's own bits."""
 
 import hashlib
 
@@ -52,8 +46,7 @@ FN_CASES = {                     # name: (capacity, P0, rows)
 
 
 def fn_outputs(case: str) -> dict[str, str]:
-    """Flash Next's attention path on fixed random inputs: prep (q, caches, indexer q and key), block selection
-    (when sparse attention is on), attention and gate, each stage's outputs hashed."""
+    """Flash Next's attention path on fixed random inputs: prep, block selection, attention and gate, hashed."""
 
     cap, p0, rows = FN_CASES[case]
     g = torch.Generator(device=DEV).manual_seed(1000 + p0)
@@ -87,7 +80,7 @@ def fn_outputs(case: str) -> dict[str, str]:
     return out
 
 
-# recorded on v0.3.5 (a3274f1) by this file's __main__, per compute capability
+# per compute capability, fn_outputs() on v0.3.5 (a3274f1): tools/hash_flashnext.py's attn/ entries
 FN_HASHES: dict[tuple[int, int], dict[str, dict[str, str]]] = {
     (12, 0): {                   # RTX 5090, Triton 3.7.1 (NVIDIA PyTorch 26.07)
         "dense": {
@@ -108,6 +101,7 @@ FN_HASHES: dict[tuple[int, int], dict[str, dict[str, str]]] = {
             "gate": "947e3c71a83d5809f205635f9d9d5b6d62b358bcc136086e623d7c581d42cecf",
         },
     },
+    # (12, 1), GB10: the entries come from the GB10 run of tools/hash_flashnext.py on v0.3.5
 }
 
 
@@ -115,7 +109,7 @@ FN_HASHES: dict[tuple[int, int], dict[str, dict[str, str]]] = {
 def test_flash_next_attention_keeps_its_bits(case):
     arch = torch.cuda.get_device_capability()
     if arch not in FN_HASHES:
-        pytest.skip(f"no Flash Next hashes recorded for sm_{arch[0]}{arch[1]}: run this file on v0.3.5")
+        pytest.skip(f"no Flash Next hashes recorded for sm_{arch[0]}{arch[1]}: run tools/hash_flashnext.py on v0.3.5")
     assert fn_outputs(case) == FN_HASHES[arch][case]
 
 
@@ -125,8 +119,7 @@ PW = H * 2 * D + 2 * HK * D          # [q|gate pairs | k | v]: no indexer column
 
 
 class _Inputs:
-    """A window's projection rows, the cache before it (normed, rotated keys; values) and the norm weights as
-    the checkpoint stores them (zero-centred, bf16) with the fp32 scales 1 + w the loader passes."""
+    """A window's projection rows, the cache before it, and zero-centred norm weights with their fp32 1 + w."""
 
     def __init__(self, rows: int, cap: int, seed: int) -> None:
         g = torch.Generator(device=DEV).manual_seed(seed)
@@ -182,8 +175,7 @@ def _assert_window_matches(x: _Inputs, p0: int, m: int, steps, kc_s, vc_s, cap: 
 
 @pytest.mark.parametrize("p0", [0, 450, 3990])
 def test_rows_alone_match_rows_in_windows(p0):
-    """Windows of 2, 3, 16, 17, 64 and 128 rows starting at P0 (450: across the 512-key chunk boundary; 3990:
-    across 4096, a context where Flash Next's attention would be sparse): each row equals the row alone."""
+    """Windows of 2 to 128 rows from P0 (across a 512-key chunk, and across 4096): each row equals the row alone."""
 
     x = _Inputs(128, 4608, seed=2000 + p0)
     steps, kc_s, vc_s = _serial(x, p0, 128)
@@ -192,9 +184,7 @@ def test_rows_alone_match_rows_in_windows(p0):
 
 
 def _reference(x: _Inputs, p0: int, rows: int, keep: int | None = None):
-    """fp32 on the CPU, as the model defines it: RMSNorm x * rsqrt(mean(x^2) + eps) * (1 + w); rotate-half RoPE on
-    the first 64 dims at theta 1e7; SDPA over the cached keys and the window's causal keys (the last ``keep`` keys
-    only, when given); out = attention * sigmoid(gate)."""
+    """fp32 on the CPU: q/k RMSNorm (1 + w), partial RoPE, SDPA (over the last ``keep`` keys if given), the gate."""
 
     F = torch.nn.functional
     pr = x.p[:rows].float().cpu()
@@ -238,8 +228,7 @@ def _err(got: torch.Tensor, ref: torch.Tensor) -> tuple[float, float]:
 
 @pytest.mark.parametrize("p0", [3, 700, 4090])
 def test_prep_attention_and_gate_match_fp32(p0):
-    """q/k RMSNorm (1 + w, fp32, one bf16 rounding), partial rotary, dense attention and the sigmoid gate against
-    an fp32 SDPA reference; values are copied to the cache bit for bit."""
+    """Prep, dense attention and the gate against an fp32 SDPA reference; values reach the cache bit for bit."""
 
     rows = 5
     x = _Inputs(rows, 4608, seed=3000 + p0)
@@ -248,8 +237,6 @@ def test_prep_attention_and_gate_match_fp32(p0):
     rq, rk, rv, ro, rg = _reference(x, p0, rows)
     assert torch.equal(vc[p0:p0 + rows], x.p[:, H * 2 * D + HK * D:].reshape(rows, HK, D))
     errs = {"q": _err(q, rq), "k": _err(kc[p0:p0 + rows], rk), "attention": _err(o, ro), "gated": _err(gated, rg)}
-    print(f"\nfp32 max abs error at P0={p0}: " + ", ".join(f"{k} {e:.3g} (max |ref| {m:.3g})"
-                                                         for k, (e, m) in errs.items()))
     for k, (e, m) in errs.items():
         assert e <= m * 2 ** -6, (k, e, m)
     sums = gated.float().reshape(rows, -1, 64).sum(-1)
@@ -257,8 +244,7 @@ def test_prep_attention_and_gate_match_fp32(p0):
 
 
 def test_rows_at_the_chunk_boundary_are_dense_and_exact():
-    """Rows whose last key is 511, 512 and 513 (one full 512-key chunk, then one and two keys into the next):
-    alone equals in the window, and each reads every one of its keys (the fp32 reference over all of them)."""
+    """Rows whose last key is 511, 512 and 513: alone equals in the window, and each reads all its keys."""
 
     p0, rows = 509, 8
     x = _Inputs(rows, 1024, seed=4000)
@@ -272,9 +258,7 @@ def test_rows_at_the_chunk_boundary_are_dense_and_exact():
 
 
 def test_a_4k_context_stays_dense_and_exact():
-    """P0 = 4087, 17 rows (across 4096) in a 4608- and an 8192-key cache: no sparse attention (Flash Next's scratch
-    at this capacity would turn it on), the same bits alone, in the window and at either capacity, and the fp32
-    reference over every key (a reference that drops the oldest keys is far off)."""
+    """17 rows across 4096 keys at two capacities: dense, the same bits everywhere, and near the full-key reference."""
 
     p0, rows = 4087, 17
     assert att.AttnScratch(1, H, D, 4608, DEV).qsa                  # the sparse default at this capacity
@@ -290,11 +274,3 @@ def test_a_4k_context_stays_dense_and_exact():
     far, _ = _err(o, rtrunc)
     assert e <= m * 2 ** -6, (e, m)
     assert far > 8 * e, (far, e)
-
-
-if __name__ == "__main__":
-    arch = torch.cuda.get_device_capability()
-    print(f"    {arch}: {{")
-    for name in sorted(FN_CASES):
-        print(f"        {name!r}: {fn_outputs(name)!r},")
-    print("    },")

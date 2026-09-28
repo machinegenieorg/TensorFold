@@ -1,8 +1,4 @@
-"""Qwen3.6-35B-A3B MoE kernels on synthetic weights (256 experts, top 8, width 512, the shared expert as expert
-256): router logits, selection, the shared experts' plan, and every (row, slot) output give a row the same bits
-alone, in any window (up to 512-row prompt chunks) and in any row order; exact ties go to the lower expert id; the
-combine adds the slots in pick order and then the shared expert; results agree with a float64 reference.
-"""
+"""Qwen3.6-35B-A3B's MoE kernels on synthetic weights: row-invariant, ties to lower ids, ordered combine, float64."""
 
 from __future__ import annotations
 
@@ -83,7 +79,6 @@ def test_router_rows_do_not_depend_on_the_window():
             assert torch.equal(got, alone[:m]), (bm, be, m)
     ref = x.double() @ table.double().T
     err = (alone.double() - ref).abs().max().item()
-    print(f"\nrouter: max|logit| {ref.abs().max().item():.3f}, max err vs float64 {err:.3e}")
     assert err <= ref.abs().max().item() * 1e-5
     # the logit is one fp32 fused multiply-add chain over k = 0, 1, ..., D - 1 (exact emulation)
     for r, e in ((0, 0), (7, 128), (199, E)):
@@ -166,8 +161,7 @@ def test_router_ties_from_equal_rows_go_to_the_lower_id():
 
 
 def test_the_plan_covers_every_pair_once():
-    """The shared experts' plan: items (expert, first, count) over the members, every (row, slot) pair once and
-    under the expert it picked, the shared expert in every row."""
+    """The plan's items cover every (row, slot) pair once, under the expert it picked; the shared one in every row."""
 
     table = router_table(5)
     for m in (1, 2, 17, 64, 129, 512):
@@ -216,9 +210,7 @@ def test_moe_rows_do_not_depend_on_the_window():
 
 
 def test_moe_prefill_width_windows_keep_each_rows_bits():
-    """129 and 512 rows (prefill chunks, decode form): the shared expert takes an item for every 16 of its pairs,
-    popular experts several, the last one part-filled. Every (row, slot) output equals the row alone; outputs start
-    as NaN, so every one is written."""
+    """129 and 512 rows (prefill chunks): several and part-filled items; every output, NaN-initialised, as alone."""
 
     table = router_table(11)
     g = torch.Generator(device=DEV).manual_seed(12)
@@ -242,8 +234,6 @@ def test_moe_prefill_width_windows_keep_each_rows_bits():
             sizes[e] = sizes.get(e, 0) + count
         assert sizes[E] == rows and sum(sizes.values()) == rows * SLOTS and len(sizes) == distinct
         routed = torch.tensor([v for e, v in sizes.items() if e != E])
-        print(f"\n{rows} rows: {distinct - 1} routed experts in {n_items} items, members min {int(routed.min())} "
-              f"median {int(routed.median())} max {int(routed.max())}")
         assert int(routed.max()) > 16 and int((routed < 16).sum()) > 0         # several items, and part-filled ones
 
 
@@ -254,7 +244,6 @@ def test_moe_matches_a_float64_reference():
     sub = run(x, table)
     xd = x.double()
     logits = xd @ table.double().T
-    worst = 0.0
     for r in range(3):
         order = sorted(range(E), key=lambda e: (-logits[r, e].item(), e))[:K_TOP]
         assert sub.pick[r, :K_TOP].tolist() == order
@@ -263,9 +252,7 @@ def test_moe_matches_a_float64_reference():
             act = torch.nn.functional.silu(xd[r] @ gw.T) * (xd[r] @ uw.T)
             y = act @ dw.T
             err = (sub.y[r, s].double() - y).abs().max().item()
-            worst = max(worst, err / y.abs().max().item())
             assert err <= y.abs().max().item() * 2 ** -5 + 1e-3, (r, s, err)
-    print(f"\nexperts: worst (row, slot) max err vs float64 {worst:.2e} of that slot's max")
 
 
 # -- combine ---------------------------------------------------------------------------------------------------

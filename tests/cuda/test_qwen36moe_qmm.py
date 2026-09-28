@@ -1,11 +1,4 @@
-"""Qwen3.6-35B-A3B dense 4-bit matmuls (group 64, the shared lane kernel) on synthetic MLX weights: a row's bits
-alone equal its bits in any window (``torch.equal``), the row tile never changes bits, the K split is pinned per
-shape, and results agree with a float64 reference of the dequantized weights. The expert tables pack for the shared
-grouped kernels and unpack to MLX's arrays.
-
-References run in float64: NVIDIA's container sets TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1, which would run fp32 matmuls
-in TF32.
-"""
+"""Qwen3.6-35B-A3B's 4-bit matmuls: row-invariant at any window and tile, pinned K splits, float64 references."""
 
 from __future__ import annotations
 
@@ -130,8 +123,6 @@ def test_matches_a_float64_reference(n, k):
     scale = ref.abs().max().item()
     err32 = (y32 - ref).abs().max().item()
     err = (y - ref).abs().max().item()
-    print(f"\n{n}x{k}: max|ref| {scale:.3f}  fp32 sums max err {err32:.3e} ({err32 / scale:.2e} of max)  "
-          f"bf16 output max err {err:.3e} ({err / scale:.2e} of max)")
     assert err32 <= scale * 1e-5, err32
     assert err <= scale * 2 ** -8, err
     back = qmm.to_mlx(q)
@@ -177,8 +168,7 @@ def test_group_sums_rows_alone_and_against_float64():
 
 
 def test_expert_tables_pack_for_the_grouped_kernels():
-    """Nine experts (the last one appended, as the loader appends the shared expert): the packed tables unpack to
-    MLX's arrays, and SwiGLU's gate and up keep their order."""
+    """Nine experts, the last appended as the loader appends the shared one: the packed tables unpack to MLX's."""
 
     gate, up = mlx_weights(512, 2048, 31, (8,)), mlx_weights(512, 2048, 32, (8,))
     down = mlx_weights(2048, 512, 33, (8,))
