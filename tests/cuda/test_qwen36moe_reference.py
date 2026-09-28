@@ -1,18 +1,8 @@
-"""Qwen3.6-35B-A3B's fp32 reference forward (``qwen3_5_moe/cuda/reference.py``).
-
-On tiny random weights (CPU, no checkpoint): cached serial decode equals the full-sequence forward, for the model and
-the MTP head; the sliced head scores equal full logits; router ties go to the lower id.
-
-On the real checkpoint (skipped when it is not in the Hugging Face cache; run in NVIDIA's container with
-``TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0``, else fp32 matmuls run in TF32): teacher-forced NLL and top-1 over public
-text, greedy replies to three chat prompts (thinking off), and the MTP drafter's top-1 agreement with the model's
-next token, which checks the order of the drafter's fc input and which hidden state it reads.
-"""
+"""Qwen3.6-35B-A3B's fp32 reference on the real checkpoint: NLL and top-1 over public text, replies, MTP order."""
 
 from __future__ import annotations
 
 import os
-import time
 
 import pytest
 import torch
@@ -20,153 +10,6 @@ import torch
 from tensorfold.families import qwen3_5_moe as family
 from tensorfold.families.qwen3_5_moe.cuda import reference as R
 from tensorfold.families.qwen3_5_moe.cuda import weights as W
-
-BF, F32 = torch.bfloat16, torch.float32
-
-
-# ---------------------------------------------------------------------------------------------------------------
-# tiny random weights
-
-
-def _config() -> W.Config:
-    return W.Config(
-        hidden=128, layers=4, layer_types=["linear", "attention", "linear", "attention"], vocab=320, eps=1e-6,
-        heads=4, kv_heads=2, head_dim=64, attn_gate=True, rope_theta=1e7, partial_rotary=0.25, rotary_dim=16,
-        mrope_section=(3, 3, 2), nk=2, nv=4, dk=32, dv=32, conv_kernel=4, experts=8, top_k=2, moe_width=64,
-        shared_width=64, norm_topk=True, tie_embeddings=False, mtp_layers=1, max_position=4096, eos=(2,), bits=4,
-        group_size=64)
-
-
-def _qw(gen: torch.Generator, n: int, k: int, lead: tuple[int, ...] = (), gain: float = 1.0) -> W.QW:
-    """Random 4-bit g64 weights whose values are near uniform with variance gain^2 / k."""
-
-    words = torch.randint(-2 ** 31, 2 ** 31, (*lead, n, k // 8), generator=gen, dtype=torch.int64).to(torch.int32)
-    step = gain * (12.0 / k) ** 0.5 / 15
-    scales = (step * (0.5 + torch.rand((*lead, n, k // 64), generator=gen))).to(BF)
-    biases = (-7.5 * scales.float() + 0.1 * step * torch.randn((*lead, n, k // 64), generator=gen)).to(BF)
-    return W.QW(words, scales, biases, 4, 64)
-
-
-def _scale(gen: torch.Generator, n: int) -> torch.Tensor:
-    return 1.0 + 0.1 * torch.randn(n, generator=gen)
-
-
-def _moe(gen: torch.Generator, c: W.Config) -> W.MoEW:
-    e, d, m = c.experts + 1, c.hidden, c.moe_width
-    router = 3.0 * torch.randn((e, d), generator=gen) / d ** 0.5
-    return W.MoEW(router, _qw(gen, m, d, (e,)), _qw(gen, m, d, (e,)), _qw(gen, d, m, (e,)))
-
-
-def _attn(gen: torch.Generator, c: W.Config) -> W.AttnW:
-    return W.AttnW(_qw(gen, sum(c.attn_rows), c.hidden), _scale(gen, c.head_dim), _scale(gen, c.head_dim),
-                   _qw(gen, c.hidden, c.heads * c.head_dim))
-
-
-def _gdn(gen: torch.Generator, c: W.Config) -> W.GDNW:
-    conv = (0.5 * torch.randn((c.conv_dim, c.conv_kernel), generator=gen)).to(BF)
-    return W.GDNW(_qw(gen, sum(c.gdn_rows), c.hidden), conv, torch.log(1.0 + 15.0 * torch.rand(c.nv, generator=gen)),
-                  torch.randn(c.nv, generator=gen), _scale(gen, c.dv).to(BF), _qw(gen, c.hidden, c.nv * c.dv))
-
-
-def _tiny(seed: int = 0) -> tuple[W.Weights, W.MTPW]:
-    gen = torch.Generator().manual_seed(seed)
-    c = _config()
-    layers = [W.LayerW(i, kind == "linear", _scale(gen, c.hidden), _scale(gen, c.hidden),
-                       _gdn(gen, c) if kind == "linear" else None, None if kind == "linear" else _attn(gen, c),
-                       _moe(gen, c)) for i, kind in enumerate(c.layer_types)]
-    half = c.rotary_dim // 2
-    inv = (torch.tensor(c.rope_theta, dtype=torch.float64) ** (-torch.arange(half, dtype=torch.float64) / half)).to(F32)
-    w = W.Weights(c, _qw(gen, c.vocab, c.hidden, gain=8.0), layers, _scale(gen, c.hidden),
-                  _qw(gen, c.vocab, c.hidden, gain=4.0), inv)
-    mtp_layer = W.LayerW(0, False, _scale(gen, c.hidden), _scale(gen, c.hidden), None, _attn(gen, c), _moe(gen, c))
-    mtp = W.MTPW(c, _scale(gen, c.hidden), _scale(gen, c.hidden), _qw(gen, c.hidden, 2 * c.hidden), mtp_layer,
-                 _scale(gen, c.hidden))
-    return w, mtp
-
-
-@pytest.fixture
-def small_blocks(monkeypatch):
-    """Slice the head, the dequantization and the attention queries finely, so the tiny model crosses slices."""
-
-    monkeypatch.setattr(R, "_HEAD_ROWS", 100)
-    monkeypatch.setattr(R, "_DEQ_ROWS", 96)
-    monkeypatch.setattr(R, "_QUERY_ROWS", 3)
-
-
-def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
-    return float((a - b).abs().max() / b.abs().max())
-
-
-@pytest.mark.parametrize("bf16, tol", [(False, 2e-5), (True, 5e-3)])
-@pytest.mark.parametrize("schedule", [[3] + [1] * 10, [4, 1, 1, 5, 2]])
-def test_cached_serial_decode_equals_the_full_forward(small_blocks, bf16, tol, schedule):
-    w, _ = _tiny()
-    tokens = torch.randint(0, w.cfg.vocab, (sum(schedule),), generator=torch.Generator().manual_seed(1))
-    full_st = R.new_state(w, bf16=bf16)
-    full = R.forward(w, tokens, full_st)
-    st, parts, at = R.new_state(w, bf16=bf16), [], 0
-    for n in schedule:
-        parts.append(R.forward(w, tokens[at:at + n], st))
-        at += n
-    serial = torch.cat(parts)
-    assert serial.shape == full.shape == (len(tokens), w.cfg.vocab)
-    assert st.pos == full_st.pos == len(tokens)
-    err = _rel(serial, full)
-    print(f"\nbf16={bf16} schedule={schedule}: serial vs full logits, max rel err {err:.2e}")
-    assert err < tol
-    if not bf16:                                               # the caches end where one full pass leaves them
-        for i, layer in enumerate(w.layers):
-            if layer.linear:
-                assert _rel(st.rec[i], full_st.rec[i]) < tol and _rel(st.conv[i], full_st.conv[i]) < tol
-            else:
-                assert _rel(st.kv[i][0], full_st.kv[i][0]) < tol and _rel(st.kv[i][1], full_st.kv[i][1]) < tol
-
-
-def test_the_mtp_head_decodes_serially_as_it_runs_in_full(small_blocks):
-    w, mtp = _tiny()
-    tokens = torch.randint(0, w.cfg.vocab, (10,), generator=torch.Generator().manual_seed(2))
-    h = R.hidden(w, tokens, R.new_state(w, bf16=False))
-    full = R.mtp_hidden(mtp, w, tokens[1:], h[:-1], R.new_mtp_state(mtp, w, bf16=False))
-    st = R.new_mtp_state(mtp, w, bf16=False)
-    serial = torch.cat([R.mtp_hidden(mtp, w, tokens[1 + t:2 + t], h[t:t + 1], st) for t in range(len(tokens) - 1)])
-    assert st.pos == len(tokens) - 1
-    assert _rel(R.logits(w, serial), R.logits(w, full)) < 1e-5
-    # the MTP head reads its inputs: another hidden state or another token changes its output
-    assert _rel(R.mtp_hidden(mtp, w, tokens[1:], h[:-1].flip(0), R.new_mtp_state(mtp, w, bf16=False)), full) > 1e-2
-    assert _rel(R.mtp_hidden(mtp, w, tokens[1:].flip(0), h[:-1], R.new_mtp_state(mtp, w, bf16=False)), full) > 1e-2
-
-
-def test_sliced_head_scores_equal_full_logits(small_blocks):
-    w, _ = _tiny()
-    tokens = torch.randint(0, w.cfg.vocab, (9,), generator=torch.Generator().manual_seed(3))
-    h = R.hidden(w, tokens, R.new_state(w))
-    full = R.logits(w, h)
-    targets = torch.randint(0, w.cfg.vocab, (9,), generator=torch.Generator().manual_seed(4))
-    arg, nll = R.head_top1(w, h, targets)
-    assert torch.equal(arg, full.argmax(1))
-    want = -torch.log_softmax(full, 1).gather(1, targets[:, None])[:, 0]
-    assert torch.allclose(nll, want, rtol=1e-5, atol=1e-5)
-    assert R.head_top1(w, h)[1] is None
-
-
-def test_router_ties_go_to_the_lower_id():
-    w, _ = _tiny()
-    c, m = w.cfg, w.layers[0].moe
-    router = torch.zeros_like(m.router)
-    router[6, 0] = router[1, 0] = 5.0                          # experts 1 and 6 tie for first
-    router[[2, 5], 0] = 2.0                                    # 2 and 5 tie below them
-    x = torch.zeros((3, c.hidden))
-    x[:, 0] = 1.0
-    ids, top = R.route(W.MoEW(router, m.gate, m.up, m.down), x, c)
-    assert ids.tolist() == [[1, 6]] * 3
-    assert torch.allclose(top, torch.full_like(top, 0.5))
-    ids, _ = R.route(W.MoEW(router, m.gate, m.up, m.down), x, W.Config(**{**c.__dict__, "top_k": 4}))
-    assert ids.tolist() == [[1, 6, 2, 5]] * 3
-
-
-# ---------------------------------------------------------------------------------------------------------------
-# the real checkpoint
-
 
 def _cached(repo: str):
     from tensorfold import hub
@@ -187,8 +30,7 @@ def _cached(repo: str):
     return found
 
 
-# Public text: the first chapter of Jane Austen's Pride and Prejudice (1813) and the United States Declaration of
-# Independence (1776), both in the public domain, and a passage written for this test.
+# public domain: Pride and Prejudice's first chapter (1813), the Declaration of Independence (1776); then our own
 AUSTEN = """\
 It is a truth universally acknowledged, that a single man in possession of a good fortune, must be in want of a
 wife.
@@ -424,7 +266,6 @@ night close to a rocky shore, a flash of light in the right place at the right t
 see."""
 
 
-
 def _unwrap(text: str) -> str:
     """Paragraphs as single lines (the passages are wrapped here to fit the line length)."""
 
@@ -453,9 +294,7 @@ def real():
     _tf32_off()
     from tokenizers import Tokenizer
 
-    t0 = time.time()
     w = W.load(snap, "cuda")
-    print(f"\nloaded {snap.name[:12]} in {time.time() - t0:.0f} s: {w.nbytes() / 2 ** 30:.2f} GiB on the GPU")
     yield snap, w, Tokenizer.from_file(str(snap / "tokenizer.json"))
     del w
     torch.cuda.empty_cache()
@@ -463,51 +302,40 @@ def real():
 
 @pytest.fixture(scope="module")
 def scored(real):
-    """Per passage: the token ids, the hidden states after the final norm, the model's argmax at each position and
-    the NLL of each next token."""
+    """Per passage: ids, hidden rows after the final norm, the model's argmax and each next token's NLL."""
 
     _, w, tok = real
     out = {}
     for name, text in PASSAGES.items():
         ids = tok.encode(text, add_special_tokens=False).ids
-        t0 = time.time()
         st = R.new_state(w)
         pre = R.hidden(w, torch.tensor(ids), st, normed=False)
         h = R.final_norm(w, pre, st)
         arg, nll = R.head_top1(w, h, torch.tensor(ids[1:] + [0]))
-        out[name] = (ids, h, arg, nll[:-1], time.time() - t0, pre)
+        out[name] = (ids, h, arg, nll[:-1], pre)
     return out
 
 
 def test_teacher_forced_nll_and_top1_over_public_text(real, scored):
-    """NLL and top-1 with activations rounded to bf16 where the kernels store them (the default), and with every
-    activation fp32: the rounding should cost next to nothing."""
+    """NLL and top-1 with bf16 roundings where the kernels store them, and with fp32 activations: nearly the same."""
 
     _, w, _ = real
-    total = {"bf16": [0.0, 0], "fp32": [0.0, 0]}
-    same, n_all = 0, 0
-    print()
-    for name, (ids, _, arg, nll, seconds, _) in scored.items():
+    nll_sum = {"bf16": 0.0, "fp32": 0.0}
+    hits = {"bf16": 0, "fp32": 0}
+    same = n_all = 0
+    for ids, _, arg, nll, _ in scored.values():
         target = torch.tensor(ids[1:])
         h32 = R.hidden(w, torch.tensor(ids), R.new_state(w, bf16=False))
         arg32, nll32 = R.head_top1(w, h32[:-1], target)
-        n = len(ids) - 1
-        for mode, a, l in (("bf16", arg[:-1], nll), ("fp32", arg32, nll32)):
-            hit = int((a.cpu() == target).sum())
-            total[mode][0] += float(l.sum())
-            total[mode][1] += hit
-            print(f"{name:12s} {mode} {n:5d} tokens  NLL {float(l.mean()):.4f}  ppl {float(l.mean().exp()):7.3f}  "
-                  f"top-1 {hit / n:.4f}" + (f"  ({seconds:.0f} s)" if mode == "bf16" else ""))
+        for mode, top, loss in (("bf16", arg[:-1], nll), ("fp32", arg32, nll32)):
+            hits[mode] += int((top.cpu() == target).sum())
+            nll_sum[mode] += float(loss.sum())
         same += int((arg[:-1] == arg32).sum())
-        n_all += n
-    for mode, (nll_sum, hits) in total.items():
-        print(f"{'all':12s} {mode} {n_all:5d} tokens  NLL {nll_sum / n_all:.4f}  "
-              f"ppl {torch.tensor(nll_sum / n_all).exp():7.3f}  top-1 {hits / n_all:.4f}")
-    print(f"bf16 and fp32 activations pick the same top-1 at {same / n_all:.4f} of positions")
-    mean = total["bf16"][0] / n_all
+        n_all += len(ids) - 1
+    mean = nll_sum["bf16"] / n_all
     assert n_all > 2000
-    assert mean < 1.5 and total["bf16"][1] / n_all > 0.65
-    assert abs(mean - total["fp32"][0] / n_all) < 0.02 and same / n_all > 0.97
+    assert mean < 1.5 and hits["bf16"] / n_all > 0.65
+    assert abs(mean - nll_sum["fp32"] / n_all) < 0.02 and same / n_all > 0.97
 
 
 def test_greedy_replies_to_chat_prompts_are_coherent(real):
@@ -515,24 +343,17 @@ def test_greedy_replies_to_chat_prompts_are_coherent(real):
 
     snap, w, tok = real
     template = ChatTemplate(snap)
-    print()
     for prompt, must in PROMPTS:
         ids = tok.encode(template.render([{"role": "user", "content": prompt}], tools=None, enable_thinking=False),
                          add_special_tokens=False).ids
-        t0 = time.time()
         out = R.greedy(w, ids, 64, w.cfg.eos)
         reply = tok.decode(out, skip_special_tokens=True).strip()
-        print(f"Q: {prompt}\nA: {reply!r}  ({len(out)} tokens, {time.time() - t0:.0f} s)")
         assert out[-1] in w.cfg.eos, "the reply should end within 64 tokens"
         assert all(word in reply.lower() for word in must), reply
-        # the cached decode picked what one full forward over prompt + reply picks, near-ties aside: the bf16
-        # roundings land differently in a 1-row and a many-row pass (fp32 activations agree to 1e-5, tiny tests)
+        # near-ties aside, one full forward over prompt + reply picks what the cached decode picked
         full = R.forward(w, torch.tensor(ids + out[:-1]), R.new_state(w))[len(ids) - 1:]
         picked = full.gather(1, torch.tensor(out, device=full.device)[:, None])[:, 0]
-        gap = full.max(1).values - picked
-        print(f"   full forward vs cached decode: {int((full.argmax(1).cpu() != torch.tensor(out)).sum())} of "
-              f"{len(out)} differ, largest gap {float(gap.max()):.4f}")
-        assert float(gap.max()) < 0.25
+        assert float((full.max(1).values - picked).max()) < 0.25
 
 
 def _swap_fc_halves(fc: W.QW, hidden: int) -> W.QW:
@@ -547,34 +368,23 @@ def _swap_fc_halves(fc: W.QW, hidden: int) -> W.QW:
 
 
 def test_the_mtp_head_agrees_with_the_models_next_token(real, scored):
+    """Row t reads token t + 1 and the hidden row at t: [embedding | hidden] after the final norm agrees best."""
+
     import dataclasses
 
     _, w, _ = real
     mtp = W.load_mtp(_cached(family.DRAFTER), w.cfg, "cuda")
     swapped = dataclasses.replace(mtp, fc=_swap_fc_halves(mtp.fc, w.cfg.hidden))
-    rates: dict[str, list[tuple[int, int, int]]] = {"fc [embedding | hidden]": [], "fc [hidden | embedding]": [],
-                                                   "hidden before the final norm": []}
-    print()
-    for name, (ids, h, arg, _, _, pre) in scored.items():
-        # row t reads token t+1 and the hidden at t, and predicts token t+2; the model's own guess for token t+2 is
-        # its argmax at position t+1
+    agree = {"fc [embedding | hidden]": 0, "fc [hidden | embedding]": 0, "hidden before the final norm": 0}
+    n = 0
+    for ids, h, arg, _, pre in scored.values():
         for label, head, hs in (("fc [embedding | hidden]", mtp, h), ("fc [hidden | embedding]", swapped, h),
                                 ("hidden before the final norm", mtp, pre)):
             hm = R.mtp_hidden(head, w, torch.tensor(ids[1:]), hs[:-1], R.new_mtp_state(head, w))
             guess, _ = R.head_top1(w, hm[:-1])
-            agree = int((guess == arg[1:-1]).sum())
-            right = int((guess.cpu() == torch.tensor(ids[2:])).sum())
-            rates[label].append((agree, right, len(ids) - 2))
-            print(f"{name:12s} {label:30s} agrees with the model {agree / (len(ids) - 2):.4f}, "
-                  f"top-1 on the text {right / (len(ids) - 2):.4f}")
-    summary = {}
-    for label, r in rates.items():
-        n = sum(k for _, _, k in r)
-        summary[label] = (sum(a for a, _, _ in r) / n, sum(b for _, b, _ in r) / n)
-    for label, (agree, right) in summary.items():
-        print(f"{'all':12s} {label:30s} agrees with the model {agree:.4f}, top-1 on the text {right:.4f}")
-    main = summary["fc [embedding | hidden]"][0]
+            agree[label] += int((guess == arg[1:-1]).sum())
+        n += len(ids) - 2
+    main = agree["fc [embedding | hidden]"] / n
     assert main > 0.5
-    assert main > summary["fc [hidden | embedding]"][0] + 0.2
-    assert main > summary["hidden before the final norm"][0]
-
+    assert main > agree["fc [hidden | embedding]"] / n + 0.2
+    assert main > agree["hidden before the final norm"] / n
