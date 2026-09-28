@@ -140,8 +140,8 @@ tokens each, greedy and sampled (the checkpoint's generation config: temperature
 
 A one-row step with graphs takes 4.44 ms at a 4,096- and at a 32,768-position cache. JSON replies draft deep (about
 6 tokens a round) because the head's chains rarely fall under the 50% stop there; chat chains stop earlier. Depth
-and the stop were chosen on the 5090 and need retuning on GB10. `tools/bench_q36_prefill.py` times the MoE stages
-and the real prefill. Prompt chunks run the decode kernels, so prefill gives serial decoding's bits; the chunk size
+and the stop were chosen on the 5090 and need retuning on GB10 (`tools/bench_q36.py drafting`).
+`tools/bench_q36.py prefill` times the real prefill and `moe` the MoE stages. Prompt chunks run the decode kernels, so prefill gives serial decoding's bits; the chunk size
 will be chosen on GB10.
 
 ### Exactness
