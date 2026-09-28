@@ -321,22 +321,25 @@ def _attn_prep(P, POS0, QW, KW, IW, INV, Q, KC, VC, IQ, IKC, eps,
             tl.store(VC + (pos.to(tl.int64) * NKV + head - NQ) * HD + d, v)
         else:
             tl.store(IQ + (r * NI + head - NQ - NKV) * IHD + d, out, mask=live)
-    else:
+    elif NI > 0:
         live = d < IHD
         raw = tl.load(P + r * PW + NQ * 2 * HD + 2 * NKV * HD + NI * IHD + d, mask=live, other=0.0)
         tl.store(IKC + pos.to(tl.int64) * IHD + d, raw, mask=live)
 
 
 def attn_prep(p: torch.Tensor, pos0: torch.Tensor, q_scale, k_scale, i_scale, inv_freq, q, kc, vc, iq, ikc,
-              eps: float, *, q_heads: int, kv_heads: int, head_dim: int, index_heads: int, index_dim: int) -> None:
+              eps: float, *, q_heads: int, kv_heads: int, head_dim: int, index_heads: int = 0,
+              index_dim: int = 0) -> None:
     rows, pw = p.shape
-    _attn_prep[(rows, q_heads + kv_heads + index_heads + 1)](
-        p, pos0, q_scale, k_scale, i_scale, inv_freq, q, kc, vc, iq, ikc, eps, PW=pw, NQ=q_heads, NKV=kv_heads,
-        HD=head_dim, NI=index_heads, IHD=index_dim, HALF=inv_freq.numel(), num_warps=2)
+    indexed = index_heads > 0
+    _attn_prep[(rows, q_heads + kv_heads + (index_heads + 1 if indexed else 0))](
+        p, pos0, q_scale, k_scale, i_scale if indexed else q_scale, inv_freq, q, kc, vc, iq if indexed else q,
+        ikc if indexed else kc, eps, PW=pw, NQ=q_heads, NKV=kv_heads, HD=head_dim, NI=index_heads,
+        IHD=index_dim if indexed else head_dim, HALF=inv_freq.numel(), num_warps=2)
 
 
 @triton.jit
-def _attn_gate(O, P, OUT, XS, PW: tl.constexpr, NQ: tl.constexpr, HD: tl.constexpr):
+def _attn_gate(O, P, OUT, XS, PW: tl.constexpr, NQ: tl.constexpr, HD: tl.constexpr, GS: tl.constexpr):
     """Program (r, h): bf16(o * sigmoid(gate)) (fp32 math), gate from the [q | gate] pairs, and group sums."""
 
     r = tl.program_id(0)
@@ -346,14 +349,14 @@ def _attn_gate(O, P, OUT, XS, PW: tl.constexpr, NQ: tl.constexpr, HD: tl.constex
     g = tl.load(P + r * PW + h * 2 * HD + HD + d).to(tl.float32)
     out = (o / (1.0 + tl.exp(-g))).to(tl.bfloat16)
     tl.store(OUT + r * (NQ * HD) + h * HD + d, out)
-    sums = tl.sum(tl.reshape(out.to(tl.float32), (HD // 32, 32)), axis=1)
-    tl.store(XS + r * (NQ * HD // 32) + h * (HD // 32) + tl.arange(0, HD // 32), sums)
+    sums = tl.sum(tl.reshape(out.to(tl.float32), (HD // GS, GS)), axis=1)
+    tl.store(XS + r * (NQ * HD // GS) + h * (HD // GS) + tl.arange(0, HD // GS), sums)
 
 
 def attn_gate(o: torch.Tensor, p: torch.Tensor, out: torch.Tensor, xs: torch.Tensor, *, q_heads: int,
-              head_dim: int) -> None:
+              head_dim: int, group: int = 32) -> None:
     rows = o.shape[0]
-    _attn_gate[(rows, q_heads)](o, p, out, xs, PW=p.shape[1], NQ=q_heads, HD=head_dim, num_warps=2)
+    _attn_gate[(rows, q_heads)](o, p, out, xs, PW=p.shape[1], NQ=q_heads, HD=head_dim, GS=group, num_warps=2)
 
 
 @triton.jit
