@@ -146,6 +146,8 @@ def test_stacked_rows_keep_their_values():
     w, s, b = qmm.to_mlx(q)
     assert torch.equal(w, torch.cat([p[0] for p in parts])) and torch.equal(s, torch.cat([p[1] for p in parts]))
     assert torch.equal(b, torch.cat([p[2] for p in parts]))
+    # unpacked a few rows at a time (the head's is chunked): the same arrays, a part-filled last chunk included
+    assert all(torch.equal(x, y) for x, y in zip(qmm.to_mlx(q, rows=128), (w, s, b)))
     x = inputs(3, 2048, 9)
     ref = _reference(x, (w, s, b))
     assert (qmm.matmul(x, q).double() - ref).abs().max().item() <= ref.abs().max().item() * 2 ** -8
