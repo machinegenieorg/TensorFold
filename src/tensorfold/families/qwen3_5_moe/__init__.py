@@ -148,4 +148,6 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
     return Qwen36Engine(Path(model_dir), drafter="" if no_drafts else str(drafter or ""), context=requested,
                         context_explicit=explicit, no_drafts=bool(no_drafts),
                         mtp_drafts=None if mtp_drafts is None else int(mtp_drafts),
-                        streams=max(1, int(options.get("parallel") or 1)))
+                        streams=max(1, int(options.get("parallel") or 1)),
+                        **({} if options.get("prompt_cache_gib") is None else
+                           {"prompt_cache_gib": float(options["prompt_cache_gib"])}))

@@ -63,7 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
     speed.add_argument("--lane-kernels", choices=("auto", "on", "off"), default="auto",
                        help="lane kernels for Qwen3.8 dense (auto: on GPUs with tensor units)")
     speed.add_argument("--prompt-cache-gib", type=float, default=None,
-                       help="memory for cached conversation prefixes (0: off; default: an eighth of RAM, at most 16)")
+                       help="memory for cached conversation prefixes (0: off; default: an eighth of RAM, at most 16; "
+                            "CUDA Qwen3.6: 4)")
     speed.add_argument("--snapshot-dir", default=str(Path.home() / ".cache" / "tensorfold" / "prefix-snapshots"),
                        help="where system-block and conversation snapshots are kept ('none': in memory only)")
     speed.add_argument("--max-snapshots", type=int, default=3, help="system-block snapshots loaded at start")
@@ -320,6 +321,8 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     streams = 1 if str(args.parallel).strip().lower() == "auto" else _parallel(args.parallel)
     if streams > 1:
         options["parallel"] = streams
+    if getattr(args, "prompt_cache_gib", None) is not None:
+        options["prompt_cache_gib"] = float(args.prompt_cache_gib)
     served = args.name or (args.model.rstrip("/").split("/")[-1] if hub.is_repo_id(args.model) else model_dir.name)
     where = f", rank {args.rank} of 2" if args.tp == 2 else ""
     print(f"[tensorfold] loading {served}: {family.title} ({family.model_type}) on CUDA{where}", flush=True)
