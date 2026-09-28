@@ -1,42 +1,4 @@
-"""Qwen3.6-35B-A3B forward on CUDA for a window of R consecutive rows per sequence (1 = a serial step, 2 to
-``window_rows`` = a verify window, up to ``Buffers.rows`` = a prefill chunk), and the commit that keeps a prefix.
-
-The model is plain pre-norm: embed, then per layer
-
-    normed = RMSNorm(h) (1 + w)            fp32, one bf16 rounding (fused into the previous layer's combine)
-    h      = h + mixer(normed)             Gated DeltaNet (30 layers) or gated attention (10 layers)
-    normed = RMSNorm(h) (1 + w_post)       fused with the residual add (and the out projection's K slices)
-    h      = h + MoE(normed)               256 routed experts (top 8) and the shared expert
-    normed = RMSNorm(h) (1 + w_next)       the next layer's input norm, or the final norm after the last layer
-
-and the head over the requested rows. Every kernel treats each row on its own (``qmm``, ``moe``, the GDN chain,
-attention and the small kernels below), so row r of a window gets the bits of the serial step at its position.
-
-Phase-2 seam: a window is a table of sequences (``Seq``: a state, its rows' offset and count, its first position).
-The row-shared kernels (every matmul, the router, the experts, the norms) run once over all R rows; the kernels that
-read a sequence's committed state (the GDN chain, attention's cache write and reads) run once per sequence on its
-rows. Today's decoders pass one sequence; nothing below assumes it.
-
-The committed state (``State``, from a ``Pool``) is read-only during a forward, except for attention cache rows at
-and past the committed length (the window's keys, overwritten by a later window). ``commit`` keeps a sequence's first
-``keep`` rows:
-
-- Gated DeltaNet: the forward writes the state after the sequence's last row into the layer's other state buffer; a
-  shorter keep replays the kept rows from the committed state into it (``gdn.replay``, the chain's update routine,
-  the same bits). The state's buffer parity flips.
-- conv windows: rows [keep, keep + 3) of [old window; the rows' q | k | v].
-- attention: keys and values were written at their absolute positions; the committed length advances by ``keep``.
-
-A window of at most ``window_rows`` rows keeps what a partial keep needs (each GDN layer's projection rows and the
-replay inputs). A longer window is a prefill chunk: it must keep every row, so it saves no replay inputs and writes
-each layer's next conv window during the forward (``Buffers.tail``), which bounds the scratch at 512-row chunks.
-Attention runs a long window in row blocks of ``attn_rows`` (each row's keys are chunked by absolute position and
-merged in order, so the blocking changes no bits), which bounds its fp32 partials at any context; a prefill chunk's
-blocks launch only the key chunks their rows read (a window launches every chunk up to the capacity, so a captured
-graph stays valid as the sequence grows, and chunks past a row's keys return at once).
-
-No cuBLAS, ``torch.matmul`` or ``F.linear`` anywhere: their algorithms depend on the row count.
-"""
+"""Qwen3.6-35B-A3B's forward on CUDA over a window of rows per sequence, and the commit that keeps a prefix."""
 
 from __future__ import annotations
 
@@ -49,13 +11,16 @@ import torch
 import triton
 import triton.language as tl
 
-from ...qwen4_exp.cuda import attention as attn_mod
-from ...qwen4_exp.cuda import gdn as gdn_mod
-from ...qwen4_exp.cuda import glue as fn_glue
-from ...qwen4_exp.cuda.forward import shift_windows
+from tensorfold.families.qwen4_exp.cuda import attention as attn_mod
+from tensorfold.families.qwen4_exp.cuda import gdn as gdn_mod
+from tensorfold.families.qwen4_exp.cuda import glue as fn_glue
+from tensorfold.families.qwen4_exp.cuda.forward import shift_windows
+
 from . import moe as moe_mod
 from . import qmm
-from .weights import QW, Config, Weights
+from .checkpoint import Config
+from .state import Seq, State
+from .weights import QW, Weights
 
 GATE = "silu"          # Qwen3.6's gated RMSNorm: w * norm(y) * silu(z)
 GS = qmm.GS            # 64: the quantization group; the small kernels write 64-group sums for the next matmul
@@ -108,11 +73,11 @@ class Model:
 
     @property
     def n_linear(self) -> int:
-        return sum(1 for l in self.layers if l.linear)
+        return sum(1 for layer in self.layers if layer.linear)
 
     @property
     def n_attention(self) -> int:
-        return sum(1 for l in self.layers if not l.linear)
+        return sum(1 for layer in self.layers if not layer.linear)
 
     @property
     def moe_cfg(self) -> SimpleNamespace:
@@ -123,18 +88,18 @@ class Model:
         """(N, K) of every dense matrix (for the split-K scratch)."""
 
         found = {(self.head.n, self.head.k)}
-        for l in self.layers:
-            mats = (l.gdn.proj, l.gdn.out) if l.linear else (l.attn.proj, l.attn.o)
+        for layer in self.layers:
+            mats = (layer.gdn.proj, layer.gdn.out) if layer.linear else (layer.attn.proj, layer.attn.o)
             found.update((q.n, q.k) for q in mats)
         return sorted(found)
 
     def nbytes(self) -> int:
         total = self.embed.nbytes() + self.head.nbytes() + self.norm.numel() * 4
-        for l in self.layers:
-            total += (l.experts.up.numel() + l.experts.down.numel()) * 4
-            total += l.router.numel() * 4
-            total += (l.gdn.proj.nbytes() + l.gdn.out.nbytes()) if l.linear else (l.attn.proj.nbytes()
-                                                                                   + l.attn.o.nbytes())
+        for layer in self.layers:
+            total += (layer.experts.up.numel() + layer.experts.down.numel()) * 4
+            total += layer.router.numel() * 4
+            mats = (layer.gdn.proj, layer.gdn.out) if layer.linear else (layer.attn.proj, layer.attn.o)
+            total += sum(q.nbytes() for q in mats)
         return total
 
 
@@ -155,9 +120,7 @@ def _check_config(c: Config) -> None:
 
 
 def prepare(w: Weights, *, release: bool = True) -> Model:
-    """The loader's weights (MLX packing) regrouped for the kernels, layer by layer. ``release`` drops each loader
-    layer (and the head) once converted: the MLX arrays and their regrouped copies do not both fit next to each other
-    on a 32 GB GPU. The embedding stays in MLX's layout (a row gather)."""
+    """The loader's weights regrouped for the kernels layer by layer; ``release`` frees each loader layer once done."""
 
     c = w.cfg
     _check_config(c)
@@ -192,146 +155,9 @@ def prepare(w: Weights, *, release: bool = True) -> Model:
     return Model(c, w.embed, layers, w.norm.float().contiguous(), head, w.inv_freq.float().contiguous())
 
 
-# -- committed state -----------------------------------------------------------------------------------------------
-class Pool:
-    """Committed caches for up to ``seqs`` sequences, allocated once: per sequence the GDN states of every linear layer
-    (two buffers: a forward writes the next state into the one it does not read), the conv windows, and the key and
-    value caches of every attention layer up to ``capacity`` positions (plus ``mtp_layers`` more for a draft head).
-    ``alloc`` hands out a slot as a ``State`` of views."""
-
-    def __init__(self, m: Model, seqs: int, capacity: int, *, mtp_layers: int = 0) -> None:
-        c = m.cfg
-        dev = m.device
-        nl, na = m.n_linear, m.n_attention
-        self.capacity = capacity
-        self.mtp_layers = mtp_layers
-        self.rec = torch.zeros((seqs, 2, nl, c.nv, c.dv, c.dk), dtype=torch.float32, device=dev)
-        self.conv = torch.zeros((seqs, nl, c.conv_kernel - 1, c.conv_dim), dtype=torch.bfloat16, device=dev)
-        self.kc = torch.zeros((seqs, na + mtp_layers, capacity, c.kv_heads, c.head_dim), dtype=torch.bfloat16,
-                              device=dev)
-        self.vc = torch.zeros_like(self.kc)
-        # with a draft head: each sequence's last hidden row the head has not absorbed yet (``mtp.py``)
-        self.tail = torch.zeros((seqs, c.hidden), dtype=torch.bfloat16, device=dev) if mtp_layers else None
-        self.free = list(range(seqs - 1, -1, -1))
-
-    def alloc(self) -> "State":
-        if not self.free:
-            raise RuntimeError("state pool exhausted")
-        st = State(self, self.free.pop())
-        st.reset()
-        return st
-
-    def release(self, st: "State") -> None:
-        if st.slot in self.free:
-            raise ValueError("state released twice")
-        self.free.append(st.slot)
-
-    def clone(self, st: "State") -> "State":
-        """A new state holding a copy of ``st``'s committed sequence."""
-
-        other = self.alloc()
-        other.copy_(st)
-        return other
-
-    def nbytes_per_seq(self) -> int:
-        return sum(t[0].numel() * t.element_size() for t in (self.rec, self.conv, self.kc, self.vc))
-
-
-class State:
-    """One sequence's committed caches: views of its pool slot, its length ``pos`` and GDN buffer parity ``cur``.
-
-    With a draft head (``Pool(mtp_layers=1)``) it also carries the head's bookkeeping (``mtp.py``): ``mtp_len``, the
-    positions the head's cache has absorbed, and ``mtp_tail``, the hidden row of position ``mtp_tail_at`` (-1: none)
-    that the head absorbs once the next token is known."""
-
-    def __init__(self, pool: Pool, slot: int) -> None:
-        self.pool, self.slot = pool, slot
-        self.capacity = pool.capacity
-        self.rec = pool.rec[slot]             # [2, linear layers, nv, dv, dk] fp32
-        self.conv = pool.conv[slot]           # [linear layers, taps - 1, conv_dim] bf16
-        self.kc = pool.kc[slot]               # [attention layers (+ MTP), capacity, kv_heads, head_dim] bf16
-        self.vc = pool.vc[slot]
-        n_att = self.kc.shape[0] - pool.mtp_layers
-        self.mtp_kc = self.kc[n_att:]         # the draft head's caches (empty without one)
-        self.mtp_vc = self.vc[n_att:]
-        self.mtp_tail = pool.tail[slot] if pool.tail is not None else None
-        self.cur = 0
-        self.pos = 0
-        self.mtp_len = 0
-        self.mtp_tail_at = -1
-
-    def reset(self) -> None:
-        """An empty sequence (cache rows need no clearing: only rows below ``pos`` are ever read)."""
-
-        self.cur = 0
-        self.rec[0].zero_()
-        self.conv.zero_()
-        self.pos = 0
-        self.mtp_len = 0
-        self.mtp_tail_at = -1
-
-    def copy_(self, src: "State") -> None:
-        """Copy ``src``'s committed sequence: its current GDN states, conv windows, and cache rows below its length."""
-
-        if src.kc.shape != self.kc.shape:
-            raise ValueError("states from pools of different shapes")
-        self.cur = 0
-        self.rec[0].copy_(src.rec[src.cur])
-        self.conv.copy_(src.conv)
-        p = src.pos
-        if p:
-            self.kc[:, :p].copy_(src.kc[:, :p])
-            self.vc[:, :p].copy_(src.vc[:, :p])
-        self.pos = p
-        self.mtp_len, self.mtp_tail_at = min(src.mtp_len, p), src.mtp_tail_at
-        if self.mtp_tail is not None and src.mtp_tail is not None:
-            self.mtp_tail.copy_(src.mtp_tail)
-        else:
-            self.mtp_tail_at = -1
-
-    def snapshot(self) -> dict:
-        """What the sequence keeps outside its cache rows (GDN states, conv windows, length, the draft head's
-        bookkeeping): with the rows below ``pos`` still in place, ``restore`` brings the sequence back (about 64 MB
-        for 30 GDN layers)."""
-
-        tail = self.mtp_tail.clone() if self.mtp_tail is not None else None
-        return {"pos": self.pos, "rec": self.rec[self.cur].clone(), "conv": self.conv.clone(),
-                "mtp": (self.mtp_len, self.mtp_tail_at, tail)}
-
-    def restore(self, snap: dict) -> None:
-        if snap["pos"] > self.capacity:
-            raise ValueError("snapshot longer than this state's capacity")
-        self.cur = 0
-        self.rec[0].copy_(snap["rec"])
-        self.conv.copy_(snap["conv"])
-        self.pos = int(snap["pos"])
-        mtp_len, tail_at, tail = snap.get("mtp", (0, -1, None))
-        self.mtp_len, self.mtp_tail_at = min(int(mtp_len), self.pos), int(tail_at)
-        if self.mtp_tail is not None and tail is not None:
-            self.mtp_tail.copy_(tail)
-        else:
-            self.mtp_tail_at = -1
-
-
-@dataclass
-class Seq:
-    """One sequence's rows of a staged window."""
-
-    state: State
-    index: int                # its place in the window's table
-    row0: int                 # its first row in the window
-    rows: int
-    pos: int                  # the position of its first row (its committed length when staged)
-    full: bool                # a window of at most ``window_rows`` rows: any prefix may be kept
-
-
 # -- per-window buffers --------------------------------------------------------------------------------------------
 class Buffers:
-    """Scratch for windows of up to ``rows`` rows over up to ``seqs`` sequences (views [:R] serve smaller windows).
-
-    ``capacity``: the longest sequence attention may read (at least every state's capacity). ``window_rows``: the
-    widest window that may keep any prefix. ``attn_rows``: rows per attention block. ``logit_rows``: the most rows
-    whose logits one forward returns."""
+    """Scratch for windows of up to ``rows`` rows over up to ``seqs`` sequences; views [:R] serve smaller windows."""
 
     def __init__(self, m: Model, rows: int = 512, *, capacity: int, window_rows: int = 32, attn_rows: int = 64,
                  logit_rows: int = 32, seqs: int = 1) -> None:
@@ -354,13 +180,12 @@ class Buffers:
         self.pos_host = torch.zeros((rows,), dtype=torch.int32, pin_memory=pin)
         self.staged = torch.cuda.Event() if pin else None
         self.pending: dict[int, Seq] = {}                                   # staged, not yet committed
-        # residual stream, the normed rows the next matmul reads, their 64-group sums; the mixer's output
+        # residual stream, the normed rows the next matmul reads, their 64-group sums, the mixer's output
         self.h = torch.empty((rows, d), dtype=bf, device=dev)
         self.normed = torch.empty((rows, d), dtype=bf, device=dev)
         self.xs = torch.empty((rows, d // GS), dtype=f32, device=dev)
         self.branch = torch.empty((rows, d), dtype=bf, device=dev)
-        # Gated DeltaNet: per-layer projection rows and replay inputs for windows (a partial keep needs them), one
-        # shared projection buffer (the same memory) and the next conv windows for prefill chunks
+        # Gated DeltaNet: projection rows and replay inputs per layer (windows), or one shared buffer (prefill chunks)
         flat = torch.empty((max(nl * wr, rows) * pw,), dtype=bf, device=dev)
         self.proj = flat[:nl * wr * pw].view(nl, wr, pw)
         self.proj_chunk = flat[:rows * pw].view(rows, pw)
@@ -416,10 +241,7 @@ class _Rows:
 # -- small kernels ------------------------------------------------------------------------------------------------
 @triton.jit
 def _add_norm(H, BR, W, HOUT, Y, XS, eps, RS, D: tl.constexpr, MODE: tl.constexpr, SK: tl.constexpr):
-    """Program r. MODE 0: x = h. MODE 1: x = bf16(h + branch), a bf16 branch. MODE 2: the branch is a matmul's SK fp32
-    K slices RS apart, added in slice order and rounded once (the bits of ``qmm``'s reduce), then x = bf16(h + branch).
-    Modes 1 and 2 store x to HOUT. Y = bf16(x * rsqrt(mean(x^2) + eps) * w) (fp32 math, w the fp32 1 + w), XS its
-    64-group sums: the arithmetic of ``moe.combine_add_rmsnorm``."""
+    """Program r: x = h (MODE 0), bf16(h + branch) (1) or bf16(h + SK slices in order) (2); Y = RMSNorm(x) w, XS."""
 
     r = tl.program_id(0).to(tl.int64)
     d = tl.arange(0, D)
@@ -459,8 +281,7 @@ def _norm(b: Buffers, R: int, scale: torch.Tensor, eps: float, branch: torch.Ten
 
 @triton.jit
 def _conv_tail(OLD, NEW, OUT, n, NEW_ROW, C: tl.constexpr, T: tl.constexpr, TP: tl.constexpr, BLOCK: tl.constexpr):
-    """OUT[j] (j < T) = row n + j of [OLD (T rows); NEW (n rows, the first C columns)]: the conv window after all
-    n rows."""
+    """OUT[j] (j < T) = row n + j of [OLD (T rows); NEW (n rows, first C columns)]: the conv window after n rows."""
 
     ch = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     j = tl.arange(0, TP)
@@ -483,8 +304,7 @@ def _tail(old: torch.Tensor, new: torch.Tensor, out: torch.Tensor, n: int) -> No
 
 # -- blocks --------------------------------------------------------------------------------------------------------
 def _gdn_block(m: Model, layer: LayerK, b: Buffers, R: int, table: Sequence[Seq], full: bool) -> torch.Tensor:
-    """Gated DeltaNet on b.normed[:R]: the stacked projection once over all rows, the chain per sequence, the out
-    projection once. Returns the out projection (bf16 [R, D] or its K slices [SK, R, D])."""
+    """Gated DeltaNet on b.normed[:R]: projection once, the chain per sequence, out projection (or its K slices)."""
 
     c = m.cfg
     g = layer.gdn
@@ -508,9 +328,7 @@ def _gdn_block(m: Model, layer: LayerK, b: Buffers, R: int, table: Sequence[Seq]
 
 def _attn_block(m: Model, layer: LayerK, b: Buffers, R: int, table: Sequence[Seq], full: bool,
                 context: int | None) -> torch.Tensor:
-    """Gated attention on b.normed[:R]: the stacked projection once; per sequence the q/k norms, RoPE and the cache
-    write at the rows' positions, then attention and the output gate in blocks of ``attn_rows`` rows; the o
-    projection once."""
+    """Gated attention on b.normed[:R]: projection once, per sequence prep and attention in row blocks, o projection."""
 
     c = m.cfg
     a = layer.attn
@@ -570,8 +388,7 @@ def _head(m: Model, b: Buffers, R: int, table: Sequence[Seq], logits: str) -> to
 
 # -- forward -------------------------------------------------------------------------------------------------------
 def stage(m: Model, b: Buffers, work: Sequence[tuple[State, Sequence[int]]]) -> tuple[int, list[Seq]]:
-    """Host work before a forward: each sequence's tokens and positions (its committed length onward) into the static
-    device buffers (pinned, async). Returns the window's rows and its table."""
+    """Stage each sequence's tokens and positions into the static device buffers; returns the rows and the table."""
 
     if not work:
         raise ValueError("a window needs at least one sequence")
@@ -610,11 +427,7 @@ def stage(m: Model, b: Buffers, work: Sequence[tuple[State, Sequence[int]]]) -> 
 
 def compute(m: Model, b: Buffers, R: int, table: Sequence[Seq], *, logits: str = "all",
             context: int | None = None) -> torch.Tensor | None:
-    """The GPU work of a forward on staged rows. ``logits``: "all" rows ([R, V]), "last" (each sequence's last row,
-    [sequences, V]) or "none". The returned logits are a view of b.logits; b.hidden[:R] holds the rows' hidden
-    states after the final norm. ``context`` (a captured graph's bucket): a bound on every window row's keys, so
-    attention launches only the key chunks below it (chunks past a row's keys write nothing either way, so the bits
-    are the same); None launches every chunk up to the capacity."""
+    """The GPU work of a staged forward: logits "all", "last" (per sequence) or "none"; ``context`` bounds the keys."""
 
     _check_logits(b, R, logits)
     if context is not None and any(s.pos + s.rows > context for s in table):
@@ -636,8 +449,7 @@ def compute(m: Model, b: Buffers, R: int, table: Sequence[Seq], *, logits: str =
 
 @torch.no_grad()
 def forward(m: Model, b: Buffers, st: State, tokens: Sequence[int], *, logits: str = "all") -> torch.Tensor | None:
-    """One sequence's rows for ``tokens`` at positions st.pos, st.pos + 1, ...: logits (see ``compute``). The
-    committed state is unchanged until ``commit``."""
+    """One sequence's rows for ``tokens`` from st.pos on (see ``compute``); the state is unchanged until ``commit``."""
 
     _check_logits(b, len(tokens), logits)
     R, table = stage(m, b, [(st, tokens)])

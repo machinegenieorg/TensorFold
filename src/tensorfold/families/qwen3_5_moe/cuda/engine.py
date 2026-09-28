@@ -1,29 +1,4 @@
-"""The Qwen3.6-35B-A3B CUDA engine behind ``tensorfold.cuda.server``: one GPU (one DGX Spark), one stream.
-
-One request decodes at a time (``--parallel`` above one is accepted and noted: requests still take turns),
-MTP-drafted when the drafter is present (``decode.mtp_decode``): a round verifies the pending token and up to
-``depth`` chained drafts (6; a chain keeps its first draft and ends before a later one the head gives less than
-``confidence``, 0.5) in one window, and keeps the rows up to the first draft the keyed sampler disagrees with.
-Drafted output is token for token serial decoding's (``decode.serial_decode``). Windows of up to ``depth + 1`` rows
-and the head's steps replay CUDA graphs (``graphs.py``, keyed by Flash Next's context buckets), with eager's bits.
-Without the drafter (or with ``no_drafts``) every round decodes one token.
-
-Capacity is fixed at startup by ``tensorfold.cuda.capacity.admit``, as for the other CUDA families, before anything
-is loaded: the checkpoint's tensors in the kernels' layout (the router tables widened to fp32, the vision tower
-skipped) and the drafter's, plus, at a cache capacity, two sequence states (GDN states, conv windows and key/value
-caches, the head's included), the kept snapshots, the window buffers, the head's step buffers and draft head, and a
-workspace (``cache_bytes``), against the memory the device has (on a GPU
-that shares the host's memory, GB10, MemAvailable, which counts the page cache the kernel gives back). An explicit
-``--context`` that cannot fit is refused with the largest that does; the default (32,768 tokens) shrinks to fit.
-``context_window`` (prompt plus reply: the cache slots less ``depth + 1`` speculative positions) is what the server
-checks requests against before streaming.
-
-Prefix reuse: the engine keeps the state after the last request's prompt and after its reply (``State.snapshot``,
-with their cache rows in place in the one sequence state), and a prompt that extends either resumes from it. Rows
-never depend on their chunk, so a resumed prompt ends in the state and logits of a fresh prefill. A fresh prompt
-starts over. A request with ``draft=False`` decodes one token a round from a fresh prefill in a second state and
-leaves the kept states as they are: the serial reference.
-"""
+"""The Qwen3.6-35B-A3B CUDA engine behind ``tensorfold.cuda.server``: admission, drafting and prefix reuse."""
 
 from __future__ import annotations
 
@@ -42,13 +17,11 @@ ROUTER = (".mlp.gate.", ".mlp.shared_expert_gate.")
 
 # -- memory, before anything is loaded ---------------------------------------------------------------------------
 def weight_transform(hidden: int):
-    """``capacity.admit``'s view of a checkpoint tensor: (bytes on the GPU, mapped host bytes). MLX's packing as
-    stored (4-bit words, bf16 scales and biases; the lane kernel pads rows to 128), the router and shared-expert gate
-    dequantized to fp32 rows of ``hidden``, the vision tower not loaded."""
+    """``capacity.admit``'s view of a tensor: (GPU bytes, mapped host bytes), routers in fp32, no vision tower."""
 
     from tensorfold.cuda.geometry import padded
 
-    from .weights import VISION_PREFIXES
+    from .checkpoint import VISION_PREFIXES
 
     def transform(name: str, info: dict) -> tuple[int, int]:
         if name.startswith(VISION_PREFIXES) or ".visual." in name:
@@ -61,8 +34,7 @@ def weight_transform(hidden: int):
 
 
 def state_bytes(cfg, capacity: int, mtp_layers: int = 0) -> tuple[int, int]:
-    """(one sequence state of ``capacity`` positions, one snapshot of it), as ``forward.Pool`` and
-    ``State.snapshot`` allocate them."""
+    """(one sequence state of ``capacity`` positions, one snapshot of it), as ``state.Pool`` allocates them."""
 
     nl = sum(1 for k in cfg.layer_types if k == "linear")
     na = cfg.layers - nl
@@ -132,9 +104,7 @@ def draft_head_bytes(cfg, head_rows: int) -> int:
 
 def cache_bytes(cfg, capacity: int, *, rows: int, states: int = STATES, mtp_layers: int = 0,
                 head_rows: int = 0) -> int:
-    """Everything the engine allocates besides the checkpoints' weights at a cache capacity: the states (the head's
-    cache and tail with ``mtp_layers``), the kept snapshots, the window buffers, the head's step buffers and draft
-    head (``head_rows`` of them), and a workspace."""
+    """Everything but the weights at a cache capacity: states, snapshots, buffers, the head's and a workspace."""
 
     from .decode import MTP_ROWS
 
@@ -148,13 +118,7 @@ def cache_bytes(cfg, capacity: int, *, rows: int, states: int = STATES, mtp_laye
 def admission(model_dir: str | Path | None, cfg, context: int | None, explicit: bool, *, rows: int, reserve: int,
               free_memory: int | None = None, loaded: bool = False, drafter: str | Path | None = None,
               head_rows: int = 0) -> dict:
-    """``capacity.admit``'s receipt: the prompt/reply window and the cache slots (window plus ``reserve``
-    speculative positions) this memory holds. ``drafter``: the MTP drafter's directory, whose tensors count with the
-    model's (its router table in fp32); ``head_rows``: the draft head's rows (with a drafter or a loaded head).
-    ``free_memory`` (tests): the budget instead of the device's; ``loaded``: the weights are on the GPU already.
-
-    The drafter loads after the model has been regrouped, so its transient (the loaded drafter, the model's head
-    unpacked to cut the draft head from, about 0.8 GB) stays below the model's own (three of its largest layers)."""
+    """``capacity.admit``'s receipt: the window and cache slots (plus ``reserve``) that fit, drafter included."""
 
     import torch
 
@@ -180,15 +144,7 @@ def admission(model_dir: str | Path | None, cfg, context: int | None, explicit: 
 
 # -- the engine ----------------------------------------------------------------------------------------------------
 class Qwen36Engine:
-    """``eos``, ``generate`` and ``context_window`` as ``tensorfold.cuda.server`` expects, on one GPU.
-
-    ``context``: the prompt-plus-reply window to admit (``context_explicit``: refuse rather than shrink it; 0 is the
-    model's whole window). ``drafter``: the MTP drafter's directory; ``mtp_drafts``: most drafts a round (default
-    ``decode.DEPTH``; 0 or ``no_drafts``: one token a round); ``confidence``: the chain's stop (default
-    ``decode.CONFIDENCE``). ``graphs``: decode windows replay CUDA graphs. ``streams``: ``--parallel``; requests take
-    turns whatever it is. ``free_memory``: bytes to plan against instead of the device's. ``model`` and ``mtp``: an
-    already prepared ``forward.Model`` and MTP head (tests), which skip the loads.
-    """
+    """``eos``, ``generate`` and ``context_window`` as ``tensorfold.cuda.server`` expects, one request at a time."""
 
     def __init__(self, model_dir: str | Path | None, drafter: str = "", *, context: int | None = None,
                  context_explicit: bool | None = None, no_drafts: bool = False, mtp_drafts: int | None = None,
@@ -208,7 +164,7 @@ class Qwen36Engine:
 
         from .decode import CONFIDENCE, DEPTH, GRAPH_ROWS, MTP_ROWS, PREFILL_ROWS, Decoder
         from .mtp import draft_token_ids
-        from .weights import Config
+        from .checkpoint import Config
 
         started = time.perf_counter()
         torch.cuda.set_device(0)
@@ -232,7 +188,7 @@ class Qwen36Engine:
         self.capacity_plan = admission(model_dir, cfg, context, explicit, rows=rows, reserve=self.depth + 1,
                                        free_memory=free_memory, loaded=model is not None,
                                        drafter=self.drafter or None, head_rows=head_rows)
-        self.max_len = self.capacity = int(self.capacity_plan["cache_slots"])
+        self.max_len = int(self.capacity_plan["cache_slots"])
         if model is None:
             from .forward import prepare
             from .weights import load
@@ -284,9 +240,7 @@ class Qwen36Engine:
         return self.e.eos
 
     def _warm(self) -> tuple[int, float]:
-        """Capture the decode graphs (windows of 1 to depth + 1 rows for the kept state, one-row steps for the serial
-        state, the head's steps) at the first context bucket and compile what a request runs eagerly (a prefill
-        chunk, a short window, the head's prompt absorb) before the first request."""
+        """Capture the decode graphs and compile what a request runs eagerly, before the first request."""
 
         import torch
 
@@ -316,8 +270,7 @@ class Qwen36Engine:
         return best
 
     def _start_from(self, hit) -> None:
-        """Before a prefill: resuming overwrites the cache rows past the kept prefix, so the kept states that extend
-        it go; a fresh prompt overwrites them all."""
+        """Before a prefill: drop the kept states whose cache rows it overwrites (all of them for a fresh prompt)."""
 
         if hit is None:
             self.cache = []
@@ -341,10 +294,7 @@ class Qwen36Engine:
 
     def generate(self, prompt: Sequence[int], max_tokens: int, sampling,
                  on_tokens: Callable[[list[int]], bool | None] | None, draft: bool = True) -> dict[str, Any]:
-        """Up to ``max_tokens`` reply tokens after ``prompt``, passed to ``on_tokens`` as each round keeps them (a True
-        return stops the decode); stops after an eos id. MTP-drafted when the engine has the head; ``draft=False``: one
-        token a round from a fresh prefill in the serial state, leaving the kept states alone. Both emit the same
-        tokens. Returns the request's stats."""
+        """Up to ``max_tokens`` reply tokens to ``on_tokens`` (True stops), drafted or serial; returns the stats."""
 
         import torch
 

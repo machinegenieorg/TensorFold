@@ -1,24 +1,4 @@
-"""Qwen3.6-35B-A3B's MoE on CUDA: 256 routed experts (top 8, width 512) and the shared expert as expert 256.
-
-    router    fp32 logits [R, 257] = x . W for the loader's fp32 router table W [257, 2048] (256 router rows, then
-              the shared expert's gate row): bf16 x widened to fp32, one fused multiply-add chain per (row, expert)
-              over K in order (``tl.dot`` at input_precision "ieee" runs on CUDA cores, k by k), so a logit never
-              depends on the other rows, the tile or the launch settings; the row tile follows the row count
-    select    Flash Next's top-k (``qwen4_exp/cuda/moe.py``): each row's top 8 by fp32 logit, largest first, the
-              lower id among equal logits; weights exp(l_k - l_0) / sum over the 8, which is the softmax over the
-              256 renormalised over the 8, rounded to bf16 as the reference implementation's weights are; slot 8
-              the shared expert with weight bf16(sigmoid(bf16(gate logit))). Then ``tensorfold.cuda.experts``'
-              plan groups the window's (row, slot) pairs by expert
-    experts   ``tensorfold.cuda.experts`` (the grouped kernels Flash Next, GLM and Nemotron share) over the
-              257-expert table at group size 64, decode form: act = bf16(bf16(silu(bf16 gate)) * bf16 up), then the
-              down projection in fp32 per (row, slot). A pair's bits never depend on the other rows of the call,
-              and the row count is a runtime argument (a new prompt length compiles nothing)
-    combine   branch = bf16(sum over the 9 slots, in pick order and then the shared expert, of fp32 w_k * y_k),
-              one rounding; optionally fused with the residual add and the next RMSNorm (``combine_add_rmsnorm``)
-
-Prompt chunks use the decode form too, so a prefilled row gets the bits of a serial step (the shared prefill form
-rounds its outputs differently).
-"""
+"""Qwen3.6-35B-A3B's MoE on CUDA: the fp32 router, Flash Next's top-k, the shared grouped experts, the combine."""
 
 from __future__ import annotations
 
@@ -29,9 +9,8 @@ import triton
 import triton.language as tl
 
 from tensorfold.cuda import experts as grouped
-
-from ...qwen4_exp.cuda import moe as _fn
-from ...qwen4_exp.cuda.moe import MoEBuffers
+from tensorfold.families.qwen4_exp.cuda import moe as fn_moe
+from tensorfold.families.qwen4_exp.cuda.moe import MoEBuffers
 
 EXPERTS = 256             # routed experts; the shared expert is expert EXPERTS of the table
 TOP_K = 8
@@ -47,8 +26,7 @@ def config(experts: int = EXPERTS, top_k: int = TOP_K, width: int = WIDTH, hidde
 
 
 def buffers(rows: int, device: torch.device | str, cfg: SimpleNamespace | None = None) -> MoEBuffers:
-    """Static MoE scratch for windows of up to ``rows`` rows (Flash Next's, decode form): logits [rows, E + 1],
-    picks and weights [rows, k + 1], the experts' plan, act [rows, k + 1, width] bf16, y [rows, k + 1, hidden] fp32."""
+    """Flash Next's static MoE scratch (decode form) for windows of up to ``rows`` rows."""
 
     return MoEBuffers(rows, cfg or config(), device)
 
@@ -95,18 +73,14 @@ def _router(X, W, OUT, M, x_stride, D: tl.constexpr, NE: tl.constexpr, BM: tl.co
     tl.store(OUT + rm[:, None] * NE + re[None, :], acc, mask=m_ok[:, None] & e_ok[None, :])
 
 
-# (up to this many rows: rows a program, experts a program, K a step, warps, stages): none changes a logit's bits.
-# Timed on MaxQ's RTX 5090 (170 SMs), GPU time a call: 16 x 16 tiles give ~30 us from 1 to 129 rows (32-, 64- and
-# 128-row tiles took 65, 150 and 172 us), 32 x 16 ~43 us at 256 rows, 64 x 16 ~55 us at 512 (16 x 16 there: 113).
-# Retime on GB10 (48 SMs).
+# (up to this many rows: rows a program, experts a program, K a step, warps, stages), timed on an RTX 5090
 ROUTER_CFG = ((128, (16, 16, 64, 4, 3)), (256, (32, 16, 64, 2, 3)), (1 << 31, (64, 16, 64, 2, 3)))
 
 
 def router(x: torch.Tensor, rows: torch.Tensor, out: torch.Tensor | None = None, *, block_m: int | None = None,
            block_e: int | None = None, bk: int | None = None, num_warps: int | None = None,
            num_stages: int | None = None) -> torch.Tensor:
-    """x [R, D] bf16 (rows may be strided), rows [E + 1, D] fp32 (router rows, then the shared expert's gate row)
-    -> [R, E + 1] fp32 logits."""
+    """x [R, D] bf16 (rows may be strided) and the fp32 table [E + 1, D] -> fp32 logits [R, E + 1]."""
 
     m, d = x.shape
     ne = rows.shape[0]
@@ -129,17 +103,14 @@ def router(x: torch.Tensor, rows: torch.Tensor, out: torch.Tensor | None = None,
 
 
 def select(logits: torch.Tensor, buf: MoEBuffers, top_k: int = TOP_K, experts: int = EXPERTS) -> None:
-    """Each row's experts and weights (rows [0, R) of ``buf``), then the window's (row, slot) pairs grouped by
-    expert (Flash Next's ``select``: its top-k and the shared experts' plan)."""
+    """Each row's experts and weights, then the (row, slot) pairs grouped by expert: Flash Next's ``select``."""
 
-    _fn.select(logits, buf, top_k, experts)
+    fn_moe.select(logits, buf, top_k, experts)
 
 
 def moe(x: torch.Tensor, xs: torch.Tensor | None, router_rows: torch.Tensor, ex: grouped.Experts, buf: MoEBuffers,
         *, top_k: int = TOP_K, experts: int = EXPERTS) -> Rows:
-    """Route rows x [R, D] bf16 and run their experts. Returns the R-row view of ``buf``: y [R, k + 1, D] fp32
-    (slot k: the shared expert), wts [R, k + 1] (routed weights, then the shared gate), pick [R, k + 1].
-    ``xs`` (x's group sums) is not read: the grouped kernels take the sums inside."""
+    """Route rows x [R, D] and run their experts; returns the R-row view of ``buf`` (y, wts, pick; slot k shared)."""
 
     rows = x.shape[0]
     view = rows_view(buf, rows)
@@ -154,8 +125,7 @@ def moe(x: torch.Tensor, xs: torch.Tensor | None, router_rows: torch.Tensor, ex:
 # -- combine -------------------------------------------------------------------------------------------------
 @triton.jit
 def _combine(Y, WTS, H, NW, HOUT, OUT, XS, eps, D: tl.constexpr, SLOTS: tl.constexpr, FUSED: tl.constexpr):
-    """Program r: branch = bf16(sum over slots k in order of fp32 y_k * w_k). FUSED: h = bf16(h + branch) to HOUT,
-    OUT = bf16(h * rsqrt(mean(h^2) + eps) * nw), XS = OUT's 64-group sums; else OUT = branch."""
+    """Program r: branch = bf16(sum of y_k w_k in slot order); FUSED adds it to h and writes the next RMSNorm, XS."""
 
     r = tl.program_id(0)
     d = tl.arange(0, D)
@@ -191,8 +161,7 @@ def _slots(y: torch.Tensor, wts: torch.Tensor) -> tuple[int, int, int]:
 
 
 def combine(y: torch.Tensor, wts: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
-    """y [R, k + 1, D] fp32 slots, wts [R, k + 1] -> [R, D] bf16: the slots in order (the routed slots in pick
-    order, then the shared expert), summed in fp32 and rounded once."""
+    """y [R, k + 1, D] fp32 and wts [R, k + 1] -> [R, D] bf16: the slots summed in order in fp32, rounded once."""
 
     rows, slots, d = _slots(y, wts)
     if out is None:
@@ -204,9 +173,7 @@ def combine(y: torch.Tensor, wts: torch.Tensor, out: torch.Tensor | None = None)
 def combine_add_rmsnorm(y: torch.Tensor, wts: torch.Tensor, h: torch.Tensor, norm: torch.Tensor, eps: float, *,
                         h_out: torch.Tensor | None = None, normed: torch.Tensor | None = None,
                         xs: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The combine, then the residual and the next norm in the same pass: h' = bf16(h + branch) (``h_out``, which
-    may be ``h``), normed = bf16(h' * rsqrt(mean(h'^2) + eps) * norm) (``norm``: the fp32 multiplier 1 + w), and
-    normed's 64-group sums for the next matmul. Returns (h', normed, xs)."""
+    """The combine, the residual add and the next RMSNorm (fp32 1 + w) with its 64-group sums: (h', normed, xs)."""
 
     rows, slots, d = _slots(y, wts)
     if h.shape != (rows, d) or h.dtype != torch.bfloat16 or not h.is_contiguous():

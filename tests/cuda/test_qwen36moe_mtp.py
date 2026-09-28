@@ -31,7 +31,8 @@ from tensorfold.families.qwen3_5_moe.cuda import decode as D  # noqa: E402
 from tensorfold.families.qwen3_5_moe.cuda import weights as W  # noqa: E402
 from tensorfold.families.qwen3_5_moe.cuda.decode import (  # noqa: E402
     Decoder, generate, generate_result, mtp_decode, prefill, run_prompt, serial_decode)
-from tensorfold.families.qwen3_5_moe.cuda.forward import State, prepare  # noqa: E402
+from tensorfold.families.qwen3_5_moe.cuda.forward import prepare  # noqa: E402
+from tensorfold.families.qwen3_5_moe.cuda.state import State  # noqa: E402
 from tensorfold.families.qwen3_5_moe.cuda.mtp import draft_token_ids, mtp_forward, prepare_mtp  # noqa: E402
 from test_qwen36moe_forward import V, _cached, _config, _Rand, _tokens  # noqa: E402  (the forward test's model)
 

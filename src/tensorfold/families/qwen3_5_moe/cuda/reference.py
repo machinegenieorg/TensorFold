@@ -1,43 +1,12 @@
-"""A plain PyTorch forward of Qwen3.6-35B-A3B (``qwen3_5_moe``) in fp32, to check the CUDA forward against.
-
-The math follows transformers' ``modeling_qwen3_5_moe.py``; the MTP head follows vLLM's ``qwen3_5_mtp.py``.
-
-- Every layer: x += mixer(norm(x)); x += moe(norm(x)), with the zero-centred RMSNorm x̂ · (1 + w) (the loader
-  hands the multiplier over as fp32).
-- Gated DeltaNet (30 layers): one projection [qkv | z | b | a]; a depthwise causal conv of width 4 over qkv,
-  then SiLU; q and k L2-normalised (eps 1e-6) and q scaled by dk^-0.5; g = -exp(A_log) · softplus(a + dt_bias),
-  beta = sigmoid(b); value head h reads key head h // (nv / nk); the delta rule in fp32 (state [nv, dv, dk]):
-  S = S·exp(g); S += k ⊗ beta·(v - S k); y = S q; then RMSNorm(y) · w · silu(z) (w as stored, not centred) and
-  out_proj.
-- Gated attention (every fourth layer, 3, 7, ..., 39): q_proj gives [query | gate] per head; q and k norms;
-  RoPE on each head's first ``rotary_dim`` dims (rotate-half; text positions reduce mrope to 1-D RoPE); causal
-  softmax attention, head h reading KV head h // (heads / kv_heads); output · sigmoid(gate), then o_proj.
-- MoE (every layer): router logits x · W in fp32, softmax over the 256 experts, top 8 (ties to the lower id),
-  renormalised; SwiGLU experts; the combine adds the slots in pick order, then the shared expert times
-  sigmoid(its gate row · x), in fp32.
-- The final norm, then the head.
-- MTP: x = fc([pre_fc_norm_embedding(embed(t + 1)) | pre_fc_norm_hidden(h_t)]) with h_t the target's hidden after
-  its final norm (vLLM passes the model's normed output; the fc input is [embedding | hidden]); one attention
-  layer with the same MoE, its own KV cache and the target's RoPE; ``norm``; the target's head. Row t sits at the
-  target's position t (vLLM's convention; RoPE only sees offsets, so a shift of every row changes nothing).
-
-Arithmetic is fp32 throughout (run with ``TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0`` in NVIDIA's container, which
-otherwise runs fp32 matmuls in TF32). With ``State(bf16=True)`` (the default) activations are rounded to bf16
-where the kernels store them: projection outputs, the embedding, the conv output, the recurrence output, the gated
-norm, q and k after norm and RoPE, the attention output and its gated product, the SwiGLU product, each expert's
-output, the residual stream after each add (the MoE sum is added unrounded), and the final norm. ``bf16=False``
-keeps every activation fp32.
-
-Slow on purpose: each call dequantizes the MLX 4-bit weights it uses (fp32 scale · q + fp32 bias per group of 64),
-a layer at a time, so the model fits a 32 GB GPU beside its packed weights. The recurrence runs a token at a time.
-"""
+"""A plain fp32 PyTorch forward of Qwen3.6-35B-A3B and its MTP head, to check the CUDA forward against."""
 
 from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
 
-from .weights import MTPW, QW, AttnW, Config, GDNW, LayerW, MoEW, Weights, dequantize
+from .checkpoint import Config
+from .weights import MTPW, QW, AttnW, GDNW, LayerW, MoEW, Weights, dequantize
 
 BF, F32 = torch.bfloat16, torch.float32
 _DEQ_ROWS = 16384            # rows dequantized at once: bounds dequantize's int64 unpacking to rows x K x 8 bytes
@@ -46,8 +15,7 @@ _QUERY_ROWS = 1024           # attention query rows per score block
 
 
 class State:
-    """One sequence's caches: KV for each attention layer, conv tail and recurrent state for each Gated DeltaNet
-    layer, all fp32 (bf16-rounded values when ``bf16``), and the next position."""
+    """One sequence's fp32 caches (KV, conv tails, recurrent states; bf16-rounded with ``bf16``) and position."""
 
     def __init__(self, cfg: Config, linear: list[bool], device: torch.device | str, *, bf16: bool = True):
         self.bf16 = bf16
@@ -79,10 +47,7 @@ def new_mtp_state(mtp: MTPW, w: Weights, *, bf16: bool = True) -> State:
     return State(mtp.cfg, [False], w.device, bf16=bf16)
 
 
-# ---------------------------------------------------------------------------------------------------------------
-# pieces
-
-
+# -- pieces ----------------------------------------------------------------------------------------------------
 def _r(x: torch.Tensor, st: State) -> torch.Tensor:
     return x.to(BF).to(F32) if st.bf16 else x
 
@@ -192,8 +157,7 @@ def _attention(at: AttnW, x: torch.Tensor, st: State, i: int, c: Config, inv_fre
 
 
 def route(m: MoEW, x: torch.Tensor, c: Config) -> tuple[torch.Tensor, torch.Tensor]:
-    """(ids, weights), each (T, top_k): softmax over the routed experts in fp32, the top_k largest (ties to the
-    lower id), renormalised when the config says so."""
+    """(ids, weights), each (T, top_k): fp32 softmax over the routed experts, top_k (ties to lower ids), renormed."""
 
     probs = torch.softmax(x @ m.router[:c.experts].T, dim=-1)
     vals, ids = torch.sort(probs, dim=-1, descending=True, stable=True)
@@ -232,14 +196,10 @@ def _layer(layer: LayerW, x: torch.Tensor, st: State, i: int, c: Config, inv_fre
     return _r(x + _moe(layer.moe, h, st, c), st)
 
 
-# ---------------------------------------------------------------------------------------------------------------
-# the model
-
-
+# -- the model -------------------------------------------------------------------------------------------------
 @torch.no_grad()
 def hidden(w: Weights, tokens: torch.Tensor, st: State, *, normed: bool = True) -> torch.Tensor:
-    """(T, hidden) fp32 after the final norm for ``tokens`` continuing the sequence in ``st`` (which advances);
-    ``normed=False``: the residual stream before it (``final_norm`` applies it)."""
+    """(T, hidden) fp32 after the final norm (or before it) for ``tokens`` continuing the sequence in ``st``."""
 
     x = embed(w, tokens, st)
     for i, layer in enumerate(w.layers):
@@ -263,8 +223,7 @@ def logits(w: Weights, h: torch.Tensor) -> torch.Tensor:
 @torch.no_grad()
 def head_top1(w: Weights, h: torch.Tensor, targets: torch.Tensor | None = None
               ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """(argmax (T,) int64, -log p(target) (T,) fp32 or None) without holding (T, vocab) logits: the head a vocabulary
-    slice at a time, with a running max (ties to the lower id) and log-sum-exp."""
+    """(argmax, -log p(target) or None) over vocabulary slices, never holding (T, vocab) logits."""
 
     hd = w.head
     T = h.shape[0]
@@ -297,8 +256,7 @@ def forward(w: Weights, tokens: torch.Tensor, st: State) -> torch.Tensor:
 
 @torch.no_grad()
 def greedy(w: Weights, prompt: list[int], max_new: int, eos: tuple[int, ...] = (), *, bf16: bool = True) -> list[int]:
-    """Greedy continuation: the prompt in one forward, then a token at a time from the caches. Stops after an eos
-    id (included) or ``max_new`` tokens."""
+    """Greedy continuation from the caches, up to ``max_new`` tokens or an eos id (included)."""
 
     st = new_state(w, bf16=bf16)
     h = hidden(w, torch.tensor(prompt), st)[-1:]
@@ -312,15 +270,10 @@ def greedy(w: Weights, prompt: list[int], max_new: int, eos: tuple[int, ...] = (
     return out
 
 
-# ---------------------------------------------------------------------------------------------------------------
-# the MTP head
-
-
+# -- the MTP head ----------------------------------------------------------------------------------------------
 @torch.no_grad()
 def mtp_hidden(mtp: MTPW, w: Weights, tokens: torch.Tensor, h: torch.Tensor, st: State) -> torch.Tensor:
-    """(T, hidden) fp32 after the MTP head's norm. Row t reads ``tokens[t]`` (the token after the target's
-    position t) and ``h[t]`` (the target's hidden at position t, after its final norm), continuing the head's
-    sequence in ``st``; the target's head over the result gives the token after ``tokens[t]``."""
+    """(T, hidden) fp32 after the MTP head's norm: row t reads ``tokens[t]`` and the target's hidden row ``h[t]``."""
 
     c = mtp.cfg
     e = _r(_rms(embed(w, tokens, st), mtp.norm_e, c.eps), st)

@@ -1,23 +1,4 @@
-"""Qwen3.6-35B-A3B decode on CUDA: prefill, serial decoding (the reference), and MTP-drafted decoding that emits
-serial decoding's tokens.
-
-Every emitted token is the keyed sample (``tensorfold.cuda.sampling.sample_rows``: seeded Gumbel over top-k/top-p,
-ties by token id) of this engine's logits at its position, or the argmax (the lowest id among equal logits) when
-greedy. A serial step is a one-row window of ``forward`` followed by a one-row ``commit``.
-
-A drafted round verifies the pending token and up to ``depth`` MTP drafts as one window through the same kernels and
-the same sampler (row r of a window has the bits of the serial step at its position), keeps the rows up to the first
-draft that differs from what the sampler picks there (``forward.commit``), then the MTP head absorbs the kept rows and
-chains the next drafts. Drafts are sampled with the same keyed rule at their positions, so a sampled draft shares its
-position's noise with the verify. With ``confidence`` > 0 a chain always keeps its first draft (every round verifies
-at least two rows) and ends before a later draft the head gives less than ``confidence``, or right after a first draft
-under it. Drafts change speed only, never the output.
-
-A prompt runs in chunks of up to ``Decoder.buf.rows`` rows (512 by default); with the MTP head the head absorbs each
-position whose next token is known, and keeps the last position's hidden row (``State.mtp_tail``) until the first
-reply token. Rows never depend on their chunk, so any chunking, and a resumed prompt (``State.snapshot``), ends in the
-state and logits of one fresh prefill.
-"""
+"""Qwen3.6-35B-A3B decoding on CUDA: prefill, serial decoding and MTP-drafted decoding that emits serial tokens."""
 
 from __future__ import annotations
 
@@ -28,27 +9,24 @@ from typing import Callable, Sequence
 import numpy as np
 import torch
 
-from tensorfold.cuda.sampling import sample_rows  # noqa: F401  (the CUDA families' keyed sampler, re-exported)
+from tensorfold.cuda.sampling import sample_rows
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 
 from . import qmm
-from .forward import Buffers, Model, Pool, State, commit, forward
+from .forward import Buffers, Model, commit, forward
 from .mtp import MTPK, MTPBuffers, mtp_forward
+from .state import Pool, State
 
-CONTEXT = 4096            # prompt plus reply tokens the caches hold, by default
 PREFILL_ROWS = 512        # rows a prefill chunk runs at once
 MTP_ROWS = 64             # rows an MTP step absorbs at once (prefill absorbs in steps of this many)
 GRAPH_ROWS = 8            # windows (and MTP steps) up to this many rows replay CUDA graphs, when enabled
-# the drafting recipe, measured on an RTX 5090 (tests/cuda/test_qwen36moe_mtp.py; retune on GB10, where a verify row
-# costs more): chat chains end by confidence well before the depth, JSON chains run deep (acceptance near 1)
+# the drafting recipe, chosen on an RTX 5090 (tools/bench_q36.py drafting): retune on GB10
 DEPTH = 6                 # most MTP drafts a round (windows of up to DEPTH + 1 rows: window_rows, graph_rows above)
 CONFIDENCE = 0.5          # a chain ends before a later draft the head gives less than this
 
 
 def sample_draft(k: MTPK, logits: torch.Tensor, position: int, sampling: Sampling | None) -> tuple[int, float]:
-    """The MTP head's draft at ``position`` (keyed like every sample, over the draft head's tokens) and its probability
-    at temperature 1 under the head's distribution over those tokens (the confidence that ends a chain; speed only).
-    One device-to-host copy."""
+    """The head's keyed draft at ``position`` and its probability at temperature 1 (the chain's confidence)."""
 
     row = logits[:1].float()
     lse = torch.logsumexp(row, dim=-1, keepdim=True)
@@ -69,14 +47,9 @@ def sample_draft(k: MTPK, logits: torch.Tensor, position: int, sampling: Samplin
 
 
 class Decoder:
-    """A model, one set of window buffers, and a pool of sequence states; ``st`` is the sequence the helpers below
-    run unless given another. ``states``: how many sequences the pool holds (tests and A/B runs take clones).
+    """A model, window buffers, a pool of ``states`` sequences (``st`` the default one), the MTP head and graphs."""
 
-    ``mtp``: the MTP head (``mtp.prepare_mtp``); the pool then holds its cache and the drafted loop can run.
-    ``graphs``: windows and MTP steps of up to ``graph_rows`` rows replay CUDA graphs (``graphs.py``), the same bits
-    as eager; ``warm`` captures them up front."""
-
-    def __init__(self, m: Model, *, capacity: int = CONTEXT, rows: int = PREFILL_ROWS, window_rows: int = 32,
+    def __init__(self, m: Model, *, capacity: int, rows: int = PREFILL_ROWS, window_rows: int = 32,
                  attn_rows: int = 64, logit_rows: int = 32, states: int = 1, mtp: MTPK | None = None,
                  mtp_rows: int = MTP_ROWS, graphs: bool = False, graph_rows: int = GRAPH_ROWS) -> None:
         self.m = m
@@ -98,8 +71,7 @@ class Decoder:
         return tuple(self.m.cfg.eos)
 
     def forward(self, tokens: Sequence[int], st: State | None = None, *, logits: str = "all") -> torch.Tensor | None:
-        """A window of ``tokens`` after ``st``'s committed sequence (logits [R, V], a view of the buffers); a CUDA graph
-        replay when enabled and the window is small."""
+        """A window of ``tokens`` after ``st``'s sequence: logits [R, V], from a CUDA graph when enabled and small."""
 
         st = st or self.st
         if self.graphs is not None and logits == "all":
@@ -111,7 +83,7 @@ class Decoder:
 
     def mtp_step(self, st: State, tokens: Sequence[int], hidden: torch.Tensor, pos0: int, *,
                  logits: bool = True) -> torch.Tensor | None:
-        """An MTP step (``mtp.mtp_forward``), a CUDA graph replay when enabled and the step is small."""
+        """An MTP step (``mtp.mtp_forward``), from a CUDA graph when enabled and small."""
 
         if self.mtp is None:
             raise ValueError("this decoder has no MTP head")
@@ -120,9 +92,7 @@ class Decoder:
         return mtp_forward(self.m, self.mtp, self.mbuf, st, tokens, hidden, pos0, logits=logits)
 
     def warm(self, rows: int | None = None, states: Sequence[State] | None = None) -> int:
-        """Capture every decode graph for ``states`` (default: ``st``) up front, so no capture lands inside a timed
-        run: windows of 1..rows rows at both GDN parities, MTP steps of 1..rows rows. Resets those states (it runs
-        windows on them). Returns the number of graphs captured."""
+        """Capture every decode graph of ``states`` (default ``st``) up front and reset them; returns the count."""
 
         if self.graphs is None:
             return 0
@@ -144,8 +114,7 @@ def _zero_mtp(st: State, lo: int, hi: int) -> None:
 
 def _absorb(e: Decoder, st: State, hidden: torch.Tensor, next_tokens: Sequence[int], *,
             logits: bool) -> torch.Tensor | None:
-    """The head absorbs positions st.mtp_len, st.mtp_len + 1, ... (their hidden rows and next tokens) in steps of up
-    to ``e.mbuf.rows`` rows; with ``logits``, the draft-head logits of the last row."""
+    """The head absorbs positions from st.mtp_len on in steps; with ``logits``, the last row's draft logits."""
 
     n = len(next_tokens)
     out = None
@@ -164,8 +133,7 @@ def _keep_tail(st: State, hidden_row: torch.Tensor) -> None:
 
 
 def _tail_ready(st: State) -> bool:
-    """Whether the head holds every position but the last committed one, whose hidden row waits in ``mtp_tail``
-    (missing earlier rows are zero-filled). Then the next absorb starts at that position."""
+    """Whether the head holds every position but the last, whose row waits in ``mtp_tail`` (gaps zero-filled)."""
 
     p = st.pos
     if p == 0 or st.mtp_tail is None or st.mtp_tail_at != p - 1:
@@ -176,8 +144,7 @@ def _tail_ready(st: State) -> bool:
 
 
 def _mtp_catch_up(e: Decoder, st: State, token: int | None) -> None:
-    """Before new rows at position st.pos: the head absorbs the waiting tail with ``token`` (the token at st.pos), or
-    zero-fills what it cannot absorb, so it holds every position below st.pos."""
+    """Before rows at st.pos: the head absorbs the waiting tail with ``token``, or zero-fills what it cannot."""
 
     if token is not None and _tail_ready(st):
         _absorb(e, st, st.mtp_tail[None], [token], logits=False)
@@ -188,10 +155,7 @@ def _mtp_catch_up(e: Decoder, st: State, token: int | None) -> None:
 
 def draft(e: Decoder, st: State, hidden: torch.Tensor, next_tokens: Sequence[int], position: int, count: int,
           sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
-    """Absorb rows (hidden states [n, hidden], next tokens) at st.mtp_len onward, then chain up to ``count`` drafts
-    for positions position, position + 1, ... (the chain's cache entries sit past st.mtp_len). With ``confidence``
-    > 0 the first draft is always kept; the chain ends before a later draft under it, and right after a first
-    draft under it."""
+    """Absorb the kept rows, then chain up to ``count`` drafts from ``position``, stopping on low ``confidence``."""
 
     k = e.mtp
     logits = _absorb(e, st, hidden, next_tokens, logits=True)
@@ -213,10 +177,7 @@ def draft(e: Decoder, st: State, hidden: torch.Tensor, next_tokens: Sequence[int
 @torch.no_grad()
 def run_prompt(e: Decoder, prompt: Sequence[int], *, st: State | None = None, chunk: int | None = None,
                resume: dict | None = None, mtp: bool = True) -> torch.Tensor:
-    """Commit ``prompt`` into ``st`` in chunks of ``chunk`` rows; returns the last prompt row's logits [1, V] (a copy).
-    ``resume``: a snapshot of this state's sequence (``State.snapshot``, its cache rows still in place) that the prompt
-    extends: only the tokens after it run. ``mtp`` (with an MTP head): the head absorbs every prompt position whose
-    next token is known and keeps the last one's hidden row for the first reply token."""
+    """Commit ``prompt`` in chunks (after ``resume``, a snapshot it extends); returns the last row's logits [1, V]."""
 
     if not prompt:
         raise ValueError("a prompt needs at least one token")
@@ -286,10 +247,7 @@ class DecodeResult:
 def serial_decode(e: Decoder, pending: int, count: int, sampling: Sampling | None = None, *,
                   st: State | None = None, stop_eos: bool = False,
                   on_tokens: Callable[[list[int]], bool] | None = None) -> DecodeResult:
-    """Up to ``count`` tokens, starting with ``pending`` (the token ``prefill`` sampled): each step runs one row (the
-    last token) and commits it, then samples the next at its position. ``on_tokens(new)`` hears each step's token and
-    returns True to stop early. The last token is sampled, not committed (it is the next step's input). The MTP head,
-    if any, is not run: a drafted continuation of this state re-syncs it (one round without drafts)."""
+    """The serial reference: up to ``count`` tokens from ``pending``, one row a step; the last is not committed."""
 
     st = st or e.st
     out = [pending]
@@ -312,13 +270,7 @@ def serial_decode(e: Decoder, pending: int, count: int, sampling: Sampling | Non
 def mtp_decode(e: Decoder, pending: int, count: int, sampling: Sampling | None = None, *, st: State | None = None,
                depth: int = DEPTH, confidence: float = CONFIDENCE, stop_eos: bool = False,
                on_tokens: Callable[[list[int]], bool] | None = None) -> DecodeResult:
-    """Up to ``count`` tokens starting with ``pending``, the tokens ``serial_decode`` emits: each round verifies the
-    pending token and its MTP drafts in one window, keeps up to the first mismatch, and drafts again. Starts from the
-    state ``prefill`` leaves (the head holds every prompt position but the last, whose hidden row waits in the tail);
-    from any other state the first round runs without drafts while the head catches up. A round never drafts past
-    ``count``, so the caches end as serial decoding leaves them (every token but the last committed), and the head
-    holds every committed position but the last, whose row waits in the tail (a continuation resumes drafting).
-    ``on_tokens(new)`` hears each round's kept tokens (after ``pending``); it returns True to stop early."""
+    """Up to ``count`` tokens from ``pending``, ``serial_decode``'s tokens, each round verifying MTP drafts."""
 
     if e.mtp is None:
         raise ValueError("drafted decoding needs the MTP head (Decoder(..., mtp=prepare_mtp(...)))")
@@ -401,10 +353,7 @@ def generate(e: Decoder, prompt: Sequence[int], max_tokens: int, sampling: Sampl
              stop_eos: bool = True, st: State | None = None, draft: bool = True,
              on_tokens: Callable[[list[int]], bool] | None = None, depth: int = DEPTH,
              confidence: float = CONFIDENCE) -> list[int]:
-    """Prefill, then decode up to ``max_tokens`` reply tokens (ending with an eos id when ``stop_eos`` and one comes).
-    ``draft`` (the default) drafts with the MTP head when the decoder has one; ``draft=False`` (or no head) decodes one
-    token a step, the serial reference. Both return the same tokens. ``on_tokens(new)`` hears the reply's tokens as
-    they are decided (the first alone) and returns True to stop early."""
+    """Prefill, then up to ``max_tokens`` reply tokens, drafted with the head or (``draft=False``) serially."""
 
     return generate_result(e, prompt, max_tokens, sampling, stop_eos=stop_eos, st=st, draft=draft,
                            on_tokens=on_tokens, depth=depth, confidence=confidence).tokens
@@ -414,8 +363,7 @@ def generate(e: Decoder, prompt: Sequence[int], max_tokens: int, sampling: Sampl
 @torch.no_grad()
 def score(e: Decoder, ids: Sequence[int], *, st: State | None = None, chunk: int | None = None
           ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Teacher forcing over ``ids`` from an empty sequence: (argmax at each position (T,) int64, the NLL of each next
-    token (T - 1,) fp32), from this engine's bf16 logits (the head over every row, ``logit_rows`` at a time)."""
+    """Teacher forcing over ``ids``: (argmax at each position, NLL of each next token) from the bf16 logits."""
 
     st = st or e.st
     b = e.buf

@@ -1,26 +1,4 @@
-"""Qwen3.6-35B-A3B's 4-bit matmuls on CUDA: MLX affine weights in groups of 64 on the shared lane kernels.
-
-Dense projections run ``tensorfold.cuda.kernels.qmm`` (the lane matmul Flash Next, the 27B and Nemotron use) at
-group size 64. For weight group g (64 inputs, one scale s and one bias b per output column):
-
-    P[m, n, g] = x[m, g-block] . q[n, g-block]     tensor cores, bf16 x integer-valued bf16 -> fp32
-    y[m, n]    = sum over g, in order, of  s[n, g] * P[m, n, g] + b[n, g] * xs[m, g]
-
-where xs[m, g] is the fp32 sum of the group's 64 bf16 inputs. The K groups are split into SK slices that are a
-constant of the weight's shape (``SPLITS``, pinned here so a retune of the shared rule cannot move these bits), and
-the slices are added in slice order. A row's bits do not depend on the row tile, the other rows or their order
-(``tests/cuda/test_qwen36moe_qmm.py``).
-
-Experts (``make_experts``) are packed for ``tensorfold.cuda.experts``, the grouped kernels Flash Next, GLM and
-Nemotron share; ``moe.py`` runs them.
-
-The loader hands over MLX's arrays as stored (``weights.QW.triple()``: int32 words [N, K/8], bf16 scales and biases
-[N, K/64]); ``make_q4`` / ``make_experts`` regroup them once for the kernels. The embedding stays in MLX's row
-layout for the gather.
-
-Format interface: ``matmul`` dispatches on the weight's type. ``Q4`` is the only format today; an NVFP4 matrix type
-would add its own branch and kernels here without touching the callers.
-"""
+"""Qwen3.6-35B-A3B's 4-bit matmuls on CUDA: MLX affine weights in groups of 64 on the shared lane kernels."""
 
 from __future__ import annotations
 
@@ -34,10 +12,7 @@ from tensorfold.cuda.experts import Experts  # noqa: F401  (re-exported)
 
 GS = 64                   # inputs per quantization group
 
-# The K split of every Qwen3.6 matrix, pinned: ``shared.split_k``'s choice at group 64 for these shapes (about 192
-# programs a matrix at one row, no split for the wide ones). The K slices are part of the arithmetic (a new value
-# changes every row's bits alike, so serial and windows stay equal, but stored hashes move); retime on GB10 before
-# any hashes are stored.
+# every Qwen3.6 matrix's K split, pinned at ``shared.split_k``'s group-64 choice: a new value moves stored hashes
 SPLITS: dict[tuple[int, int], int] = {
     (12352, 2048): 1,        # Gated DeltaNet [in_proj_qkv | in_proj_z | in_proj_b | in_proj_a]
     (9216, 2048): 2,         # attention [q_proj (query | gate per head) | k_proj | v_proj]
@@ -102,8 +77,7 @@ def stack_q4(parts: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]) -> Q4
 
 
 def to_mlx(q: Q4, rows: int = 8192) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The stored MLX layout again: (N, K/8) int32 words, (N, K/64) scales and biases, ``rows`` rows at a time (the
-    unpacking's int64 temporaries for the whole head would take about 4 GB)."""
+    """The stored MLX layout again (words, scales, biases), unpacked ``rows`` rows at a time to bound temporaries."""
 
     if q.n <= rows:
         return shared.unpack(q)
@@ -149,9 +123,7 @@ def group_sums(x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor
 # -- the matmul (format dispatch) ------------------------------------------------------------------------------
 def matmul(x: torch.Tensor, w: Q4, xs: torch.Tensor | None = None, *, out: torch.Tensor | None = None,
            f32: bool = False, part: torch.Tensor | None = None, reduce: bool = True) -> torch.Tensor:
-    """x (M, K) bf16 (rows may be strided, any M) @ w.T -> (M, N) bf16, or unrounded fp32 sums with ``f32``.
-    ``xs``: x's 64-group sums (computed when None). ``part``: the split-K scratch (``split_scratch``).
-    ``reduce=False`` with a split K returns the unreduced fp32 slices [SK, M, N], to be added in slice order."""
+    """x (M, K) bf16 @ w.T -> (M, N) bf16, fp32 sums with ``f32``, or the unreduced K slices with ``reduce=False``."""
 
     if isinstance(w, Q4):
         if w.gs != GS:
@@ -165,8 +137,7 @@ def matmul(x: torch.Tensor, w: Q4, xs: torch.Tensor | None = None, *, out: torch
 # -- embedding -------------------------------------------------------------------------------------------------
 def embed(ids: torch.Tensor, words: torch.Tensor, scales: torch.Tensor, biases: torch.Tensor,
           out: torch.Tensor | None = None) -> torch.Tensor:
-    """ids (R,) int32/int64 -> (R, D) bf16 rows of the 4-bit embedding (MLX layout as stored, group 64):
-    bf16(fp32 q * s + b), the dense Qwen family's gather kernel into a caller's buffer."""
+    """ids (R,) -> (R, D) bf16 rows of the 4-bit embedding as stored: the dense family's gather into ``out``."""
 
     from tensorfold.families.qwen3_5.cuda import glue as dense
 
@@ -183,9 +154,7 @@ def embed(ids: torch.Tensor, words: torch.Tensor, scales: torch.Tensor, biases: 
 
 # -- experts ---------------------------------------------------------------------------------------------------
 def make_experts(gate: tuple, up: tuple, down: tuple, shared_expert: tuple | None = None) -> Experts:
-    """gate / up: MLX (words [E, NI, D/8], scales [E, NI, D/64], biases); down: ([E, D, NI/8], [E, D, NI/64], ...),
-    packed for ``tensorfold.cuda.experts`` (SwiGLU). The loader's table already holds the shared expert as expert
-    E - 1 (``shared_expert`` None); ``shared_expert`` (gate, up, down) appends one."""
+    """MLX (words, scales, biases) expert tables packed for the grouped kernels; ``shared_expert`` appends one."""
 
     parts = [gate, up, down]
     for t in parts + (list(shared_expert) if shared_expert is not None else []):

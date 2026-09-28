@@ -16,6 +16,7 @@ torch = pytest.importorskip("torch")
 
 from tensorfold import families  # noqa: E402
 from tensorfold.families import qwen3_5_moe as family  # noqa: E402
+from tensorfold.families.qwen3_5_moe.cuda import checkpoint as C  # noqa: E402
 from tensorfold.families.qwen3_5_moe.cuda import weights as W  # noqa: E402
 
 ORIGINAL = "Qwen/Qwen3.6-35B-A3B"
@@ -91,8 +92,8 @@ def _read(folder: Path, name: str) -> torch.Tensor:
     index = json.loads((folder / "model.safetensors.index.json").read_text())["weight_map"]
     if not (folder / index[name]).is_file():
         pytest.skip(f"{name}'s shard is not in the cache")
-    base, header = W._read_header(folder / index[name])
-    rd = W._Reader(folder, "cpu", {name: (header[name]["dtype"], tuple(header[name]["shape"]))})
+    base, header = C.read_header(folder / index[name])
+    rd = C.Reader(folder, "cpu", {name: (header[name]["dtype"], tuple(header[name]["shape"]))})
     return rd.get(name).float()
 
 
@@ -100,12 +101,12 @@ def test_mlx_stores_one_plus_w_for_the_centred_norms():
     snap = _cached(family.MODELS[0])
     cfg = W.Config.read(snap)
     spec = W.layout(cfg, "language_model.")
-    rd = W._Reader(snap, "cpu", spec)
+    rd = C.Reader(snap, "cpu", spec)
     means = [float(rd.get(f"language_model.model.layers.{i}.input_layernorm.weight").float().mean())
              for i in range(cfg.layers)]
     assert W.norms_around_one(means)
     drafter = _cached(family.DRAFTER)
-    rd = W._Reader(drafter, "cpu", W.mtp_layout(W.Config.read(drafter)))
+    rd = C.Reader(drafter, "cpu", W.mtp_layout(W.Config.read(drafter)))
     assert W.norms_around_one([float(rd.get("layers.0.input_layernorm.weight").float().mean())])
 
 

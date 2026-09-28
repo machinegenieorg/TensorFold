@@ -30,7 +30,8 @@ from tensorfold.families.qwen3_5_moe.cuda import weights as W  # noqa: E402
 from tensorfold.families.qwen3_5_moe.cuda.decode import (  # noqa: E402
     Decoder, generate, prefill, run_prompt, sample_rows, score, serial_decode)
 from tensorfold.families.qwen3_5_moe.cuda.forward import (  # noqa: E402
-    Buffers, Pool, State, commit, forward, forward_many, prepare)
+    Buffers, commit, forward, forward_many, prepare)
+from tensorfold.families.qwen3_5_moe.cuda.state import Pool, State  # noqa: E402
 
 DEV = "cuda"
 BF = torch.bfloat16

@@ -1,34 +1,4 @@
-"""Qwen3.6-35B-A3B's MTP head on CUDA (the drafter repository's weights), through the family's kernels.
-
-Row t of the head reads the model's hidden state at position t (after the final norm, ``Buffers.hidden``) and the
-token at position t + 1, and scores the token at position t + 2:
-
-    x = fc([RMSNorm(embed(t_{t+1})) (1 + w_e) | RMSNorm(h_t) (1 + w_h)])      one 2048 x 4096 matmul, bf16 out
-    x = x + attention(RMSNorm(x) (1 + w_in))    one gated attention layer over the head's own cache, the model's RoPE
-    x = x + MoE(RMSNorm(x) (1 + w_post))        256 routed experts (top 8) and the shared expert
-    h = RMSNorm(x) (1 + w_norm);  logits = head(h)
-
-Row t sits at position t of the head's cache (``State.mtp_kc``), which holds the rows the head has absorbed
-(``State.mtp_len``). A chained draft feeds the head's own output ``h`` back as the next row's hidden state; its cache
-entries sit past ``mtp_len`` and the next absorb overwrites them.
-
-Only the last row of a step needs its output: earlier rows only leave their keys and values in the cache, so a step
-runs the attention, MoE and head on its last row alone (and a prefill absorb, which needs no output, stops after the
-cache write). The head proposes and never decides a token, so none of this needs row invariance; every kernel is
-still deterministic (the same inputs give the same bits), so drafts, and therefore speeds, repeat.
-
-The draft head scores a subset of the vocabulary (``draft_vocab.txt``, the rows of the model's head at those ids): a
-full head is 248,320 x 2,048 4-bit weights, about 290 MB a draft, eight times the rest of the MTP head. A token outside
-the subset can never be a draft, which costs speed, never correctness. The list holds 76,882 ids: every id below
-65,536 (the tokenizer's earliest merges), the 33 added tokens (``<|im_end|>``, ``<think>``, ...), and every id seen at
-least 10 times in CPython 3.14's standard library, this repository, and the Python sources and documentation of the
-packages in a local Python install (23,237 files, 67 million tokens):
-
-    python tools/draft_vocab.py tokenizer.json out.txt --keep-below 65536 --min-count 10 --size 76856 PATTERNS...
-
-plus ids 248044-248076. On held-out public text it holds 98.2% of the tokens of English prose (the reference test's
-passages) and 99.8% of JSON; a draft reads 31% of the full head. (The tokenizer's merges are Qwen3.8's.)
-"""
+"""Qwen3.6-35B-A3B's MTP head on CUDA (the drafter's weights) through the family's kernels, and its draft head."""
 
 from __future__ import annotations
 
@@ -41,11 +11,14 @@ import torch
 import triton
 import triton.language as tl
 
-from ...qwen4_exp.cuda import attention as attn_mod
-from ...qwen4_exp.cuda import glue as fn_glue
+from tensorfold.families.qwen4_exp.cuda import attention as attn_mod
+from tensorfold.families.qwen4_exp.cuda import glue as fn_glue
+from tensorfold.families.qwen4_exp.cuda import weights as fn_weights
+
 from . import moe as moe_mod
 from . import qmm
-from .forward import GS, AttnK, LayerK, Model, State, _norm
+from .forward import GS, AttnK, LayerK, Model, _norm
+from .state import State
 from .weights import MTPW
 
 DRAFT_VOCAB = Path(__file__).with_name("draft_vocab.txt")
@@ -72,22 +45,15 @@ class MTPK:
 
 
 def draft_token_ids(draft_vocab: int | str | Path | Sequence[int] | None) -> np.ndarray | None:
-    """The token ids the draft head scores, sorted and unique: "default" (``draft_vocab.txt`` beside this module), a
-    file of ids, an int N (the ids below N), a sequence of ids, or None (the whole vocabulary)."""
+    """The draft head's token ids, sorted: Flash Next's rule ("default" is this family's list), or a sequence of ids."""
 
-    if draft_vocab is None or (isinstance(draft_vocab, str) and not draft_vocab):
-        return None
-    if isinstance(draft_vocab, (int, np.integer)):
-        return np.arange(int(draft_vocab), dtype=np.int64)
-    if isinstance(draft_vocab, (str, Path)):
-        source = DRAFT_VOCAB if draft_vocab == "default" else Path(draft_vocab)
-        return np.unique(np.loadtxt(source, dtype=np.int64).reshape(-1))
-    return np.unique(np.asarray(list(draft_vocab), dtype=np.int64))
+    if isinstance(draft_vocab, (list, tuple, range, np.ndarray)):
+        return np.unique(np.asarray(list(draft_vocab), dtype=np.int64))
+    return fn_weights.draft_token_ids(str(DRAFT_VOCAB) if draft_vocab == "default" else draft_vocab)
 
 
 def prepare_mtp(mtp: MTPW, m: Model, *, draft_vocab: int | str | Path | Sequence[int] | None = "default") -> MTPK:
-    """The drafter's weights (``weights.load_mtp``) regrouped for the kernels, with a draft head over
-    ``draft_vocab`` (see ``draft_token_ids``) cut from the model's head."""
+    """The drafter's weights regrouped for the kernels, with a draft head over ``draft_vocab`` cut from the model's."""
 
     c = m.cfg
     lw = mtp.layer
@@ -112,8 +78,7 @@ def prepare_mtp(mtp: MTPW, m: Model, *, draft_vocab: int | str | Path | Sequence
 
 def draft_head(m: Model, draft_vocab: int | str | Path | Sequence[int] | None = "default"
                ) -> tuple[qmm.Q4, torch.Tensor | None, np.ndarray | None]:
-    """(head, ids on the device, ids on the host): the model's head rows at the draft vocabulary's ids, or the whole
-    head (and None, None) without one. ``MTPK``'s last three fields."""
+    """(head, device ids, host ids): the model's head rows at the draft vocabulary, or the whole head and no ids."""
 
     ids = draft_token_ids(draft_vocab)
     if ids is None:
@@ -189,8 +154,7 @@ class _Row:
 # -- kernels -------------------------------------------------------------------------------------------------------
 @triton.jit
 def _norm_into(X, W, Y, XS, eps, y_stride, xs_stride, D: tl.constexpr):
-    """Program r: Y[r] = bf16(x * rsqrt(mean(x^2) + eps) * w) (fp32 math) and its 64-group sums, into strided rows
-    (one half of the fc input)."""
+    """Program r: Y[r] = bf16(RMSNorm(x) w) (fp32 math) and its 64-group sums, into one half of the fc input."""
 
     r = tl.program_id(0).to(tl.int64)
     d = tl.arange(0, D)
@@ -213,8 +177,7 @@ def _pre_fc(k: MTPK, b: MTPBuffers, n: int, eps: float) -> None:
 
 # -- a step --------------------------------------------------------------------------------------------------------
 def mtp_stage(b: MTPBuffers, st: State, tokens: Sequence[int], hidden: torch.Tensor, pos0: int) -> int:
-    """Host work before a step: the next tokens and positions pos0, pos0 + 1, ... into the static device buffers
-    (pinned, async), and the rows' hidden states ``hidden`` [n, hidden] bf16 into ``b.hin``."""
+    """Stage a step's next tokens, positions from ``pos0`` and hidden rows into the static buffers; returns rows."""
 
     n = len(tokens)
     if not 0 < n <= b.rows or hidden.shape[0] != n:
@@ -240,9 +203,7 @@ def mtp_stage(b: MTPBuffers, st: State, tokens: Sequence[int], hidden: torch.Ten
 
 def mtp_compute(m: Model, k: MTPK, b: MTPBuffers, st: State, n: int, *, logits: bool = True,
                 context: int | None = None) -> torch.Tensor | None:
-    """The GPU work of a staged step (capturable): every row's keys and values into the head's cache; with
-    ``logits``, the last row's output (``b.out``) and its draft-head logits [1, head rows] (a view of ``b.logits``).
-    ``context``: a bound on the last row's keys (a captured graph's bucket), as in ``forward.compute``."""
+    """A staged step's GPU work: every row's keys into the head's cache; with ``logits``, the last row's logits."""
 
     c = m.cfg
     a = k.layer.attn
@@ -270,8 +231,7 @@ def mtp_compute(m: Model, k: MTPK, b: MTPBuffers, st: State, n: int, *, logits: 
 @torch.no_grad()
 def mtp_forward(m: Model, k: MTPK, b: MTPBuffers, st: State, tokens: Sequence[int], hidden: torch.Tensor,
                 pos0: int, *, logits: bool = True) -> torch.Tensor | None:
-    """Rows at positions pos0, pos0 + 1, ... reading ``hidden`` [n, hidden] and the next ``tokens``: see
-    ``mtp_compute``. The caller keeps ``st.mtp_len``."""
+    """An MTP step over ``tokens`` and ``hidden`` from ``pos0`` (see ``mtp_compute``); the caller keeps mtp_len."""
 
     n = mtp_stage(b, st, tokens, hidden, pos0)
     return mtp_compute(m, k, b, st, n, logits=logits)
