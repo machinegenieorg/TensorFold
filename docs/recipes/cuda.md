@@ -9,7 +9,7 @@ CUDA kernels. Use the [runbook](../../RUNBOOK.md#nvidia-gpus) for the container 
 | [Flash Next](qwen3.8-flash-next.md#cuda) | One or two ranks, MTP chains and CUDA graphs |
 | [Nemotron 3.5 Lightning](nemotron-3.5.md#cuda) | One or two ranks, MTP chains and CUDA graphs |
 | [GLM-5.3-Flash](glm-5.3-flash.md#cuda) | Two ranks, MTP and optional DFlash2 |
-| [Qwen3.6-35B-A3B](qwen3.6-35b-a3b.md#cuda) | One rank, serial decoding (MTP drafting next) |
+| [Qwen3.6-35B-A3B](qwen3.6-35b-a3b.md#cuda) | One rank, MTP chains and CUDA graphs |
 
 ## Arithmetic and state
 
