@@ -293,8 +293,11 @@ class Qwen36Engine:
         return max(1, min(int(max_tokens), room))
 
     def generate(self, prompt: Sequence[int], max_tokens: int, sampling,
-                 on_tokens: Callable[[list[int]], bool | None] | None, draft: bool = True) -> dict[str, Any]:
-        """Up to ``max_tokens`` reply tokens to ``on_tokens`` (True stops), drafted or serial; returns the stats."""
+                 on_tokens: Callable[[list[int]], bool | None] | None, draft: bool = True,
+                 constraint=None) -> dict[str, Any]:
+        """Up to ``max_tokens`` reply tokens to ``on_tokens`` (True stops), drafted or serial; returns the stats.
+
+        ``constraint``: the request's grammar (``tensorfold.cuda.grammar``), applied at every token choice."""
 
         import torch
 
@@ -309,7 +312,7 @@ class Qwen36Engine:
         if draft:
             self._start_from(hit)
         first = prefill(self.e, prompt, sampling, st=st, chunk=self.chunk, resume=hit[1] if hit else None,
-                        mtp=drafting)
+                        mtp=drafting, constraint=constraint)
         if draft:
             self._remember(prompt)
         torch.cuda.synchronize()
@@ -323,11 +326,12 @@ class Qwen36Engine:
             return stats
         if drafting:
             res = mtp_decode(self.e, first, max_tokens, sampling, st=st, depth=self.depth,
-                             confidence=self.confidence, stop_eos=True, on_tokens=on_tokens)
+                             confidence=self.confidence, stop_eos=True, on_tokens=on_tokens, constraint=constraint)
             stats.update(drafted=res.drafted, accepted=res.accepted, acceptance=round(res.acceptance, 3),
                          tokens_per_round=round(res.tokens_per_round, 2))
         else:
-            res = serial_decode(self.e, first, max_tokens, sampling, st=st, stop_eos=True, on_tokens=on_tokens)
+            res = serial_decode(self.e, first, max_tokens, sampling, st=st, stop_eos=True, on_tokens=on_tokens,
+                                constraint=constraint)
         if draft and res.committed:        # the reply's state: every token but the pending last one is committed
             self._remember(prompt + res.committed)
         stats.update(completion_tokens=len(res.tokens), decode_s=round(res.seconds, 4), rounds=res.rounds,

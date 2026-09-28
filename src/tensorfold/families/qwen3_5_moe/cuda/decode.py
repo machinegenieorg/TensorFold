@@ -1,4 +1,9 @@
-"""Qwen3.6-35B-A3B decoding on CUDA: prefill, serial decoding and MTP-drafted decoding that emits serial tokens."""
+"""Qwen3.6-35B-A3B decoding on CUDA: prefill, serial decoding and MTP-drafted decoding that emits serial tokens.
+
+A ``constraint`` (``tensorfold.cuda.grammar.Constraint``, a request's JSON schema) masks the logits at every token
+choice, serial or drafted, drops the drafts it cannot follow, and follows the chosen tokens; without one nothing here
+changes.
+"""
 
 from __future__ import annotations
 
@@ -209,11 +214,15 @@ def run_prompt(e: Decoder, prompt: Sequence[int], *, st: State | None = None, ch
 
 @torch.no_grad()
 def prefill(e: Decoder, prompt: Sequence[int], sampling: Sampling | None = None, *, st: State | None = None,
-            chunk: int | None = None, resume: dict | None = None, mtp: bool = True) -> int:
-    """Commit the prompt and sample the first reply token (at position len(prompt))."""
+            chunk: int | None = None, resume: dict | None = None, mtp: bool = True, constraint=None) -> int:
+    """Commit the prompt and sample the first reply token (at position len(prompt)), which ``constraint`` follows."""
 
     logits = run_prompt(e, prompt, st=st, chunk=chunk, resume=resume, mtp=mtp)
-    return sample_rows(logits, [len(prompt)], sampling)[0]
+    if constraint is None:
+        return sample_rows(logits, [len(prompt)], sampling)[0]
+    first = sample_rows(constraint.mask(logits), [len(prompt)], sampling)[0]
+    constraint.advance([first])
+    return first
 
 
 # -- decoding ----------------------------------------------------------------------------------------------------------
@@ -246,17 +255,24 @@ class DecodeResult:
 @torch.no_grad()
 def serial_decode(e: Decoder, pending: int, count: int, sampling: Sampling | None = None, *,
                   st: State | None = None, stop_eos: bool = False,
-                  on_tokens: Callable[[list[int]], bool] | None = None) -> DecodeResult:
-    """The serial reference: up to ``count`` tokens from ``pending``, one row a step; the last is not committed."""
+                  on_tokens: Callable[[list[int]], bool] | None = None, constraint=None) -> DecodeResult:
+    """The serial reference: up to ``count`` tokens from ``pending``, one row a step; the last is not committed.
+
+    ``constraint`` has followed ``pending``; it masks each step, and its reply ends at its stop token."""
 
     st = st or e.st
+    stop_eos = stop_eos or constraint is not None
     out = [pending]
     pos0 = st.pos
     torch.cuda.synchronize()
     start = time.perf_counter()
     while len(out) < count and not (stop_eos and out[-1] in e.eos):
         logits = e.forward([out[-1]], st)
+        if constraint is not None:
+            logits = constraint.mask(logits[:1])
         tok = sample_rows(logits[:1], [st.pos + 1], sampling)[0]
+        if constraint is not None:
+            constraint.advance([tok])
         commit(e.m, e.buf, st, 1)
         out.append(tok)
         if on_tokens is not None and on_tokens([tok]):
@@ -269,12 +285,16 @@ def serial_decode(e: Decoder, pending: int, count: int, sampling: Sampling | Non
 @torch.no_grad()
 def mtp_decode(e: Decoder, pending: int, count: int, sampling: Sampling | None = None, *, st: State | None = None,
                depth: int = DEPTH, confidence: float = CONFIDENCE, stop_eos: bool = False,
-               on_tokens: Callable[[list[int]], bool] | None = None) -> DecodeResult:
-    """Up to ``count`` tokens from ``pending``, ``serial_decode``'s tokens, each round verifying MTP drafts."""
+               on_tokens: Callable[[list[int]], bool] | None = None, constraint=None) -> DecodeResult:
+    """Up to ``count`` tokens from ``pending``, ``serial_decode``'s tokens, each round verifying MTP drafts.
+
+    ``constraint`` has followed ``pending``: it drops the drafts it cannot follow, masks every row of a window as
+    the serial step at that path, and follows the kept tokens."""
 
     if e.mtp is None:
         raise ValueError("drafted decoding needs the MTP head (Decoder(..., mtp=prepare_mtp(...)))")
     st = st or e.st
+    stop_eos = stop_eos or constraint is not None
     m, b = e.m, e.buf
     out = [pending]
     rounds = drafted = accepted = 0
@@ -288,9 +308,13 @@ def mtp_decode(e: Decoder, pending: int, count: int, sampling: Sampling | None =
     if len(out) < count and not (stop_eos and pending in e.eos) and _tail_ready(st):
         drafts = draft(e, st, st.mtp_tail[None], [pending], st.pos + 1, min(depth, count - 2), sampling, confidence)
     while len(out) < count and not (stop_eos and out[-1] in e.eos):
+        if constraint is not None:
+            drafts = constraint.admissible(drafts)
         tokens = [out[-1]] + drafts
         R = len(tokens)
         logits = e.forward(tokens, st)
+        if constraint is not None:
+            logits = constraint.mask(logits[:R], drafts)
         sampled = sample_rows(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
         keep = 1
         for i, d in enumerate(drafts):
@@ -299,6 +323,8 @@ def mtp_decode(e: Decoder, pending: int, count: int, sampling: Sampling | None =
             keep += 1
         commit(m, b, st, keep)
         kept = sampled[:keep]
+        if constraint is not None:
+            constraint.advance(kept)
         rounds += 1
         drafted += len(drafts)
         accepted += keep - 1
@@ -333,30 +359,32 @@ def mtp_decode(e: Decoder, pending: int, count: int, sampling: Sampling | None =
 def generate_result(e: Decoder, prompt: Sequence[int], max_tokens: int, sampling: Sampling | None = None, *,
                     stop_eos: bool = True, st: State | None = None, draft: bool = True,
                     on_tokens: Callable[[list[int]], bool] | None = None, depth: int = DEPTH,
-                    confidence: float = CONFIDENCE) -> DecodeResult:
+                    confidence: float = CONFIDENCE, constraint=None) -> DecodeResult:
     """``generate`` with the decode loop's counts (rounds, drafts, acceptance, seconds after the prefill)."""
 
     if max_tokens < 1:
         return DecodeResult([], 0.0, 0)
+    stop_eos = stop_eos or constraint is not None
     drafting = draft and e.mtp is not None and depth > 0
-    first = prefill(e, prompt, sampling, st=st, mtp=drafting)
+    first = prefill(e, prompt, sampling, st=st, mtp=drafting, constraint=constraint)
     if (on_tokens is not None and on_tokens([first])) or (stop_eos and first in e.eos) or max_tokens == 1:
         return DecodeResult([first], 0.0, 0)
     if drafting:
         return mtp_decode(e, first, max_tokens, sampling, st=st, depth=depth, confidence=confidence,
-                          stop_eos=stop_eos, on_tokens=on_tokens)
-    return serial_decode(e, first, max_tokens, sampling, st=st, stop_eos=stop_eos, on_tokens=on_tokens)
+                          stop_eos=stop_eos, on_tokens=on_tokens, constraint=constraint)
+    return serial_decode(e, first, max_tokens, sampling, st=st, stop_eos=stop_eos, on_tokens=on_tokens,
+                         constraint=constraint)
 
 
 @torch.no_grad()
 def generate(e: Decoder, prompt: Sequence[int], max_tokens: int, sampling: Sampling | None = None, *,
              stop_eos: bool = True, st: State | None = None, draft: bool = True,
              on_tokens: Callable[[list[int]], bool] | None = None, depth: int = DEPTH,
-             confidence: float = CONFIDENCE) -> list[int]:
+             confidence: float = CONFIDENCE, constraint=None) -> list[int]:
     """Prefill, then up to ``max_tokens`` reply tokens, drafted with the head or (``draft=False``) serially."""
 
     return generate_result(e, prompt, max_tokens, sampling, stop_eos=stop_eos, st=st, draft=draft,
-                           on_tokens=on_tokens, depth=depth, confidence=confidence).tokens
+                           on_tokens=on_tokens, depth=depth, confidence=confidence, constraint=constraint).tokens
 
 
 # -- teacher-forced scoring ------------------------------------------------------------------------------------------
