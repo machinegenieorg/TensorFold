@@ -100,20 +100,32 @@ class State:
         else:
             self.mtp_tail_at = -1
 
-    def snapshot(self) -> dict:
-        """What the sequence keeps outside its cache rows: with those rows in place, ``restore`` brings it back."""
+    def snapshot(self, rows: bool = False) -> dict:
+        """What the sequence keeps outside its cache rows: with those rows in place, ``restore`` brings it back.
+
+        ``rows``: a copy of the cache rows below ``pos`` too (attention and draft-head keys and values), so the
+        snapshot restores into any state of this pool, whatever has been written there since."""
 
         tail = self.mtp_tail.clone() if self.mtp_tail is not None else None
-        return {"pos": self.pos, "rec": self.rec[self.cur].clone(), "conv": self.conv.clone(),
+        snap = {"pos": self.pos, "rec": self.rec[self.cur].clone(), "conv": self.conv.clone(),
                 "mtp": (self.mtp_len, self.mtp_tail_at, tail)}
+        if rows:
+            snap["kc"], snap["vc"] = self.kc[:, :self.pos].clone(), self.vc[:, :self.pos].clone()
+        return snap
 
     def restore(self, snap: dict) -> None:
         if snap["pos"] > self.capacity:
             raise ValueError("snapshot longer than this state's capacity")
+        p = int(snap["pos"])
+        if "kc" in snap and (snap["kc"].shape[1] != p or snap["kc"].shape[0] != self.kc.shape[0]):
+            raise ValueError("a snapshot's cache rows do not match its length or this pool's layers")
         self.cur = 0
         self.rec[0].copy_(snap["rec"])
         self.conv.copy_(snap["conv"])
-        self.pos = int(snap["pos"])
+        if "kc" in snap and p:
+            self.kc[:, :p].copy_(snap["kc"])
+            self.vc[:, :p].copy_(snap["vc"])
+        self.pos = p
         mtp_len, tail_at, tail = snap.get("mtp", (0, -1, None))
         self.mtp_len, self.mtp_tail_at = min(int(mtp_len), self.pos), int(tail_at)
         if self.mtp_tail is not None and tail is not None:

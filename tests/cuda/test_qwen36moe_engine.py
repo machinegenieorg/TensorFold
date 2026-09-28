@@ -41,7 +41,9 @@ def rnd():
 @pytest.fixture(scope="module", params=list(ENGINES))
 def engine(request, rnd):
     kw = ENGINES[request.param]
-    eng = Qwen36Engine(None, model=rnd.m, mtp=None if request.param == "serial" else rnd.k, context=1024, **kw)
+    # the kept prompt and reply alone: test_qwen36moe_prefix.py covers the prompt cache
+    eng = Qwen36Engine(None, model=rnd.m, mtp=None if request.param == "serial" else rnd.k, context=1024,
+                       prompt_cache_gib=0, **kw)
     assert eng.depth == {"serial": 0, "drafted": decode.DEPTH, "deep": 4}[request.param]
     assert (eng.e.mtp is not None) == (eng.depth > 0) and eng.e.graphs is not None
     yield eng

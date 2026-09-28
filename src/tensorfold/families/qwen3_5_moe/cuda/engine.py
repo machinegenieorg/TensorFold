@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -13,6 +14,7 @@ STATES = 2                 # the kept sequence and the serial switch's
 WINDOW_ROWS, ATTN_ROWS, LOGIT_ROWS = 32, 64, 32
 MAX_DEPTH = 15             # MTP drafts a round at most (the package's MAX_DRAFTS): windows of up to 16 rows
 ROUTER = (".mlp.gate.", ".mlp.shared_expert_gate.")
+PROMPT_CACHE_GIB = 4.0     # --prompt-cache-gib default: states at shared prompt prefixes (a 2.9k-token block 124 MiB)
 
 
 # -- memory, before anything is loaded ---------------------------------------------------------------------------
@@ -43,6 +45,13 @@ def state_bytes(cfg, capacity: int, mtp_layers: int = 0) -> tuple[int, int]:
     kv = 2 * (na + mtp_layers) * capacity * cfg.kv_heads * cfg.head_dim * 2
     tail = cfg.hidden * 2 if mtp_layers else 0      # the hidden row the head has not absorbed yet
     return 2 * rec + conv + kv + tail, rec + conv + tail
+
+
+def checkpoint_bytes(cfg, tokens: int, mtp_layers: int = 0) -> int:
+    """One prompt-cache entry of ``tokens`` positions: a snapshot plus its attention (and draft head) cache rows."""
+
+    na = sum(1 for k in cfg.layer_types if k != "linear")
+    return state_bytes(cfg, 0, mtp_layers)[1] + tokens * 2 * (na + mtp_layers) * cfg.kv_heads * cfg.head_dim * 2
 
 
 def buffer_bytes(cfg, capacity: int, rows: int, *, window_rows: int = WINDOW_ROWS, attn_rows: int = ATTN_ROWS,
@@ -103,13 +112,14 @@ def draft_head_bytes(cfg, head_rows: int) -> int:
 
 
 def cache_bytes(cfg, capacity: int, *, rows: int, states: int = STATES, mtp_layers: int = 0,
-                head_rows: int = 0) -> int:
-    """Everything but the weights at a cache capacity: states, snapshots, buffers, the head's and a workspace."""
+                head_rows: int = 0, prompt_cache: int = 0) -> int:
+    """Everything but the weights at a cache capacity: states, snapshots, buffers, the head's, a workspace and the
+    prompt cache's budget."""
 
     from .decode import MTP_ROWS
 
     one, snap = state_bytes(cfg, capacity, mtp_layers)
-    total = states * one + SNAPSHOTS * snap + buffer_bytes(cfg, capacity, rows) + WORKSPACE
+    total = states * one + SNAPSHOTS * snap + buffer_bytes(cfg, capacity, rows) + WORKSPACE + int(prompt_cache)
     if mtp_layers:
         total += mtp_buffer_bytes(cfg, capacity, MTP_ROWS, head_rows) + draft_head_bytes(cfg, head_rows)
     return total
@@ -117,8 +127,9 @@ def cache_bytes(cfg, capacity: int, *, rows: int, states: int = STATES, mtp_laye
 
 def admission(model_dir: str | Path | None, cfg, context: int | None, explicit: bool, *, rows: int, reserve: int,
               free_memory: int | None = None, loaded: bool = False, drafter: str | Path | None = None,
-              head_rows: int = 0) -> dict:
-    """``capacity.admit``'s receipt: the window and cache slots (plus ``reserve``) that fit, drafter included."""
+              head_rows: int = 0, prompt_cache: int = 0) -> dict:
+    """``capacity.admit``'s receipt: the window and cache slots (plus ``reserve``) that fit, drafter and prompt cache
+    included."""
 
     import torch
 
@@ -126,7 +137,8 @@ def admission(model_dir: str | Path | None, cfg, context: int | None, explicit: 
 
     mtp_layers = 1 if head_rows else 0
     geometry = cap.Geometry(lambda slots: cache_bytes(cfg, slots, rows=rows, mtp_layers=mtp_layers,
-                                                      head_rows=head_rows), reserve, reserve + 1)
+                                                      head_rows=head_rows, prompt_cache=prompt_cache),
+                            reserve, reserve + 1)
     extra = tuple(sorted(Path(drafter).glob("*.safetensors"))) if drafter and not loaded else ()
     transform = weight_transform(cfg.hidden)
     if free_memory is None and not loaded:
@@ -142,6 +154,20 @@ def admission(model_dir: str | Path | None, cfg, context: int | None, explicit: 
     return {**plan.receipt(cap.choose(plan)), "largest_window": plan.largest}
 
 
+def chat_marks(model_dir: str | Path | None) -> tuple[int, int] | None:
+    """The ``<|im_start|>`` and ``system`` ids from the checkpoint's tokenizer.json (a system message's first two)."""
+
+    if model_dir is None:
+        return None
+    try:
+        tok = json.loads((Path(model_dir) / "tokenizer.json").read_text(encoding="utf-8"))
+        opener = next((a["id"] for a in tok.get("added_tokens", []) if a.get("content") == "<|im_start|>"), None)
+        system = tok["model"]["vocab"].get("system")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    return (int(opener), int(system)) if opener is not None and system is not None else None
+
+
 # -- the engine ----------------------------------------------------------------------------------------------------
 class Qwen36Engine:
     """``eos``, ``generate`` and ``context_window`` as ``tensorfold.cuda.server`` expects, one request at a time."""
@@ -150,7 +176,8 @@ class Qwen36Engine:
                  context_explicit: bool | None = None, no_drafts: bool = False, mtp_drafts: int | None = None,
                  confidence: float | None = None, rows: int | None = None, prefill_chunk: int | None = None,
                  tp: int = 1, streams: int = 1, free_memory: int | None = None, model=None, mtp=None,
-                 graphs: bool = True, warm: bool = True) -> None:
+                 graphs: bool = True, warm: bool = True, prompt_cache_gib: float | None = None,
+                 marks: tuple[int, int] | None = None) -> None:
         if int(tp) != 1:
             raise ValueError("Qwen3.6-35B-A3B's CUDA engine runs on one GPU: two ranks do not apply")
         if mtp_drafts is not None and not 0 <= int(mtp_drafts) <= MAX_DEPTH:
@@ -165,6 +192,7 @@ class Qwen36Engine:
         from .decode import CONFIDENCE, DEPTH, GRAPH_ROWS, MTP_ROWS, PREFILL_ROWS, Decoder
         from .mtp import draft_token_ids
         from .checkpoint import Config
+        from .prefix_cache import MIN_POINT, PrefixCache
 
         started = time.perf_counter()
         torch.cuda.set_device(0)
@@ -185,9 +213,19 @@ class Qwen36Engine:
             print(f"[tensorfold] Qwen3.6-35B-A3B: --parallel {streams} accepted, requests are served one at a time "
                   "(shared rounds are not implemented for this family yet)", flush=True)
         explicit = context is not None if context_explicit is None else bool(context_explicit)
+        # the prompt cache: its budget is admitted with the caches; a budget no entry fits is refused
+        gib = PROMPT_CACHE_GIB if prompt_cache_gib is None else float(prompt_cache_gib)
+        mtp_layers = 1 if self.depth else 0
+        smallest = checkpoint_bytes(cfg, MIN_POINT, mtp_layers)
+        if gib < 0 or 0 < gib * GiB < smallest:
+            raise ValueError(f"--prompt-cache-gib {gib:g} holds no prompt prefix: the shortest kept ({MIN_POINT} "
+                             f"tokens) takes {smallest / 2**20:.0f} MiB; 0 turns the prompt cache off")
+        self.prefixes = PrefixCache(int(gib * GiB), cost=lambda n: checkpoint_bytes(cfg, n, mtp_layers))
+        self.marks = marks if marks is not None else chat_marks(model_dir)
         self.capacity_plan = admission(model_dir, cfg, context, explicit, rows=rows, reserve=self.depth + 1,
                                        free_memory=free_memory, loaded=model is not None,
-                                       drafter=self.drafter or None, head_rows=head_rows)
+                                       drafter=self.drafter or None, head_rows=head_rows,
+                                       prompt_cache=self.prefixes.budget)
         self.max_len = int(self.capacity_plan["cache_slots"])
         if model is None:
             from .forward import prepare
@@ -225,7 +263,8 @@ class Qwen36Engine:
         plan = self.capacity_plan
         print(f"[tensorfold] Qwen3.6-35B-A3B on CUDA: {mode}; {self.context_window}-token prompt/reply window, "
               f"{self.max_len}-token cache; weights {model.nbytes() / GiB:.2f} GiB + MTP head {head_gib:.2f} GiB, "
-              f"{STATES} states {STATES * self.e.pool.nbytes_per_seq() / GiB:.2f} GiB (estimate "
+              f"{STATES} states {STATES * self.e.pool.nbytes_per_seq() / GiB:.2f} GiB, prompt cache "
+              f"{self.prefixes.budget / GiB:g} GiB (estimate "
               f"{plan['total_bytes_estimate'] / GiB:.1f} GiB within {plan['budget_bytes'] / GiB:.1f}); loaded in "
               f"{loaded_s:.1f}s, {captured} decode graphs captured and kernels warmed in {warm_s:.1f}s", flush=True)
 
@@ -254,29 +293,50 @@ class Qwen36Engine:
         finally:
             self.chunk = chunk
         self.cache = []
+        self.prefixes.clear()
         self.e.st.reset()
         self.serial.reset()
         torch.cuda.synchronize()
         return captured, time.perf_counter() - t0
 
     # -- prefix reuse ----------------------------------------------------------------------------------------------
+    # Two kinds of kept state. ``self.cache``: the last prompt's and reply's snapshots, whose cache rows stay in place
+    # in ``self.e.st`` (a follow-up that extends them). ``self.prefixes``: the prompt cache, entries that carry their
+    # own cache rows (system blocks and shared prefixes), restored into ``self.e.st`` whatever it held since.
     def _resume(self, prompt: Sequence[int]):
-        """The longest kept state the prompt extends by at least one token, or None."""
+        """The longest kept state the prompt extends by at least one token: (ids, snapshot, kind), or None."""
 
         best = None
         for ids, snap in self.cache:
             if len(ids) < len(prompt) and list(prompt[:len(ids)]) == ids and (best is None or len(ids) > len(best[0])):
-                best = (ids, snap)
+                best = (ids, snap, "kept")
+        entry = self.prefixes.find(prompt)
+        if entry is not None and (best is None or len(entry.tokens) > len(best[0])):   # a tie keeps the rows in place
+            self.prefixes.use(entry)
+            best = (entry.tokens.tolist(), entry.snap, "system" if entry.pinned else "shared")
         return best
 
-    def _start_from(self, hit) -> None:
-        """Before a prefill: drop the kept states whose cache rows it overwrites (all of them for a fresh prompt)."""
+    def _start_from(self, hit, prompt: Sequence[int]) -> None:
+        """Before a prefill: keep the in-place states whose cache rows it leaves as they are (none for a fresh one)."""
 
-        if hit is None:
-            self.cache = []
-        else:
-            n = len(hit[0])
-            self.cache = [c for c in self.cache if len(c[0]) <= n or c[0][:n] != hit[0]]
+        n = len(hit[0]) if hit else 0
+        self.cache = [c for c in self.cache if len(c[0]) <= n and list(prompt[:len(c[0])]) == c[0]]
+
+    def _checkpoint(self, prompt: list[int], hit, st, mtp: bool) -> tuple[dict | None, list[int]]:
+        """Prefill up to each point worth keeping (``PrefixCache.points``) and keep the state there; returns the
+        snapshot the rest of the prefill resumes from and the points kept."""
+
+        from .decode import run_prompt
+
+        resume = hit[1] if hit else None
+        kept: list[int] = []
+        for at, pinned in self.prefixes.points(prompt, len(hit[0]) if hit else 0, self.marks):
+            run_prompt(self.e, prompt[:at], st=st, chunk=self.chunk, resume=resume, mtp=mtp)
+            snap = st.snapshot(rows=True)
+            if self.prefixes.add(prompt[:at], snap, pinned=pinned):
+                kept.append(at)
+            resume = {k: v for k, v in snap.items() if k not in ("kc", "vc")}      # its rows are in place
+        return resume, kept
 
     def _remember(self, ids: list[int]) -> None:
         snap = self.e.st.snapshot()
@@ -309,18 +369,22 @@ class Qwen36Engine:
         hit = self._resume(prompt) if draft else None
         st = self.e.st if draft else self.serial
         t0 = time.perf_counter()
+        resume, kept = (hit[1] if hit else None), []
         if draft:
-            self._start_from(hit)
-        first = prefill(self.e, prompt, sampling, st=st, chunk=self.chunk, resume=hit[1] if hit else None,
-                        mtp=drafting, constraint=constraint)
+            self._start_from(hit, prompt)
+            resume, kept = self._checkpoint(prompt, hit, st, drafting)
+        first = prefill(self.e, prompt, sampling, st=st, chunk=self.chunk, resume=resume, mtp=drafting,
+                        constraint=constraint)
         if draft:
             self._remember(prompt)
+            self.prefixes.seen(prompt)
         torch.cuda.synchronize()
         prefill_s = time.perf_counter() - t0
         cached = len(hit[0]) if hit else 0
         stats: dict[str, Any] = {"prompt_tokens": len(prompt), "cached": cached, "prefill_s": round(prefill_s, 4),
                                  "prefill_tps": round((len(prompt) - cached) / prefill_s, 1) if prefill_s else 0.0,
-                                 "completion_tokens": 1, "drafts": drafting}
+                                 "completion_tokens": 1, "drafts": drafting, "resumed": hit[2] if hit else None,
+                                 "checkpoints": kept}
         stop = on_tokens is not None and bool(on_tokens([first]))
         if stop or first in self.eos or max_tokens <= 1:
             return stats
