@@ -183,6 +183,23 @@ What was checked, on the 5090 (sm_120). GB10 hashes differ from sm_120's, and ea
 | The real MTP head against the fp32 reference head on the same hidden rows | relative error 0.6-0.9%, the same top-1 on 98.6-99.3% of rows |
 | Drafted against serial by token-ID SHA-256 on every benchmark run, GB10 | TODO |
 
+#### Rerunning the hash checks
+
+Two tools hash kernel and model outputs on fixed random inputs, one JSON entry per output. Run them from the
+repository root in the CUDA container, on the same GPU and image for both sides of a comparison, and diff the files:
+
+```bash
+python tools/hash_flashnext.py fn.json   # 659 Flash Next hashes: lane matmuls, experts, GDN, gdn_io, attention, a model
+python tools/hash_qwen36.py q36.json     # 363 Qwen3.6 hashes: every matmul shape, the MoE stages, a model
+```
+
+For Flash Next the reference is v0.3.5 itself: in a v0.3.5 checkout, copy this branch's
+`tools/hash_flashnext.py` and `tests/cuda/test_qwen36moe_attention.py` (whose `fn_outputs` uses v0.3.5's APIs
+only), run the tool there, then on this branch, and require every hash equal. For Qwen3.6 the reference is the
+previous commit's output. `FN_HASHES` in `tests/cuda/test_qwen36moe_attention.py` holds the tool's `attn/` entries
+and `FLASHNEXT` in `tests/cuda/test_qwen36moe_gdn.py` holds `flashnext_digests()` from v0.3.5, per compute
+capability; the GB10 (12, 1) entries come from the GB10 run.
+
 ### Quality
 
 Against a plain fp32 PyTorch forward with bf16 roundings (`cuda/reference.py`, TF32 off), teacher-forced over the
