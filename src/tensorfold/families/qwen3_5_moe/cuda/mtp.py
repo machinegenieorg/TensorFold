@@ -238,9 +238,11 @@ def mtp_stage(b: MTPBuffers, st: State, tokens: Sequence[int], hidden: torch.Ten
     return n
 
 
-def mtp_compute(m: Model, k: MTPK, b: MTPBuffers, st: State, n: int, *, logits: bool = True) -> torch.Tensor | None:
+def mtp_compute(m: Model, k: MTPK, b: MTPBuffers, st: State, n: int, *, logits: bool = True,
+                context: int | None = None) -> torch.Tensor | None:
     """The GPU work of a staged step (capturable): every row's keys and values into the head's cache; with
-    ``logits``, the last row's output (``b.out``) and its draft-head logits [1, head rows] (a view of ``b.logits``)."""
+    ``logits``, the last row's output (``b.out``) and its draft-head logits [1, head rows] (a view of ``b.logits``).
+    ``context``: a bound on the last row's keys (a captured graph's bucket), as in ``forward.compute``."""
 
     c = m.cfg
     a = k.layer.attn
@@ -255,7 +257,7 @@ def mtp_compute(m: Model, k: MTPK, b: MTPBuffers, st: State, n: int, *, logits: 
     if not logits:
         return None
     r = n - 1
-    o = attn_mod.attention(b.q[r:r + 1], kc, vc, b.pos[r:r + 1], b.attn, 1, c.head_dim ** -0.5)
+    o = attn_mod.attention(b.q[r:r + 1], kc, vc, b.pos[r:r + 1], b.attn, 1, c.head_dim ** -0.5, context=context)
     fn_glue.attn_gate(o[:1], b.pa[r:r + 1], b.gated, b.gated_xs, q_heads=c.heads, head_dim=c.head_dim, group=GS)
     branch = qmm.matmul(b.gated, a.o, b.gated_xs, out=b.branch, part=b.part, reduce=False)
     row = _Row(b.h[r:r + 1], b.normed[r:r + 1], b.xs[r:r + 1])
