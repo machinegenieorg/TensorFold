@@ -1,4 +1,8 @@
-"""OpenAI server for the CUDA engines: a family's ``cuda_engine`` gives ``eos``, ``generate`` and ``follow``."""
+"""OpenAI server for the CUDA engines: a family's ``cuda_engine`` gives ``eos``, ``generate`` and ``follow``.
+
+An engine whose ``generate`` takes ``constraint`` enforces ``response_format`` (``tensorfold.cuda.grammar``); other
+engines refuse it with a 400 rather than reply unconstrained.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -14,6 +18,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Callable
 
+from tensorfold.cuda import grammar
 from tensorfold.server.errors import RequestError
 from tensorfold.server.http import Server
 from tensorfold.server.messages import (_normalize_tool_call_arguments, late_system_role, normalize_messages,
@@ -190,6 +195,7 @@ class PreparedRequest:
     max_tokens: int
     tools: list[dict[str, Any]]
     thinking: bool
+    grammar: Any = None             # the compiled response_format, or None
 
 
 def _native_context(model_dir: Path) -> int:
@@ -212,6 +218,7 @@ class App:
 
         self.engine = engine
         self.served = served
+        self.model_dir = Path(model_dir)
         self.tok = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
         self.template = ChatTemplate(model_dir)
         self.default_thinking = default_thinking
@@ -232,7 +239,25 @@ class App:
             return "this model's CUDA engine has no serial switch (\"draft\": false)"
         if not isinstance(body.get("messages", []), list):
             return "messages must be a list"
+        try:
+            spec = grammar.request_spec(body)
+        except RequestError as exc:
+            return str(exc)
+        if spec is not None and "constraint" not in inspect.signature(self.engine.generate).parameters:
+            return f"{spec.field}: this model's CUDA engine does not enforce structured output"
         return None
+
+    def _grammars(self) -> grammar.Grammars:
+        """The tokenizer's grammar compiler, built on the first structured request."""
+
+        found = getattr(self, "grammars", None)
+        if found is None:
+            model_dir = getattr(self, "model_dir", None)
+            vocab = grammar.vocab_size(model_dir) if model_dir is not None else None
+            if vocab is None:
+                raise RequestError("structured output needs the checkpoint's config.json vocab_size")
+            found = self.grammars = grammar.for_model(model_dir, vocab, tuple(self.engine.eos))
+        return found
 
     def _engine_capacity(self) -> int | None:
         capacities = []
@@ -291,7 +316,9 @@ class App:
         prompt = self.tok.encode(text, add_special_tokens=False).ids
         if not prompt:
             raise RequestError("rendered prompt is empty")
-        return PreparedRequest(prompt, max_tokens, tools, thinking)
+        spec = grammar.request_spec(body)
+        compiled = self._grammars().compile(spec) if spec is not None else None
+        return PreparedRequest(prompt, max_tokens, tools, thinking, compiled)
 
     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
         """Why the request cannot run, or None; rendered before a stream's headers are sent."""
@@ -383,11 +410,12 @@ class App:
                 stopped["client"] = True
             return stopped["client"]
 
-        draft = body.get("draft", True) is not False
+        extra: dict[str, Any] = {} if body.get("draft", True) is not False else {"draft": False}
+        if prepared.grammar is not None:    # response_format: a fresh grammar state, after </think> when thinking
+            extra["constraint"] = self._grammars().constraint(prepared.grammar, after_think=chat and thinking)
         # an engine that decodes concurrent requests together (``concurrent``) takes them as they come
         with (nullcontext() if getattr(self.engine, "concurrent", False) else self.lock):
-            stats = self.engine.generate(prompt, max_tokens, sampling, on_tokens,
-                                         **({} if draft else {"draft": False}))
+            stats = self.engine.generate(prompt, max_tokens, sampling, on_tokens, **extra)
         stats = {**(stats or {}), "token_sha": token_sha(out)}
         reasoning, answer = visible(True)
         final: dict[str, Any] = {}

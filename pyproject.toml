@@ -34,6 +34,8 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
+# response_format / guided_json on the CUDA server (JSON-schema constrained replies)
+grammar = ["xgrammar>=0.2.8,<0.3; sys_platform != 'darwin'"]
 
 [project.scripts]
 tensorfold = "tensorfold.cli:main"
