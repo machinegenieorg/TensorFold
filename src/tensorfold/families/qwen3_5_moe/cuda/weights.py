@@ -13,6 +13,11 @@ import torch
 from .. import DRAFTER, DRAFTER_MODEL_TYPE
 from .checkpoint import DTYPES, Config, Reader, Spec, checkpoint_tensors, layout, layout_problems, mtp_layout
 
+# each centred-norm group's mean weight w in the original checkpoints (MLX stores 1 + w: its group means less one)
+NORM_W = {"input_layernorm": -0.06, "post_attention_layernorm": 0.31, "q_norm": 0.49, "k_norm": 0.49,
+          "model.norm": 1.63}
+MTP_NORM_W = {"input_layernorm": -0.1, "post_attention_layernorm": 0.87, "q_norm": 0.77, "k_norm": 0.74, "norm": 1.93,
+              "pre_fc_norm_embedding": -0.73, "pre_fc_norm_hidden": -0.51}
 
 
 @dataclass
@@ -137,17 +142,25 @@ class MTPW:
         return _nbytes([self.norm_e, self.norm_h, self.fc, self.layer, self.norm])
 
 
-def norms_around_one(means: list[float]) -> bool:
-    """Whether norm weights with these means store 1 + w (MLX, means near 1) or w (means near 0)."""
+def norm_means(rd: Reader, reference: dict[str, float]) -> dict[str, float]:
+    """Each centred-norm group's mean stored weight, over every norm of the group the reader's spec names."""
 
-    if not means:
-        raise ValueError("no norm weights to tell how they are stored")
-    if all(0.5 < m < 2.0 for m in means):
-        return True
-    if all(-0.5 < m < 0.5 for m in means):
-        return False
-    raise ValueError(f"cannot tell how the norm weights are stored (input norm means {min(means):.3f} to "
-                     f"{max(means):.3f})")
+    means = {}
+    for group in reference:
+        names = [n for n in rd.spec if n == group + ".weight" or n.endswith("." + group + ".weight")]
+        if names:
+            means[group] = sum(float(rd.get(n).float().mean()) for n in names) / len(names)
+    return means
+
+
+def norms_around_one(means: dict[str, float], reference: dict[str, float]) -> bool:
+    """Whether the centred norms store 1 + w (each group's mean nearer w + 1 than w); a mix of the two is refused."""
+
+    plus = {group: mean > reference[group] + 0.5 for group, mean in means.items()}
+    if len(set(plus.values())) != 1:
+        found = ", ".join(f"{g} {'1 + w' if p else 'w'} (mean {means[g]:.3f})" for g, p in sorted(plus.items()))
+        raise ValueError(f"the centred norm weights mix w and 1 + w: {found}")
+    return next(iter(plus.values()))
 
 
 def dequantize(q: QW) -> torch.Tensor:
@@ -260,9 +273,7 @@ def load(model_dir: str | Path, device: str | torch.device = "cuda") -> Weights:
                          + "; ".join(problems[:6]))
     t0 = time.time()
     rd = Reader(model_dir, device, spec)
-    means = [float(rd.get(f"{prefix}model.layers.{i}.input_layernorm.weight").float().mean())
-             for i in range(cfg.layers)]
-    build = _Builder(rd, cfg, norms_around_one(means))
+    build = _Builder(rd, cfg, norms_around_one(norm_means(rd, NORM_W), NORM_W))
     embed = build.qw(prefix + "model.embed_tokens")
     layers = []
     for i, kind in enumerate(cfg.layer_types):
@@ -302,7 +313,7 @@ def load_mtp(drafter_dir: str | Path, target: Config, device: str | torch.device
     if problems:
         raise ValueError(f"{drafter_dir} does not have the drafter layout the loader reads: " + "; ".join(problems[:6]))
     rd = Reader(drafter_dir, device, spec)
-    build = _Builder(rd, cfg, norms_around_one([float(rd.get("layers.0.input_layernorm.weight").float().mean())]))
+    build = _Builder(rd, cfg, norms_around_one(norm_means(rd, MTP_NORM_W), MTP_NORM_W))
     mtp = MTPW(cfg, build.scale("pre_fc_norm_embedding.weight"), build.scale("pre_fc_norm_hidden.weight"),
                build.qw("fc"), build.layer(0, "layers.0", "attention"), build.scale("norm.weight"), build.around_one)
     if rd.read != set(spec):

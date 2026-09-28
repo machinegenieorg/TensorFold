@@ -102,12 +102,29 @@ def test_mlx_stores_one_plus_w_for_the_centred_norms():
     cfg = W.Config.read(snap)
     spec = W.layout(cfg, "language_model.")
     rd = C.Reader(snap, "cpu", spec)
-    means = [float(rd.get(f"language_model.model.layers.{i}.input_layernorm.weight").float().mean())
-             for i in range(cfg.layers)]
-    assert W.norms_around_one(means)
+    means = W.norm_means(rd, W.NORM_W)
+    assert set(means) == set(W.NORM_W) and W.norms_around_one(means, W.NORM_W)
     drafter = _cached(family.DRAFTER)
     rd = C.Reader(drafter, "cpu", W.mtp_layout(W.Config.read(drafter)))
-    assert W.norms_around_one([float(rd.get("layers.0.input_layernorm.weight").float().mean())])
+    means = W.norm_means(rd, W.MTP_NORM_W)
+    assert set(means) == set(W.MTP_NORM_W) and W.norms_around_one(means, W.MTP_NORM_W)
+
+
+# the group means of mlx-community/Qwen3.6-35B-A3B-4bit and its MTP drafter (1 + w)
+REAL_MEANS = {"input_layernorm": 0.944, "post_attention_layernorm": 1.309, "q_norm": 1.494, "k_norm": 1.486,
+              "model.norm": 2.628}
+REAL_MTP_MEANS = {"input_layernorm": 0.905, "post_attention_layernorm": 1.868, "q_norm": 1.767, "k_norm": 1.742,
+                  "norm": 2.925, "pre_fc_norm_embedding": 0.273, "pre_fc_norm_hidden": 0.494}
+
+
+def test_each_centred_norm_group_is_judged_against_its_own_mean_and_a_mix_is_refused():
+    for means, reference in ((REAL_MEANS, W.NORM_W), (REAL_MTP_MEANS, W.MTP_NORM_W)):
+        assert W.norms_around_one(means, reference)
+        assert not W.norms_around_one({g: m - 1.0 for g, m in means.items()}, reference)
+        for group in means:
+            mixed = {**means, group: means[group] - 1.0}
+            with pytest.raises(ValueError, match=f"mix w and 1 \\+ w: .*{group} w "):
+                W.norms_around_one(mixed, reference)
 
 
 @pytest.mark.parametrize("mlx_repo, mlx_name, original_name", [
@@ -141,8 +158,6 @@ TINY = {"hidden_size": 128, "num_hidden_layers": 4, "full_attention_interval": 4
         "shared_expert_intermediate_size": 64, "rms_norm_eps": 1e-6, "eos_token_id": 2, "attn_output_gate": True,
         "rope_parameters": {"partial_rotary_factor": 0.25, "rope_theta": 10000000, "mrope_section": [3, 3, 2]},
         "mtp_num_hidden_layers": 1}
-CENTRED = ("layernorm.weight", "model.norm.weight", "q_norm.weight", "k_norm.weight", "pre_fc_norm_embedding.weight",
-           "pre_fc_norm_hidden.weight")
 
 
 def _bf16_bits(x: np.ndarray) -> np.ndarray:
@@ -165,17 +180,25 @@ def _write_safetensors(path: Path, tensors: dict[str, tuple[str, np.ndarray]]) -
     path.write_bytes(struct.pack("<Q", len(head)) + head + b"".join(blobs))
 
 
-def _fill(spec: W.Spec, rng: np.random.Generator, around_one: bool) -> dict[str, tuple[str, np.ndarray]]:
+def _centred(name: str, reference: dict[str, float]) -> float | None:
+    """The original mean weight of the centred-norm group ``name`` belongs to, or None."""
+
+    return next((w for g, w in reference.items() if name == g + ".weight" or name.endswith(f".{g}.weight")), None)
+
+
+def _fill(spec: W.Spec, rng: np.random.Generator, around_one: bool,
+          reference: dict[str, float] = W.NORM_W) -> dict[str, tuple[str, np.ndarray]]:
     tensors = {}
     for name, (dtype, shape) in spec.items():
+        centre = _centred(name, reference)
         if dtype == "U32":
             arr = rng.integers(0, 2 ** 32, size=shape, dtype=np.uint64).astype(np.uint32)
         elif name.endswith(".scales"):
             arr = _bf16_bits(rng.uniform(0.001, 0.1, size=shape))
         elif name.endswith(".biases"):
             arr = _bf16_bits(rng.uniform(-0.5, 0.5, size=shape))
-        elif name.endswith(CENTRED):
-            arr = _bf16_bits(rng.normal(0.0, 0.1, size=shape) + (1.0 if around_one else 0.0))
+        elif centre is not None:
+            arr = _bf16_bits(rng.normal(centre, 0.1, size=shape) + (1.0 if around_one else 0.0))
         else:
             arr = _bf16_bits(rng.normal(0.0, 0.5, size=shape))
         tensors[name] = (dtype, arr)
@@ -292,6 +315,15 @@ def test_a_checkpoint_storing_w_gets_one_added_in_fp32(tmp_path):
     assert torch.equal(w.layers[0].gdn.norm, gated)                       # never shifted
 
 
+def test_a_checkpoint_mixing_w_and_one_plus_w_is_refused(tmp_path):
+    rng = np.random.default_rng(3)
+    plain = {f"language_model.model.layers.3.self_attn.{n}.weight":
+             ("BF16", _bf16_bits(rng.normal(W.NORM_W[n], 0.1, 64))) for n in ("q_norm", "k_norm")}
+    folder, _ = _fake_checkpoint(tmp_path / "mixed", extra=plain)
+    with pytest.raises(ValueError, match="mix w and 1 \\+ w: .*k_norm w .*q_norm w "):
+        W.load(folder, device="cpu")
+
+
 def test_the_loader_refuses_a_layout_it_does_not_know(tmp_path):
     extra = {"language_model.model.layers.0.mlp.expert_bias": ("BF16", _bf16_bits(np.zeros(4)))}
     folder, _ = _fake_checkpoint(tmp_path / "extra", extra=extra)
@@ -311,7 +343,7 @@ def test_the_drafter_loads_with_its_own_4bit_router(tmp_path):
     config = {"block_size": 3, "model_type": "qwen3_5_mtp", "quantization": {"group_size": 64, "bits": 4, "mode": "affine"},
               "text_config": dict(TINY)}
     (folder / "config.json").write_text(json.dumps(config))
-    t = _fill(W.mtp_layout(W.Config.read(folder)), np.random.default_rng(11), True)
+    t = _fill(W.mtp_layout(W.Config.read(folder)), np.random.default_rng(11), True, W.MTP_NORM_W)
     _write_safetensors(folder / "model.safetensors", t)                 # one file, no index
     mtp = W.load_mtp(folder, target, device="cpu")
     assert mtp.around_one and mtp.meta["block_size"] == 3
