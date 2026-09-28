@@ -101,10 +101,21 @@ def stack_q4(parts: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]) -> Q4
                    torch.cat([p[2] for p in parts]))
 
 
-def to_mlx(q: Q4) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The stored MLX layout again: (N, K/8) int32 words, (N, K/64) scales and biases."""
+def to_mlx(q: Q4, rows: int = 8192) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The stored MLX layout again: (N, K/8) int32 words, (N, K/64) scales and biases, ``rows`` rows at a time (the
+    unpacking's int64 temporaries for the whole head would take about 4 GB)."""
 
-    return shared.unpack(q)
+    if q.n <= rows:
+        return shared.unpack(q)
+    tiles = rows // 64
+    parts = []
+    for t0 in range(0, q.weight.shape[0], tiles):
+        n = min(q.n, (t0 + tiles) * 64) - t0 * 64
+        if n <= 0:
+            break
+        cols = slice(t0 * 64, t0 * 64 + n)
+        parts.append(shared.unpack(Q4(q.weight[t0:t0 + tiles], q.scales[:, cols], q.biases[:, cols], n, q.k, q.gs)))
+    return tuple(torch.cat(t) for t in zip(*parts))
 
 
 def dequantize(words: torch.Tensor, scales: torch.Tensor, biases: torch.Tensor) -> torch.Tensor:
