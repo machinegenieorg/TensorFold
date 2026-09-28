@@ -33,6 +33,39 @@ so its speeds do not predict GB10's.
   it from the main checkpoint). Its head scores 76,882 of the 248,320 token ids (`cuda/draft_vocab.txt`), 31%
   of a full head's bytes a draft.
 
+## Draft vocabulary provenance
+
+The MTP head's draft head reads the public list in `src/tensorfold/families/qwen3_5_moe/cuda/draft_vocab.txt`:
+76,882 sorted IDs, 31% of the 248,320-row head. The target sampler still reads the full vocabulary, so the list
+affects proposals only; a token outside it can never be a draft, which costs speed, never correctness.
+
+The corpus is Flash Next's: Homebrew CPython 3.14.5's standard-library `*.py` files, excluding `site-packages` and
+`__pycache__` (see [its recipe](qwen3.8-flash-next.md#draft-vocabulary-provenance); with Flash Next's tokenizer the
+same corpus and command reproduce its list, SHA-256 `88d5b483…`). Use `tokenizers==0.22.2` and `tools/draft_vocab.py`
+with SHA-256 `1baf0dd08669355cf9cf6e32998e5436ce8712c3ab1bffe38d369f3fa3a86b56`. The tokenizer is the one the
+server encodes with, `tokenizer.json` from `mlx-community/Qwen3.6-35B-A3B-4bit` (33 added tokens), with SHA-256:
+
+```text
+87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4
+```
+
+Place that tokenizer at `tokenizer.json` and copy the clean stdlib into an empty `cpython` directory, preserving
+relative paths, as Flash Next's recipe describes. Then run from the repository root:
+
+```bash
+TOKENIZERS_PARALLELISM=false python3 -B tools/draft_vocab.py tokenizer.json draft_vocab.txt --size 76882 --keep-below 65536 --min-count 1 --added-tokens 'cpython/**/*.py'
+```
+
+The generator keeps every ID below 65,536 and the tokenizer's added IDs (248,044 to 248,076), then adds corpus IDs
+by frequency and fills the remaining places with the lowest unused IDs. Expected output SHA-256:
+
+```text
+0fdfd41d8d7f310ee25240e81de7310f71d70f98136e51a9e172139365f10f94
+```
+
+On the reference test's three public passages the list holds 98.2% of the tokens. The drafting rates measured
+below used the previous list (the same size, built from a local corpus); they do not qualify the current one.
+
 ## CUDA
 
 ```bash
