@@ -1,22 +1,9 @@
-"""Qwen3.6-35B-A3B MTP drafting and CUDA graphs (``qwen3_5_moe/cuda/mtp.py``, ``decode.py``, ``graphs.py``).
-
-Random weights in the loader's layout (the forward test's model: the real per-layer shapes, eight layers, 32 routed
-experts, a 6144-token vocabulary) plus a random MTP head: the head against the fp32 reference, its steps repeat and
-do not depend on how a prompt is chunked, drafted decoding emits serial decoding's tokens (greedy and sampled, eager
-and graphs, any depth, with and without a confidence stop, with a draft vocabulary, from a resumed prompt and from a
-state the head lags behind), an oracle drafter that is mostly right exercises long accepted prefixes and ends in serial
-decoding's state, and graph replays give eager's bits.
-
-The real checkpoint and drafter (skipped when not in the Hugging Face cache): drafted equals serial by SHA-256 of the
-replies to three chat prompts and two JSON-extraction prompts (synthetic), greedy and sampled, with the MTP acceptance,
-tokens per round and speed against serial (reported, not gated: the RTX 5090's speed does not predict GB10's).
-"""
+"""Qwen3.6-35B-A3B MTP drafting and CUDA graphs: drafted decoding emits serial tokens, graphs give eager bits."""
 
 from __future__ import annotations
 
 import gc
 import hashlib
-import time
 from types import SimpleNamespace
 
 import pytest
@@ -80,8 +67,7 @@ def _serial(e: Decoder, prompt, count, sampling):
 
 # -- the head -------------------------------------------------------------------------------------------------------
 def test_the_mtp_head_follows_the_reference(rnd):
-    """Row by row, the head's output (after its norm) against the fp32 reference with bf16 roundings, reading the
-    CUDA model's hidden rows; and chunked absorbs leave the head's cache and last-row output in the same bits."""
+    """The head's rows track the fp32 reference; chunked absorbs leave the same cache and last-row bits."""
 
     from tensorfold.families.qwen3_5_moe.cuda import reference as R
 
@@ -98,9 +84,7 @@ def test_the_mtp_head_follows_the_reference(rnd):
     ours = torch.stack(outs)
     ref = R.mtp_hidden(rnd.mtpw, rnd.w, torch.tensor(prompt[1:]), hidden[:-1].float(),
                        R.new_mtp_state(rnd.mtpw, rnd.w, bf16=True))
-    rel = float((ours - ref).norm() / ref.norm())
-    print(f"\nMTP head vs the fp32 reference (bf16 roundings): relative error {rel:.2e} over {len(outs)} rows")
-    assert rel < 2e-2
+    assert float((ours - ref).norm() / ref.norm()) < 2e-2
     # the same positions absorbed in steps of 16 then 7 rows, and all at once: the same cache and last output
     kc_serial = st.mtp_kc[0, :len(prompt) - 1].clone()
     last_serial = e.mbuf.logits.clone()
@@ -121,8 +105,7 @@ def _big(e: Decoder, rnd):
 
 
 def test_graphs_across_context_buckets_give_eager_bits(rnd):
-    """A sequence crossing 8,192 keys moves from the first context bucket's graphs to the next (Flash Next's keys):
-    drafted and serial decoding with graphs emit eager serial decoding's tokens on both sides of the boundary."""
+    """Crossing 8,192 keys moves to the next bucket's graphs; drafted and serial decoding keep eager's tokens."""
 
     prompt = _tokens(8180, 71)
     for sampling in SAMPLINGS:
@@ -167,8 +150,7 @@ def test_drafted_decoding_emits_serial_tokens_eager_and_graphs(rnd, sampling):
 
 @pytest.mark.parametrize("sampling", SAMPLINGS)
 def test_an_oracle_drafter_keeps_long_prefixes_and_ends_in_serial_state(rnd, sampling, monkeypatch):
-    """Drafts that are serial decoding's tokens, with every third chain wrong at a varying depth: rounds keep up to
-    depth + 1 tokens, the emitted tokens and the committed caches equal serial decoding's."""
+    """Mostly right drafts keep long prefixes; the tokens and the committed caches equal serial decoding's."""
 
     prompt = _tokens(50, 41)
     e = _decoder(rnd, graphs=True, states=2)
@@ -216,14 +198,12 @@ def test_confidence_stopped_chains_and_a_draft_vocabulary_change_speed_only(rnd,
             assert min(got.widths[:-1]) >= 2, (conf, got.widths)        # every round but a last one-token round
             assert got.committed == ref.tokens[:-1]                                     # drafts one at least
             drafted[conf], rounds[conf] = got.drafted, got.rounds
-        print(f"\ndrafts by confidence {drafted}, rounds {rounds}")
         assert drafted[0.0] > drafted[0.9] and drafted[0.9] < 1.5 * rounds[0.9], (drafted, rounds)
 
 
 @pytest.mark.parametrize("sampling", SAMPLINGS)
 def test_resumed_prompts_and_a_lagging_head_still_emit_serial_tokens(rnd, sampling):
-    """A drafted reply, then a follow-up prompt resumed from its state (the head absorbs the waiting tail); a state
-    decoded serially (the head lags) drafts after one catch-up round; a prompt run without the head the same."""
+    """A resumed follow-up, a serially decoded state and a prompt run without the head all draft serial tokens."""
 
     e = _decoder(rnd, graphs=True, states=3)
     p1 = _tokens(40, 61)
@@ -340,7 +320,6 @@ def real():
 
     tok = Tokenizer.from_file(str(snap / "tokenizer.json"))
     template = ChatTemplate(snap)
-    t0 = time.time()
     w = W.load(snap, "cuda")
     mtpw = W.load_mtp(drafter, w.cfg, "cuda")
     m = prepare(w)
@@ -357,13 +336,7 @@ def real():
     gc.collect()
     torch.cuda.empty_cache()
     e = Decoder(m, capacity=4096, rows=512, mtp=heads["draft vocabulary"], graphs=True, states=1)
-    t1 = time.time()
-    captured = e.warm(8)
-    print(f"\nloaded and regrouped in {t1 - t0:.0f} s; {captured} graphs captured in {time.time() - t1:.1f} s; MTP head "
-          f"{heads['full'].nbytes() / 2 ** 20:.0f} MiB with the full head, "
-          f"{heads['draft vocabulary'].nbytes() / 2 ** 20:.0f} MiB with the {heads['draft vocabulary'].head.n}-token "
-          f"draft head; MTP buffers {e.mbuf.nbytes() / 2 ** 20:.0f} MiB; GPU memory "
-          f"{torch.cuda.memory_allocated() / 2 ** 30:.2f} GiB allocated")
+    e.warm(8)
     prompts = []
     for text in CHAT + EXTRACT:
         prompts.append(tok.encode(template.render([{"role": "user", "content": text}], tools=None,
@@ -391,9 +364,7 @@ def _run(e: Decoder, ids, sampling, *, draft: bool, depth: int = D.DEPTH, confid
 
 
 def test_real_mtp_head_follows_the_reference_head(real):
-    """Teacher forcing over a non-memorised passage and one of the model's own replies: the CUDA head against the fp32
-    reference head (bf16 roundings) on the same hidden rows, and each head's top-1 against the model's next token
-    (row t reads token t + 1 and guesses token t + 2, the model's argmax at position t + 1)."""
+    """On a passage and a reply, the CUDA head picks the fp32 reference head's top-1, and the model's as often."""
 
     from tensorfold.families.qwen3_5_moe.cuda import qmm
     from tensorfold.families.qwen3_5_moe.cuda import reference as R
@@ -415,8 +386,7 @@ def test_real_mtp_head_follows_the_reference_head(real):
             out.append(qmm.matmul(x, m.head, out=b.logits[:x.shape[0]], part=b.part).argmax(-1))
         return torch.cat(out)
 
-    print()
-    for name, ids in texts.items():
+    for ids in texts.values():
         T = len(ids)
         run_prompt(e, ids, mtp=False)
         hidden = b.hidden[:T].clone()
@@ -433,145 +403,20 @@ def test_real_mtp_head_follows_the_reference_head(real):
         ref = top1(ref_h).tolist()
         want = model[1:].tolist()
         n = T - 2
-        rel = float((ours_h - ref_h).norm() / ref_h.norm())
+        assert float((ours_h - ref_h).norm() / ref_h.norm()) < 2e-2
         a_ours = sum(ours[t] == want[t] for t in range(n)) / n
         a_ref = sum(ref[t] == want[t] for t in range(n)) / n
         same = sum(ours[t] == ref[t] for t in range(n)) / n
-        print(f"{name:10s} {n} rows: CUDA head vs reference head relative error {rel:.2e}, same top-1 {same:.3f}; "
-              f"top-1 = the model's next token: CUDA {a_ours:.3f}, reference {a_ref:.3f}")
         assert same > 0.9 and a_ours > a_ref - 0.03
 
 
 def test_real_drafted_replies_equal_serial_by_sha256(real):
-    e, tok = real.e, real.tok
-    for ids in real.prompts[:1]:                                  # warm-up: compiles every kernel shape used below
-        _run(e, ids, None, draft=True)
-        _run(e, ids, None, draft=False, graphs=False)
-    print()
-    totals = {}
+    """Three chat and two JSON prompts, greedy and sampled: drafted, serial and eager serial replies are equal."""
+
+    e = real.e
     for sname, sampling in REAL_SAMPLINGS.items():
         for name, ids in zip(real.names, real.prompts):
             ser = _run(e, ids, sampling, draft=False)
             eager = _run(e, ids, sampling, draft=False, graphs=False)
             dr = _run(e, ids, sampling, draft=True)
-            same = _sha(dr.tokens) == _sha(ser.tokens) == _sha(eager.tokens)
-            print(f"{sname:7s} {name}: {len(ser.tokens):3d} tokens sha256 {_sha(ser.tokens)} drafted "
-                  f"{_sha(dr.tokens)} {'EQUAL' if same else 'DIFFERENT'}; serial {ser.tokens_per_second:6.1f} tok/s "
-                  f"(eager {eager.tokens_per_second:6.1f}), drafted {dr.tokens_per_second:6.1f} tok/s = "
-                  f"{dr.tokens_per_second / ser.tokens_per_second:.2f}x; acceptance {dr.acceptance:.2f}, "
-                  f"{dr.tokens_per_round:.2f} tokens a round over {dr.rounds} rounds")
-            assert dr.tokens == ser.tokens == eager.tokens, (sname, name)
-            t = totals.setdefault(sname, [0, 0.0, 0.0, 0.0, 0, 0, 0])
-            n = len(ser.tokens) - 1
-            t[0] += n
-            t[1] += ser.seconds
-            t[2] += dr.seconds
-            t[3] += eager.seconds
-            t[4] += dr.drafted
-            t[5] += dr.accepted
-            t[6] += dr.rounds
-        if sname == "greedy":
-            reply = tok.decode(dr.tokens, skip_special_tokens=True).strip()
-            print(f"   (json 2, greedy: {reply[:160]!r}...)")
-    for sname, (n, ss, ds, es, drafted, accepted, rounds) in totals.items():
-        print(f"{sname:7s} all: {n} tokens; serial {n / ss:.1f} tok/s with graphs, {n / es:.1f} eager (graphs "
-              f"{es / ss:.2f}x); drafted {n / ds:.1f} tok/s = {ss / ds:.2f}x serial with graphs; acceptance "
-              f"{accepted / max(1, drafted):.3f}; {n / max(1, rounds):.2f} tokens a round")
-
-
-def _use_head(e: Decoder, k) -> None:
-    e.mtp = k
-    e.mbuf = D.MTPBuffers(e.m, k, e.mbuf.rows, capacity=e.capacity)
-    e.graphs.steps.clear()
-
-
-def _profile(e: Decoder, ids, sampling, depth: int, confidence: float, rounds: int = 48) -> dict[str, float]:
-    """Mean milliseconds a drafted round spends verifying (window + sampling), committing and drafting (absorb and
-    chain, with their host syncs), synchronised after each phase; and a serial step's."""
-
-    st, b = e.st, e.buf
-    first = prefill(e, ids, sampling)
-    assert D._tail_ready(st)
-    t = {"verify": 0.0, "commit": 0.0, "draft": 0.0, "rows": 0.0, "kept": 0.0}
-    out = [first]
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    drafts = D.draft(e, st, st.mtp_tail[None], [first], st.pos + 1, depth, sampling, confidence)
-    t["draft"] += time.perf_counter() - t0
-    for _ in range(rounds):
-        t0 = time.perf_counter()
-        tokens = [out[-1]] + drafts
-        lg = e.forward(tokens, st)
-        sampled = D.sample_rows(lg[:len(tokens)], [st.pos + 1 + r for r in range(len(tokens))], sampling)
-        t1 = time.perf_counter()
-        keep = 1
-        for i, d in enumerate(drafts):
-            if sampled[i] != d:
-                break
-            keep += 1
-        e.commit(keep, st)
-        torch.cuda.synchronize()
-        t2 = time.perf_counter()
-        out += sampled[:keep]
-        drafts = D.draft(e, st, b.hidden[:keep], sampled[:keep], st.pos + 1, depth, sampling, confidence)
-        t3 = time.perf_counter()
-        t["verify"] += t1 - t0
-        t["commit"] += t2 - t1
-        t["draft"] += t3 - t2
-        t["rows"] += len(tokens)
-        t["kept"] += keep
-    res = {k: 1e3 * v / rounds for k, v in t.items() if k not in ("rows", "kept")}
-    res["rows"], res["kept"] = t["rows"] / rounds, t["kept"] / rounds
-    first = prefill(e, ids, sampling, mtp=False)
-    ser = serial_decode(e, first, rounds + 1, sampling)
-    res["serial step"] = 1e3 * ser.seconds / rounds
-    return res
-
-
-def test_real_depth_confidence_and_draft_vocabulary(real):
-    """Speed against the drafting recipe on two prompts (reported only): depth and confidence, the draft vocabulary
-    against the full head, where a round's time goes, and what a 32k-token cache costs a serial step."""
-
-    e = real.e
-    ids_c, ids_j = real.prompts[0], real.prompts[3]
-    sampling = REAL_SAMPLINGS["sampled"]
-    base = {name: _run(e, ids, sampling, draft=False) for name, ids in (("chat", ids_c), ("json", ids_j))}
-    vocab = {int(t) for t in real.heads["draft vocabulary"].ids_host}
-    print()
-    for name, res in base.items():
-        inside = sum(t in vocab for t in res.tokens) / len(res.tokens)
-        print(f"{name}: serial {res.tokens_per_second:.1f} tok/s; {inside:.3f} of its reply tokens are in the "
-              f"{len(vocab)}-token draft vocabulary")
-    configs = [(3, 0.5), (4, 0.5), (6, 0.3), (6, 0.5), (6, 0.7), (8, 0.5)]
-    for head in ("draft vocabulary", "full"):
-        _use_head(e, real.heads[head])
-        for depth, conf in (configs if head == "draft vocabulary" else [(D.DEPTH, D.CONFIDENCE)]):
-            parts = []
-            for name, ids in (("chat", ids_c), ("json", ids_j)):
-                _run(e, ids, sampling, draft=True, depth=depth, confidence=conf)       # captures new shapes
-                res = _run(e, ids, sampling, draft=True, depth=depth, confidence=conf)
-                assert res.tokens == base[name].tokens
-                parts.append(f"{name} {res.tokens_per_second / base[name].tokens_per_second:.2f}x "
-                             f"(acc {res.acceptance:.2f}, {res.tokens_per_round:.2f}/round)")
-            print(f"{head:16s} depth {depth} confidence {conf:.1f}: " + ", ".join(parts))
-    _use_head(e, real.heads["draft vocabulary"])
-    for name, ids in (("chat", ids_c), ("json", ids_j)):
-        _run(e, ids, sampling, draft=True)                   # captures the MTP steps' graphs again
-        p = _profile(e, ids, sampling, D.DEPTH, D.CONFIDENCE)
-        print(f"{name} round at depth {D.DEPTH}, confidence {D.CONFIDENCE}: verify {p['verify']:.2f} ms "
-              f"({p['rows']:.2f} rows), commit {p['commit']:.2f} ms, draft {p['draft']:.2f} ms; {p['kept']:.2f} "
-              f"tokens kept; a serial step {p['serial step']:.2f} ms")
-    # the attention grid covers the cache's capacity: a serial step at 32k positions against 4k
-    big = Decoder(real.m, capacity=32768, rows=512, graphs=True, states=1)
-    big.warm(2)
-    for d in (big, big):
-        first = prefill(d, ids_c, None)
-        r32 = serial_decode(d, first, 65, None)
-    first = prefill(e, ids_c, None, mtp=False)
-    r4 = serial_decode(e, first, 65, None)
-    assert r32.tokens == r4.tokens
-    print(f"serial step with graphs: {1e3 / r4.tokens_per_second:.2f} ms at a 4096-position cache, "
-          f"{1e3 / r32.tokens_per_second:.2f} ms at 32768")
-    del big
-    gc.collect()
-    torch.cuda.empty_cache()
+            assert _sha(dr.tokens) == _sha(ser.tokens) == _sha(eager.tokens), (sname, name)

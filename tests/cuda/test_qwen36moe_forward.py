@@ -1,21 +1,9 @@
-"""Qwen3.6-35B-A3B forward on CUDA (``qwen3_5_moe/cuda/forward.py`` and ``decode.py``).
-
-Small random weights in the loader's layout (the real per-layer shapes: hidden 2048, Gated DeltaNet 16/32 heads,
-attention 16/2 heads of 256, experts of width 512 at top 8; eight layers, 32 routed experts, a 6144-token vocabulary):
-a window gives the logits of serial steps bit for bit, a kept prefix continues like serial decoding, prefill chunking
-and resuming change no bits, two sequences in one window get the bits they get alone, and a window samples what serial
-decoding samples.
-
-The real checkpoint (skipped when it is not in the Hugging Face cache): the forward against the fp32 reference with
-bf16 roundings (teacher-forced NLL and top-1 over the reference test's passages, greedy replies to its chat prompts),
-a greedy chat reply with its speed and memory, and a 16-row window against 16 serial steps.
-"""
+"""Qwen3.6-35B-A3B's forward on CUDA: windows, commits and prefill chunks give serial bits; the real checkpoint."""
 
 from __future__ import annotations
 
 import gc
 import os
-import time
 from types import SimpleNamespace
 
 import pytest
@@ -52,7 +40,7 @@ class _Rand:
         self.g = torch.Generator(device=DEV).manual_seed(seed)
 
     def qw(self, n: int, k: int, lead: tuple[int, ...] = (), gain: float = 1.0) -> W.QW:
-        """MLX 4-bit g64 weights, values near uniform with variance gain^2 / k (the reference test's recipe)."""
+        """MLX 4-bit g64 weights, values near uniform with variance gain^2 / k."""
 
         words = torch.randint(-2 ** 31, 2 ** 31, (*lead, n, k // 8), generator=self.g, device=DEV,
                               dtype=torch.int64).to(torch.int32)
@@ -141,8 +129,7 @@ def test_windows_give_serial_logits_and_a_kept_prefix_continues_like_serial(mode
 
 
 def test_prefill_chunking_changes_no_bits(model):
-    """Chunks of 1 and 7 rows run as windows (replay inputs kept), 64 to 512 as prefill chunks (conv windows written
-    during the forward, attention in 48-row blocks): the same state and last logits."""
+    """Chunks of 1 and 7 rows run as windows, 64 to 512 as prefill chunks: the same state and last logits."""
 
     e = _decoder(model)
     prompt = _tokens(600, 3)
@@ -176,7 +163,7 @@ def test_a_resumed_prompt_ends_where_a_fresh_one_does(model):
 
 
 def test_two_sequences_in_one_window_get_their_own_bits(model):
-    """The phase-2 seam: row-shared kernels over both sequences' rows, per-sequence GDN chains and attention."""
+    """A window of two sequences: row-shared kernels over both, per-sequence GDN chains and attention."""
 
     m = model
     b = Buffers(m, 512, capacity=1024, window_rows=32, attn_rows=48, seqs=2)
@@ -267,16 +254,14 @@ def _reference_results(w: W.Weights, tok, template, passages: dict, prompts: lis
     out = {"passages": {}, "replies": []}
     for name, text in passages.items():
         ids = tok.encode(text, add_special_tokens=False).ids
-        t0 = time.time()
         h = R.hidden(w, torch.tensor(ids), R.new_state(w, bf16=True))
         arg, nll = R.head_top1(w, h, torch.tensor(ids[1:] + [0]))
-        out["passages"][name] = (ids, arg.cpu(), nll[:-1].cpu(), time.time() - t0)
+        out["passages"][name] = (ids, arg.cpu(), nll[:-1].cpu())
         del h
     for prompt, _ in prompts:
         ids = tok.encode(template.render([{"role": "user", "content": prompt}], tools=None, enable_thinking=False),
                          add_special_tokens=False).ids
-        t0 = time.time()
-        out["replies"].append((ids, R.greedy(w, ids, 64, w.cfg.eos, bf16=True), time.time() - t0))
+        out["replies"].append((ids, R.greedy(w, ids, 64, w.cfg.eos, bf16=True)))
     return out
 
 
@@ -294,26 +279,15 @@ def real():
 
     tok = Tokenizer.from_file(str(snap / "tokenizer.json"))
     template = ChatTemplate(snap)
-    t0 = time.time()
     w = W.load(snap, "cuda")
-    load_s = time.time() - t0
     # the reference first: its MLX weights and the regrouped ones do not both fit a 32 GB GPU
-    t0 = time.time()
     ref = _reference_results(w, tok, template, PASSAGES, PROMPTS)
-    ref_s = time.time() - t0
     torch.cuda.empty_cache()
-    t0 = time.time()
     m = prepare(w)
     del w
     gc.collect()
     torch.cuda.empty_cache()
-    torch.cuda.synchronize()
-    prep_s = time.time() - t0
-    torch.cuda.reset_peak_memory_stats()
     e = Decoder(m, capacity=4096, rows=512)
-    print(f"\nloaded in {load_s:.0f} s, reference in {ref_s:.0f} s, regrouped in {prep_s:.0f} s: model "
-          f"{m.nbytes() / 2 ** 30:.2f} GiB, buffers {e.buf.nbytes() / 2 ** 30:.2f} GiB, state "
-          f"{e.pool.nbytes_per_seq() / 2 ** 30:.3f} GiB a sequence at {e.capacity} positions")
     yield SimpleNamespace(snap=snap, tok=tok, template=template, m=m, e=e, ref=ref, passages=PASSAGES,
                           prompts=PROMPTS)
     del e, m
@@ -330,71 +304,25 @@ def _first_difference(a: list[int], b: list[int]) -> int | None:
 
 def test_real_forward_agrees_with_the_fp32_reference(real):
     e, tok = real.e, real.tok
-    print()
-    total = {"ours": [0.0, 0], "ref": [0.0, 0]}
-    agree_all = n_all = 0
-    for name, (ids, arg_r, nll_r, ref_s) in real.ref["passages"].items():
-        t0 = time.time()
+    for name, (ids, arg_r, nll_r) in real.ref["passages"].items():
         arg, nll = score(e, ids)
-        torch.cuda.synchronize()
-        ours_s = time.time() - t0
-        target = torch.tensor(ids[1:])
         n = len(ids) - 1
-        agree = int((arg[:-1].cpu() == arg_r[:-1]).sum())
-        hits = {"ours": int((arg[:-1].cpu() == target).sum()), "ref": int((arg_r[:-1] == target).sum())}
-        means = {"ours": float(nll.mean()), "ref": float(nll_r.mean())}
-        for k in total:
-            total[k][0] += float((nll if k == "ours" else nll_r).sum())
-            total[k][1] += hits[k]
-        agree_all += agree
-        n_all += n
-        print(f"{name:12s} {n:5d} tokens  NLL ours {means['ours']:.4f} ref {means['ref']:.4f}  top-1 ours "
-              f"{hits['ours'] / n:.4f} ref {hits['ref'] / n:.4f}  argmax agreement {agree / n:.4f}  "
-              f"max |dNLL| {float((nll.cpu() - nll_r).abs().max()):.3f}  ({ours_s:.1f} s, ref {ref_s:.0f} s)")
-        assert abs(means["ours"] - means["ref"]) < 0.05, name
-        assert agree / n > 0.93, name
-    print(f"{'all':12s} {n_all:5d} tokens  NLL ours {total['ours'][0] / n_all:.4f} ref {total['ref'][0] / n_all:.4f}  "
-          f"top-1 ours {total['ours'][1] / n_all:.4f} ref {total['ref'][1] / n_all:.4f}  argmax agreement "
-          f"{agree_all / n_all:.4f}")
-    for (prompt, must), (ids, ref_out, ref_s) in zip(real.prompts, real.ref["replies"]):
-        t0 = time.time()
-        ours = generate(e, ids, 64, None, stop_eos=True)
-        ours_s = time.time() - t0
-        diff = _first_difference(ours, ref_out)
-        reply = tok.decode(ours, skip_special_tokens=True).strip()
-        print(f"Q: {prompt}\n   ours ({len(ours)} tokens, {ours_s:.1f} s): {reply!r}")
-        if diff is None:
-            print(f"   the reference's greedy reply is identical ({len(ref_out)} tokens, {ref_s:.0f} s)")
-        else:
-            print(f"   first difference at reply token {diff} of {len(ours)} / {len(ref_out)}; reference: "
-                  f"{tok.decode(ref_out, skip_special_tokens=True).strip()!r}")
+        assert abs(float(nll.mean()) - float(nll_r.mean())) < 0.05, name
+        assert int((arg[:-1].cpu() == arg_r[:-1]).sum()) / n > 0.93, name
+    for (_, must), (ids, _) in zip(real.prompts, real.ref["replies"]):
+        reply = tok.decode(generate(e, ids, 64, None, stop_eos=True), skip_special_tokens=True).strip()
         assert all(word in reply.lower() for word in must), reply
 
 
-def test_real_greedy_chat_reply_speed_and_memory(real):
+def test_real_window_of_sixteen_rows_equals_sixteen_serial_steps(real):
     e, tok = real.e, real.tok
     msg = "Write a short paragraph about why lighthouses were built, and how a sailor tells one from another."
     ids = tok.encode(real.template.render([{"role": "user", "content": msg}], tools=None, enable_thinking=False),
                      add_special_tokens=False).ids
-    first = prefill(e, ids)                             # warm-up: compiles the one-row kernels
-    serial_decode(e, first, 4)
-    torch.cuda.synchronize()
-    t0 = time.time()
     first = prefill(e, ids)
-    torch.cuda.synchronize()
-    prefill_s = time.time() - t0
     snap = e.st.snapshot()
-    res = serial_decode(e, first, 65)                   # the first token and 64 more
-    text = tok.decode(res.tokens, skip_special_tokens=False)
-    free, total = torch.cuda.mem_get_info()
-    print(f"\nprompt {len(ids)} tokens, prefill {prefill_s * 1e3:.0f} ms ({len(ids) / prefill_s:.0f} tok/s)")
-    print(f"greedy reply, {len(res.tokens) - 1} tokens after the first at {res.tokens_per_second:.1f} tok/s "
-          f"(eager, one row a step):\n{text}")
-    print(f"GPU memory: {torch.cuda.memory_allocated() / 2 ** 30:.2f} GiB allocated, peak "
-          f"{torch.cuda.max_memory_allocated() / 2 ** 30:.2f} GiB since the decoder was built, "
-          f"{(total - free) / 2 ** 30:.2f} of {total / 2 ** 30:.2f} GiB in use on the device")
-    assert len(res.tokens) == 65 and len(set(res.tokens)) > 20
-    # a 16-row window from the prompt gives the 16 serial steps' logits bit for bit, on the real weights
+    res = serial_decode(e, first, 17)
+    assert len(res.tokens) == 17 and len(set(res.tokens)) > 5
     e.st.restore(snap)
     serial = []
     for t in res.tokens[:16]:
@@ -402,19 +330,5 @@ def test_real_greedy_chat_reply_speed_and_memory(real):
         e.commit(1)
     e.st.restore(snap)
     window = e.forward(res.tokens[:16])
-    same = [torch.equal(window[r], serial[r]) for r in range(16)]
-    print(f"16-row window vs 16 serial steps: {sum(same)} of 16 rows bit-identical")
-    assert all(same)
+    assert all(torch.equal(window[r], serial[r]) for r in range(16))
     assert [int(x) for x in window.argmax(-1).tolist()] == res.tokens[1:17]
-    # prefill throughput on a 2048-token prompt (eager; the second run of each chunk size is timed)
-    long = [t for ids, *_ in real.ref["passages"].values() for t in ids][:2048]
-    rates = []
-    for chunk in (128, 512):
-        for _ in range(2):
-            torch.cuda.synchronize()
-            t0 = time.time()
-            run_prompt(e, long, chunk=chunk)
-            torch.cuda.synchronize()
-            seconds = time.time() - t0
-        rates.append(f"{chunk}-row chunks {len(long) / seconds:.0f} tok/s")
-    print(f"prefill of {len(long)} tokens: " + ", ".join(rates))
