@@ -56,7 +56,12 @@ FLASHNEXT = {
         (16, 48, 17): "78d1a4274dca019060ec64392418be539b7d8b691f02d114852b9028ede86673",
         (8, 24, 5): "f2efd765f0ea895b4e06459bbfd242e38e453bc370c8a36fd3620e61ff2bebdf",
     },
-    # (12, 1), GB10: the entries come from the GB10 run of flashnext_digests() on v0.3.5
+    (12, 1): {  # GB10 (sm_121), NVIDIA PyTorch 26.07, TORCH_CUDA_ARCH_LIST=12.1: v0.3.5.1, CUDA code as v0.3.5
+        (16, 48, 1): "415934450198e0166fcd4af50a6bfad432e706461e5074a63c6880d4bae0969b",
+        (16, 48, 6): "0f785d9aca210e25260bdc64a71e7411dfc31ec636d98d743effc5666e6a0dcd",
+        (16, 48, 17): "7e451717da7a320bf4b801c15793ad6f23411699aed3a2b25da9d068cc105cd8",
+        (8, 24, 5): "9400540a65dbcacf9078fd6e8e87eaa0f2db9f33f8c34f6fdc1060e332861144",
+    },
 }
 
 

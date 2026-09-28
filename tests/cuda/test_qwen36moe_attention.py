@@ -101,7 +101,25 @@ FN_HASHES: dict[tuple[int, int], dict[str, dict[str, str]]] = {
             "gate": "947e3c71a83d5809f205635f9d9d5b6d62b358bcc136086e623d7c581d42cecf",
         },
     },
-    # (12, 1), GB10: the entries come from the GB10 run of tools/hash_flashnext.py on v0.3.5
+    (12, 1): {                   # GB10, NVIDIA PyTorch 26.07, TORCH_CUDA_ARCH_LIST=12.1: v0.3.5.1 (CUDA as v0.3.5)
+        "dense": {
+            "prep": "a54f5f4b418e831bc8362d207a48ef9613fa09ae736d1dffc6472dad03b96b13",
+            "attn": "d0752055d2fe4422b48d03d1a36de7bfd71d0253995a584961977c4355ff7965",
+            "gate": "3831541e431952fc4daea20ef5ec0fcfdb47a4773a9dfd1e03b9d9d890d7f52e",
+        },
+        "mixed": {
+            "prep": "8a629f706dd78e1840b81ef16841a1229a638f58026ccf4eaa52bd9495655750",
+            "select": "acdbadd026e82742a1afe9879c475621484656f003865509ad806af25dd02152",
+            "attn": "9d9eb1ab474317d6c134c894a524d7e6dd999910b38c8e0058dfaa06034e1967",
+            "gate": "f9297c95dc44e3d5e60d990ddb81ccb3851818506425740515a353ea93e85fdd",
+        },
+        "sparse": {
+            "prep": "35ce85b917dee2b4ad3017e696c3bcbc03c5d3fd38cef611cc4d926d35081c66",
+            "select": "b5e2572c6e48fb86d5a82e97eac898b446d445e72d4141780960a35c6f88b3ef",
+            "attn": "19cf8b6f6304a20c46293687272a7bf346ea710132d1f900c3d0cf6c41811a46",
+            "gate": "8ca2a8cd90a77f0437497b6d60dd4d5323dedb3949667bd8f6dc1934e2dcb744",
+        },
+    },
 }
 
 
