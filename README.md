@@ -19,6 +19,7 @@ Python 3.11 or newer is required. See the [runbook](RUNBOOK.md) for installation
 | Qwen3.8-27B | `Vontra/Qwen3.8-27B-MLX-4bit` | MLX, CUDA | `z-lab/Qwen3.8-27B-DFlash2` and context copies; DFlash2 is optional on MLX |
 | Qwen3.8 Flash Next | `Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP` | MLX, CUDA | Included MTP head and context copies |
 | GLM-5.3-Flash | `Vontra/GLM-5.3-Flash-MLX-4bit-MTP` | CUDA with two ranks | MTP; optional DFlash2 |
+| Qwen3.6-35B-A3B | `mlx-community/Qwen3.6-35B-A3B-4bit` | CUDA with one rank | MTP from `mlx-community/Qwen3.6-35B-A3B-MTP-4bit` |
 
 `tensorfold models` lists families and checkpoints. `tensorfold info MODEL` checks configuration without
 fetching weights. `serve` downloads a missing checkpoint; `pull` downloads it ahead of time.
@@ -100,7 +101,7 @@ that cannot fit one request is refused at startup. `--context 0` removes the met
 capacity and memory admission still apply. Use the reported context when configuring client compaction.
 
 On CUDA, Qwen defaults to the affordable native capacity. GLM targets a dense 2,051-token window,
-and Nemotron targets 16,384 tokens; the capacity estimate can lower these defaults. Explicit `--context 0` targets the affordable native capacity for every CUDA family.
+Nemotron 16,384 tokens and Qwen3.6-35B-A3B 32,768; the capacity estimate can lower these defaults. Explicit `--context 0` targets the affordable native capacity for every CUDA family.
 A positive CUDA value must fit both the native window and the capacity estimate on every rank;
 otherwise startup refuses it with fitting guidance. Increasing GLM beyond its dense window enables
 its sparse-attention path. The startup report distinguishes native and allocated capacity.
@@ -166,7 +167,7 @@ tensorfold pull Vontra/Qwen3.8-27B-MLX-4bit z-lab/Qwen3.8-27B-DFlash2
 tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --host 0.0.0.0
 ```
 
-Qwen3.8-27B, Flash Next and Nemotron support one or two CUDA ranks; GLM requires two.
+Qwen3.8-27B, Flash Next and Nemotron support one or two CUDA ranks; GLM requires two; Qwen3.6-35B-A3B runs on one.
 For two ranks, see the [CUDA runbook](RUNBOOK.md#nvidia-gpus). Each rank needs its checkpoint and any
 optional drafter. Rank 0 serves HTTP. Unified GPU/host memory also holds runtime buffers and file-backed
 model data; the startup estimate is not a measured maximum capacity.

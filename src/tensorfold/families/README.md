@@ -9,6 +9,7 @@ All MLX families use the lane engine; CUDA families provide their own engine.
 | `qwen3_5/` | Qwen3.8-27B | DFlash2 and context copies | One or two ranks |
 | `qwen4_exp/` | Qwen3.8 Flash Next | MTP and context copies | One or two ranks |
 | `glm5_next/` | GLM-5.3-Flash | Not supported | Two ranks, MTP and optional DFlash2 |
+| `qwen3_5_moe/` | Qwen3.6-35B-A3B | Not supported | One rank, MTP from a separate drafter |
 
 MLX load-time checks determine the usable window width and shared-forward support. Each stream has
 independent state; shared execution must reproduce its solo output. CUDA requests in the HTTP server
