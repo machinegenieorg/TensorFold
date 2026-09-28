@@ -6,11 +6,10 @@ A CUDA engine only, for one DGX Spark (GB10, 128 GB unified memory). It reads
 `cuda/README.md`; most are TensorFold's shared CUDA kernels or Flash Next's). There is no MLX engine for this
 family.
 
-Status: phase 1, one stream, MTP-drafted from `mlx-community/Qwen3.6-35B-A3B-MTP-4bit` with CUDA graphs. Numbers
-marked TODO wait for the GB10 run. The development
-numbers below come from an RTX 5090 (sm_120, 32 GB) in `tensorfold-dev:26.07`, the x86 build of the same NVIDIA
-PyTorch 26.07 base (PyTorch 2.13, CUDA 13.3, Triton 3.7.1). The 5090 has about six times GB10's memory bandwidth,
-so its speeds do not predict GB10's.
+Status: one stream, MTP-drafted from `mlx-community/Qwen3.6-35B-A3B-MTP-4bit` with CUDA graphs. Numbers marked
+TODO wait for the GB10 run. The development numbers below come from an RTX 5090 (sm_120, 32 GB) in an x86 build of
+the same NVIDIA PyTorch 26.07 container (PyTorch 2.13, CUDA 13.3, Triton 3.7.1). The 5090 has about six times
+GB10's memory bandwidth, so its speeds do not predict GB10's.
 
 ## What decides the speed
 
@@ -108,24 +107,24 @@ streams anything. The estimate at the default window:
 | Workspace | 1.00 |
 | Total (weights plus the larger of loading and the rest) | 21.79 |
 
-The states grow by 44 KiB a token of context (two states). On the 5090 the engine held 20.77 GiB after start-up at
-the default window, with a peak of 20.83 GiB; the device reported 22.92 GiB in use (the CUDA context and graphs sit
-outside PyTorch's count, inside the workspace). GB10: TODO.
+The states grow by 44 KiB a token of context (two states). On the 5090 (`tools/bench_q36.py serve`) the engine held
+20.77 GiB after start-up at the default window, with a peak of 20.83 GiB; the device reported 22.92 GiB in use (the
+CUDA context and graphs sit outside PyTorch's count, inside the workspace). GB10: TODO.
 
-The first start builds the DeltaNet, lane-matmul and expert extensions with the container's `nvcc` and compiles
-the Triton kernels. Later
-starts read the weights with large sequential reads and drop the shards from the page cache as they go (on unified
-memory the cached pages would sit beside the same bytes on the GPU), read the drafter, capture the decode graphs
-(32: windows of 1 to 7 rows at both GDN buffer parities, the head's steps, one-row steps for the serial state) and
-run a short warm-up request. On the 5090 with the checkpoints in the page cache: 9.7 s to load, 2.1 s to capture and
-warm up. GB10 start-up time: TODO.
+The first start builds the DeltaNet, lane-matmul and expert extensions with the container's `nvcc` and compiles the
+Triton kernels. Later starts read the weights with large sequential reads and drop the shards from the page cache as
+they go (on unified memory the cached pages would sit beside the same bytes on the GPU), read the drafter, capture
+the decode graphs (32: windows of 1 to 7 rows at both GDN buffer parities, the head's steps, one-row steps for the
+serial state) and run a short warm-up request. On the 5090 with the checkpoints in the page cache: 9.7 s to load,
+2.1 s to capture and warm up. GB10 start-up time: TODO.
 
 ### Measured
 
-Decode speed after the first token, one stream, through the released server in-process
-(`tests/cuda/test_qwen36moe_engine.py`): three chat prompts and two JSON-extraction prompts with thinking off, 256
-tokens each, greedy and sampled (the checkpoint's generation config: temperature 1, top-k 20, top-p 0.95). On the
-5090 only the ratios mean anything for GB10, and even they will move: a verify row costs relatively more there.
+Decode speed after the first token, one stream, from the engine as `tensorfold serve` builds it
+(`python tools/bench_q36.py serve`): three chat prompts and two JSON-extraction prompts with thinking off, 256
+tokens each, greedy and sampled (the checkpoint's generation config: temperature 1, top-k 20, top-p 0.95). Prefill:
+`python tools/bench_q36.py prefill`. On the 5090 only the ratios mean anything for GB10, and even they will move: a
+verify row costs relatively more there. The 5090 column predates the current draft vocabulary.
 
 | | 5090 (development) | GB10 |
 | --- | ---: | ---: |
@@ -140,9 +139,9 @@ tokens each, greedy and sampled (the checkpoint's generation config: temperature
 
 A one-row step with graphs takes 4.44 ms at a 4,096- and at a 32,768-position cache. JSON replies draft deep (about
 6 tokens a round) because the head's chains rarely fall under the 50% stop there; chat chains stop earlier. Depth
-and the stop were chosen on the 5090 and need retuning on GB10 (`tools/bench_q36.py drafting`).
-`tools/bench_q36.py prefill` times the real prefill and `moe` the MoE stages. Prompt chunks run the decode kernels, so prefill gives serial decoding's bits; the chunk size
-will be chosen on GB10.
+and the stop were chosen on the 5090 and need retuning on GB10 (`tools/bench_q36.py drafting`). `tools/bench_q36.py
+prefill` times the real prefill and `moe` the MoE stages. Prompt chunks run the decode kernels, so prefill gives
+serial decoding's bits; the chunk size will be chosen on GB10.
 
 ### Exactness
 
@@ -181,6 +180,8 @@ What was checked, on the 5090 (sm_120). GB10 hashes differ from sm_120's, and ea
 | The released server in-process, the real checkpoint: OpenAI chat requests with thinking off, greedy and sampled (seed 1234), 64 tokens: the served tokens against the engine's serial decoding of the same prompt; streamed against non-streamed; `"draft": false`; a request past the window refused before streaming | equal in all three, greedy and sampled; refused |
 | The real checkpoint: a drafted follow-up turn resumed from the kept reply (67 of 87 tokens) against a fresh prefill, greedy and sampled | equal |
 | The real MTP head against the fp32 reference head on the same hidden rows | relative error 0.6-0.9%, the same top-1 on 98.6-99.3% of rows |
+| `tests/cuda/test_qwen36moe_engine.py`: 15 drafts a round verifying 16-row windows from CUDA graphs; an exactly repeated prompt; two concurrent requests to the served engine, each against its solo reply | TODO (GB10 run) |
+| `tests/test_cuda_qwen36moe_{package,load,admission,reference}.py`, no GPU: the package's refusals, the loader's key map and centred-norm groups, the memory admission, the reference on tiny weights | package, load and reference pass on a Mac; admission TODO (GB10 run) |
 | Drafted against serial by token-ID SHA-256 on every benchmark run, GB10 | TODO |
 
 #### Rerunning the hash checks
@@ -203,7 +204,8 @@ capability; the GB10 (12, 1) entries come from the GB10 run.
 ### Quality
 
 Against a plain fp32 PyTorch forward with bf16 roundings (`cuda/reference.py`, TF32 off), teacher-forced over the
-reference test's passages on the 5090: argmax agreement 99.3% over 3,114 tokens. On a passage the model has not
+reference test's public passages on the 5090 (`python tools/bench_q36.py quality`): argmax agreement 99.3% over
+3,114 tokens. On a passage the model has not
 memorised, the NLL is 1.934 against the reference's 1.927. Greedy chat replies are coherent and name what the
 prompts ask for. The MTP drafter's fc reads `[normed embedding | normed hidden]` in that order: 90.3% top-1
 agreement with the next token, against 0.1% with the halves swapped. GB10: TODO.
@@ -211,9 +213,10 @@ agreement with the next token, against 0.1% with the halves swapped. GB10: TODO.
 ### Limits
 
 - One stream: requests decode one at a time, whatever `--parallel` says. The forward already takes a table of
-  sequences (the batching seam).
+  sequences.
 - The context capacity is fixed at start. Prefix reuse keeps two states, the last prompt's and the last reply's, and
-  the caches hold one sequence, so a prompt that extends neither starts over.
+  the caches hold one sequence, so a prompt that extends neither starts over. An exactly repeated prompt prefills
+  again: a kept state holds no logits for its last position.
 - A prompt that does not fit the window is refused, and a reply stops where the window ends.
 
 ### Next
