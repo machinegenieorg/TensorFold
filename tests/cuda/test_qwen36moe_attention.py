@@ -101,7 +101,25 @@ FN_HASHES: dict[tuple[int, int], dict[str, dict[str, str]]] = {
             "gate": "7b6a6747e5b6fab24210d6ab4b62d6c8d14d7a747c9054b7c5f284a1632b1557",
         },
     },
-    # (12, 1), GB10: recorded by the GB10 run
+    (12, 1): {                   # GB10 (NVIDIA PyTorch 26.07)
+        "dense": {
+            "prep": "6a970e6bfaac348a1ab95e9f1008d5df1d65461fa14c302e7ad7b7a869884f01",
+            "attn": "fa594e7ed77a6e3e14c3065731bdfb48c14cc83a314b73a32dffc61f99e90b77",
+            "gate": "d043401ebc91bd94c714b488770e3beec1074d1bb004296ae3c4f081f6515cd8",
+        },
+        "mixed": {
+            "prep": "6f6ac206db8676e211afe85f8b74e8d54956f52f02c4702f97088b7e6ae71a25",
+            "select": "beb8cb14885c51bc036973f37e7ac6c1a0a8c67585ea33473ee0e78296860fee",
+            "attn": "e9cb81a6e487770a686a6260a1a8b2d1251a19462bb67a2dfa38c38bcdea1571",
+            "gate": "d8b1a1d4d546c5c0e9e18b042c2c66805090a9b737be871d1ae76013cac4460f",
+        },
+        "sparse": {
+            "prep": "fe7cf084c0547da661f0b7cdf14b10358c6c93336813b8eb8f75b77fab6629c3",
+            "select": "f9a456583c27d741023e322b6b25c1e97ecc9396a0de0aa0758e1952586531f4",
+            "attn": "9dde97fa62b15456d159518bbe686271ae2f7a3f1344c8986f4cb9f4185ad4a0",
+            "gate": "94a64411ee65a0a8f4d00f1fe297b29060d03dfbf50df529f2221209b8076ad7",
+        },
+    },
 }
 
 
