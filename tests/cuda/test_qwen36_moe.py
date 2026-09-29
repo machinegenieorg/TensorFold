@@ -625,3 +625,323 @@ def test_streams_ignoring_end_tokens_decode_past_them_beside_others():
     _drain(dec)
     assert runs[0].out == free == runs[2].out and len(free) == 40
     assert runs[1].out == free[:free.index(free[5]) + 1]
+
+
+# response_format: a reply's grammar (tensorfold.cuda.grammar) masks the rows where tokens are chosen
+
+import json  # noqa: E402
+
+from tensorfold.cuda.grammar import GrammarError  # noqa: E402
+
+# the toy vocabulary: token t < 256 is chr(t), token 0 the stop token; tokens past 256 are special (never allowed)
+SCHEMAS = {
+    "object": {"type": "object", "additionalProperties": False, "required": ["t", "s"],
+               "properties": {"t": {"type": "string", "enum": ["a", "bb"]}, "n": {"type": "integer"},
+                              "s": {"type": "string"}}},
+    "enum": {"enum": ["a", "bb", "ccc"]},        # no whitespace around it: the value ends within four tokens
+}
+_GRAMMARS: dict = {}
+
+
+def _grammar(name: str, vocab: int = V, think_end: int | None = None):
+    """A fresh grammar state for SCHEMAS[name] over the toy vocabulary (``think_end``: it applies after that token)."""
+
+    xgr = pytest.importorskip("xgrammar")
+    from tensorfold.cuda import grammar
+
+    key = (vocab, think_end)
+    if key not in _GRAMMARS:
+        words = [""] + [chr(t) for t in range(1, 256)] + [""] * (vocab - 256)
+        info = xgr.TokenizerInfo(words, xgr.VocabType.RAW, vocab_size=vocab, stop_token_ids=[0])
+        _GRAMMARS[key] = (grammar.Grammars(info, think_end=think_end), {})
+    grammars, compiled = _GRAMMARS[key]
+    if name not in compiled:
+        compiled[name] = grammars.compile(grammar.Spec("json_schema", json.dumps(SCHEMAS[name])))
+    return grammars.constraint(compiled[name], after_think=think_end is not None)
+
+
+def _follows(name: str, tokens: list[int], vocab: int = V) -> bool:
+    """Whether the grammar takes every token (and, after a stop token, nothing more follows)."""
+
+    c = _grammar(name, vocab)
+    for i, t in enumerate(tokens):
+        if not c.m.accept_token(t):
+            return False
+        if c.m.is_terminated():
+            return i == len(tokens) - 1
+    return True
+
+
+def _cserial(w, prompt, sampling, count, name=None, vocab=V, think_end=None):
+    """The constrained serial reference ("draft": false): one row a round from a fresh prefill, each masked."""
+
+    c = _grammar(name, vocab, think_end) if name else None
+    st, first = serial_prefill(w, prompt, sampling, constraint=c)
+    return draft_decode(w, st, prompt, first, count, sampling, None, allow_copy=False, constraint=c).tokens
+
+
+def _csolo(w, head, prompt, sampling, count, name=None, confidence=0.3, runner=None, vocab=V, think_end=None):
+    c = _grammar(name, vocab, think_end) if name else None
+    st, mc, first, carry = decode.prefill(w, head, prompt, sampling, constraint=c)
+    return decode.mtp_decode(w, head, st, mc, carry, first, count, sampling, depth=3, confidence=confidence,
+                             prompt=prompt, runner=runner, constraint=c)
+
+
+class _Oracle:
+    """Copied continuations that are mostly a reference reply's next tokens, the same for the same context."""
+
+    def __init__(self, refs: dict):
+        self.refs = refs
+
+    def propose(self, context, most):
+        prompt = next((p for p in self.refs if list(context[:len(p)]) == list(p)), None)
+        if prompt is None:
+            return []
+        truth = self.refs[prompt][len(context) - len(prompt):][:most]
+        rng = random.Random(len(context) * 1009 + len(prompt))
+        return [t if rng.random() < 0.85 else rng.randrange(1, 256) for t in truth]
+
+
+def _counting(monkeypatch):
+    """Record every window's rows before and after its grammar drops drafts."""
+
+    from tensorfold.cuda import grammar
+
+    seen = []
+    real = grammar.Constraint.window
+
+    def window(self, tokens, parents):
+        got = real(self, tokens, parents)
+        seen.append((len(tokens), len(got.tokens)))
+        return got
+
+    monkeypatch.setattr(grammar.Constraint, "window", window)
+    return seen
+
+
+@pytest.mark.parametrize("graphs", [False, True])
+@pytest.mark.parametrize("sampling", [None, Sampling(1234, 1.0, 20, 0.95), Sampling(99, 0.8, 0, 1.0)])
+def test_constrained_mtp_decode_equals_constrained_serial(monkeypatch, sampling, graphs):
+    """The head's chains (random) and copied continuations (mostly right) under a JSON schema: drafts the grammar
+    rejects are dropped with the rows after them, rows are masked by their paths (after graph replays too), and the
+    reply equals the constrained serial one, token for token; a plain request after it on the same graphs is serial."""
+
+    from tensorfold.families.qwen3_5_moe.cuda.graphs import Graphs
+
+    w, head = _model()
+    runner = Graphs(w, head, 512) if graphs else None
+    prompts = [PROMPTS[1], list(range(20, 60))]
+    refs = {tuple(p): _cserial(w, p, sampling, 48, "object") for p in prompts}
+    plain = _serial(w, prompts[0], sampling, 48)
+    assert plain != refs[tuple(prompts[0])]                          # the mask changed the reply
+    seen = _counting(monkeypatch)
+    for prompt in prompts:                                           # the head's own drafts only
+        res = _csolo(w, head, prompt, sampling, 48, "object", confidence=0.0, runner=runner)
+        assert res.tokens == refs[tuple(prompt)] and _follows("object", res.tokens), prompt
+    monkeypatch.setattr(decode, "CopyIndex", lambda: _Oracle(refs))
+    for prompt in prompts:                                           # long windows the grammar cuts short
+        res = _csolo(w, head, prompt, sampling, 48, "object", confidence=0.0, runner=runner)
+        assert res.tokens == refs[tuple(prompt)], prompt
+        assert res.accepted > 0 and res.rounds < len(res.tokens) - 1
+    assert any(kept < rows for rows, kept in seen) and any(kept > 1 for _, kept in seen)
+    monkeypatch.undo()
+    again = _csolo(w, head, prompts[0], sampling, 48, runner=runner)
+    assert again.tokens == plain
+
+
+@pytest.mark.parametrize("sampling", [None, Sampling(1234, 1.0, 20, 0.95)])
+def test_constrained_replies_end_at_the_stop_token_or_max_tokens(sampling):
+    """A value the schema completes in a few tokens: the grammar allows only the stop token after it, drafted and
+    serial alike; a reply cut at max_tokens is the serial prefix."""
+
+    w, head = _model()
+    for prompt in (PROMPTS[0], PROMPTS[2]):
+        want = _cserial(w, prompt, sampling, 24, "enum")
+        assert want[-1] == 0 and len(want) <= 6 and json.loads("".join(map(chr, want[:-1]))) in SCHEMAS["enum"]["enum"]
+        assert _csolo(w, head, prompt, sampling, 24, "enum", confidence=0.0).tokens == want
+        cut = _cserial(w, prompt, sampling, 2, "enum")
+        assert cut == want[:2] and _csolo(w, head, prompt, sampling, 2, "enum", confidence=0.0).tokens == cut
+
+
+def test_with_thinking_the_grammar_applies_after_think_end():
+    """Tokens up to </think> are the plain reply's; the schema holds from the token after it; drafted equals serial."""
+
+    from tensorfold.families.qwen3_5_moe.cuda.graphs import Graphs
+
+    w, head = _model()
+    prompt, sampling = PROMPTS[1], Sampling(1234, 1.0, 20, 0.95)
+    plain = _serial(w, prompt, sampling, 40)
+    at = next(i for i in range(3, len(plain)) if plain[i] not in plain[:i] and plain[i] != 0)
+    think_end = plain[at]
+    want = _cserial(w, prompt, sampling, 40, "object", think_end=think_end)
+    assert want[:at + 1] == plain[:at + 1] and want != plain
+    assert _follows("object", want[at + 1:])
+    for runner in (None, Graphs(w, head, 256)):
+        got = _csolo(w, head, prompt, sampling, 40, "object", confidence=0.0, runner=runner, think_end=think_end)
+        assert got.tokens == want
+
+
+@pytest.mark.parametrize("expandable", [False, True])
+@pytest.mark.parametrize("graphs", [False, True])
+def test_constrained_and_plain_streams_together_equal_solo_and_serial(monkeypatch, expandable, graphs):
+    """Constrained and plain, drafted and serial, greedy and keyed streams share rounds (copied continuations mostly
+    right, cut by each grammar): each emits its solo and serial tokens, in the solo run's rounds."""
+
+    from tensorfold.families.qwen3_5_moe.cuda.graphs import Graphs
+
+    w, head = _model()
+    names = ["object", None, "object", "object", None, "enum"]
+    prompts = MIXED + [[40, 41, 42]]
+    samplings = SAMPLED + [Sampling(5, 1.0, 20, 0.95)]
+    drafts = [True, True, True, False, True, True]
+    with _segments(expandable):
+        refs = {tuple(p): _cserial(w, p, smp, 32, n) for p, smp, n in zip(prompts, samplings, names)}
+        monkeypatch.setattr(decode, "CopyIndex", lambda: _Oracle(refs))
+        monkeypatch.setattr(multi, "CopyIndex", lambda: _Oracle(refs))
+        solo = [_csolo(w, head, p, smp, 32, n) for p, smp, n in zip(prompts, samplings, names)]
+        dec = MultiDecoder(w, head, depth=3, confidence=0.3, graphs=Graphs(w, head, 1024) if graphs else None)
+        streams = []
+        for prompt, sampling, name, draft in zip(prompts, samplings, names, drafts):
+            got: list[int] = []
+            s = Stream(prompt, 32, sampling, draft=draft, emit=lambda new, got=got: got.extend(new),
+                       constraint=_grammar(name) if name else None)
+            dec.admit(s)
+            streams.append((s, got))
+        _drain(dec)
+    for i, (s, got) in enumerate(streams):
+        ref = refs[tuple(s.prompt)]
+        assert s.error is None and got == ref and s.out == got and solo[i].tokens == got, i
+        assert names[i] is None or _follows(names[i], got), i
+        if s.draft:
+            assert (s.rounds, s.min_rows) == (solo[i].rounds, min(solo[i].widths)), (i, s.rounds, solo[i].rounds)
+    assert refs[tuple(prompts[5])][-1] == 0                            # the enum reply ended at its stop token
+    assert not dec.streams and not dec.filling
+
+
+@pytest.mark.parametrize("sampling", [None, Sampling(1234, 1.0, 20, 0.95)])
+def test_a_constrained_stream_alone_replays_the_graphs_and_others_join(sampling):
+    """A constrained stream decoding alone takes the solo engine's rounds in its graphs; a plain one joins (both
+    eager) and leaves; the first goes on in the graphs. Both emit their serial tokens."""
+
+    from tensorfold.families.qwen3_5_moe.cuda.graphs import Graphs
+
+    w, head = _model()
+    runner = Graphs(w, head, 1024)
+    dec = MultiDecoder(w, head, depth=3, confidence=0.3, graphs=runner)
+    first = Stream(list(range(20, 60)), 64, sampling, constraint=_grammar("object"))
+    dec.admit(first)
+    for _ in range(4):
+        dec.finish(dec.round())
+    assert dec.resident is first and first.st is runner.st and runner.target
+    second = Stream(PROMPTS[0], 12, SAMPLED[1])
+    dec.admit(second)
+    while not second.done:
+        dec.finish(dec.round())
+    assert not first.done and dec.resident is first
+    _drain(dec)
+    assert first.out == _cserial(w, first.prompt, sampling, 64, "object") and _follows("object", first.out)
+    assert second.out == _serial(w, PROMPTS[0], SAMPLED[1], 12)
+
+
+class _Failing:
+    """A grammar whose ``window`` fails after ``after`` calls, as xgrammar might."""
+
+    def __init__(self, inner, after: int):
+        self.inner, self.after, self.calls = inner, after, 0
+
+    def window(self, tokens, parents):
+        self.calls += 1
+        if self.calls > self.after:
+            raise GrammarError("the reply's grammar failed: simulated")
+        return self.inner.window(tokens, parents)
+
+    def mask(self, logits, window=None):
+        return self.inner.mask(logits, window)
+
+    def advance(self, tokens):
+        self.inner.advance(tokens)
+
+
+def test_a_failed_grammar_ends_only_its_own_stream():
+    """A grammar failing mid-reply (together with others, or alone in the graphs) ends that request with its error;
+    the other requests get their serial tokens and the scheduler goes on."""
+
+    from tensorfold.families.qwen3_5_moe.cuda.graphs import Graphs
+
+    w, head = _model()
+    refs = [_cserial(w, p, smp, 20, "object") for p, smp in zip(MIXED[:3], SAMPLED[:3])]
+    sched = Scheduler(MultiDecoder(w, head, depth=3, confidence=0.3, graphs=Graphs(w, head, 1024)), max_streams=4)
+    results: dict = {}
+
+    def go(key, prompt, sampling, constraint):
+        got: list[int] = []
+        try:
+            results[key] = (got, sched.submit(prompt, 20, sampling, True, lambda new: got.extend(new) or False,
+                                              constraint=constraint))
+        except Exception as exc:                        # noqa: BLE001
+            results[key] = (got, exc)
+
+    jobs = [(i, MIXED[i], SAMPLED[i], _grammar("object")) for i in range(3)]
+    jobs.append(("failed", MIXED[4], None, _Failing(_grammar("object"), 2)))
+    threads = [threading.Thread(target=go, args=job, daemon=True) for job in jobs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=300)
+    got, err = results["failed"]
+    assert isinstance(err, GrammarError) and 1 <= len(got) < 20, err
+    for i in range(3):
+        got, stats = results[i]
+        assert isinstance(stats, dict) and got == refs[i], (i, stats)
+    alone = []                                          # alone, in the graphs' buffers: its error, then the next
+    for key, constraint in (("alone", _Failing(_grammar("object"), 1)), ("after", _grammar("object"))):
+        go(key, MIXED[0], SAMPLED[0], constraint)
+        alone.append(results[key])
+    assert isinstance(alone[0][1], GrammarError) and alone[1][0] == refs[0]
+    assert sched.thread.is_alive() and not sched.decoder.streams and sched.decoder.resident is None
+
+
+@pytest.mark.parametrize("expandable", [False, True])
+@pytest.mark.parametrize("sampling", [None, Sampling(1234, 1.0, 20, 0.95)])
+def test_a_constrained_stream_grows_the_graph_buffers_past_8192_rows(monkeypatch, expandable, sampling):
+    """A constrained stream alone grows the graphs' buffers past 8,192 rows and recaptures (windows of several
+    widths, cut by its grammar); a plain one joins and leaves, a constrained one follows; all emit their serial
+    tokens, on one stream's engine path and under --parallel, expandable segments on and off."""
+
+    from tensorfold.families.qwen3_5_moe.cuda.graphs import BUCKET, Graphs
+
+    vocab = 1 << 20                                     # two chain widths' logits map the pool's segment twice
+    w, head = _model(vocab=vocab)
+    long = [3 + (i * 7) % 200 for i in range(BUCKET)]           # with its reply, past the first BUCKET rows
+    with _segments(expandable):
+        refs = {tuple(p): _cserial(w, p, sampling, n, name, vocab) for p, n, name in
+                ((PROMPTS[1], 24, "object"), (long, 40, "object"), (PROMPTS[0], 12, None), (PROMPTS[2], 24, "enum"))}
+        monkeypatch.setattr(decode, "CopyIndex", lambda: _Oracle(refs))
+        monkeypatch.setattr(multi, "CopyIndex", lambda: _Oracle(refs))
+        runner = Graphs(w, head, 4 * BUCKET)            # one stream's engine
+        for prompt, n, name, rows in ((PROMPTS[1], 24, "object", BUCKET), (long, 40, "object", 2 * BUCKET),
+                                      (PROMPTS[2], 24, "enum", 2 * BUCKET)):
+            res = _csolo(w, head, prompt, sampling, n, name, confidence=0.0, runner=runner, vocab=vocab)
+            assert res.tokens == refs[tuple(prompt)] and runner.rows == rows, prompt
+        runner = Graphs(w, head, 4 * BUCKET)            # --parallel
+        dec = MultiDecoder(w, head, depth=3, confidence=0.0, graphs=runner)
+        short = Stream(PROMPTS[1], 24, sampling, constraint=_grammar("object", vocab))
+        dec.admit(short)
+        _drain(dec)
+        grown = Stream(long, 40, sampling, constraint=_grammar("object", vocab))
+        dec.admit(grown)
+        while grown.rounds < 2:
+            dec.finish(dec.round())
+        assert runner.rows == 2 * BUCKET and dec.resident is grown
+        joined = Stream(PROMPTS[0], 12, sampling)
+        dec.admit(joined)
+        while not joined.done:
+            dec.finish(dec.round())
+        assert not grown.done
+        _drain(dec)
+        last = Stream(PROMPTS[2], 24, sampling, constraint=_grammar("enum", vocab))
+        dec.admit(last)
+        _drain(dec)
+    assert any(bucket > BUCKET for _, bucket in runner.target) and any(bucket > BUCKET for _, bucket in runner.mtp)
+    for s in (short, grown, joined, last):
+        assert s.error is None and s.out == refs[tuple(s.prompt)], s.prompt
