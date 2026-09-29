@@ -90,8 +90,10 @@ def picks(logits: torch.Tensor, positions: Sequence[int], samplings: Sequence[Sa
 @torch.no_grad()
 def prefill(w, head: Head | None, prompt: Sequence[int], sampling: Sampling | None, *,
             state: State | None = None, cache: Cache | None = None, held: torch.Tensor | None = None,
-            stops: Sequence[int] = (), keep: Callable | None = None) -> tuple[State, Cache | None, int, Carry | None]:
-    """Commit the prompt, sample its next token, absorb all prompt rows but the last into the head; ``keep(p, ...)`` gets each stop's state."""
+            stops: Sequence[int] = (), keep: Callable | None = None,
+            constraint=None) -> tuple[State, Cache | None, int, Carry | None]:
+    """Commit the prompt, sample its next token (masked by ``constraint``, a reply's grammar, and followed), absorb all
+    prompt rows but the last into the head; ``keep(p, ...)`` gets each stop's state."""
 
     st = clone_state(state) if state is not None else State(w)
     if st.pos >= len(prompt):
@@ -106,9 +108,21 @@ def prefill(w, head: Head | None, prompt: Sequence[int], sampling: Sampling | No
         normed, held = extend(w, head, prompt, st, mc, held, end)
         if end < len(prompt):
             keep(end, clone_state(st), mc.view() if mc is not None else None, held)
-    first = sample_rows(_mm(normed[-1:], w.head), [len(prompt)], sampling)[0]
+    first = first_token(w, normed[-1:], len(prompt), sampling, constraint)
     carry = Carry(held, [first]) if head is not None else None
     return st, mc, first, carry
+
+
+def first_token(w, last: torch.Tensor, n: int, sampling: Sampling | None, constraint=None) -> int:
+    """The token after an ``n``-token prompt from its last normed row; a grammar (``tensorfold.cuda.grammar``) masks
+    the row before sampling and follows the token."""
+
+    logits = _mm(last, w.head)
+    if constraint is None:
+        return sample_rows(logits, [n], sampling)[0]
+    first = sample_rows(constraint.mask(logits), [n], sampling)[0]
+    constraint.advance([first])
+    return first
 
 
 @torch.no_grad()
@@ -139,8 +153,9 @@ COPY_ROWS = 16       # a copied continuation's verify window
 def mtp_decode(w, head: Head, st: State, mc: Cache, carry: Carry, pending: int, count: int,
                sampling: Sampling | None, *, depth: int, confidence: float, stop_eos: bool = True,
                on_tokens: Callable[[list[int]], bool | None] | None = None, runner=None,
-               prompt: Sequence[int] = ()) -> Result:
-    """Each round: absorb the carry (its last row drafts first), then verify a copied continuation from the context or a chain of up to ``depth`` MTP drafts, and keep a path; ``runner``: a ``graphs.Graphs`` to decode in and replay."""
+               prompt: Sequence[int] = (), constraint=None) -> Result:
+    """Each round: absorb the carry (its last row drafts first), then verify a copied continuation from the context or a chain of up to ``depth`` MTP drafts, and keep a path; ``runner``: a ``graphs.Graphs`` to decode in and replay.
+    ``constraint``: the reply's grammar (see ``mtp_round``)."""
 
     if runner is not None:                               # copied into its fixed buffers; commits write in place
         st, mc = runner.load(st, mc, min(runner.capacity, st.pos + count + COPY_ROWS))
@@ -162,7 +177,7 @@ def mtp_decode(w, head: Head, st: State, mc: Cache, carry: Carry, pending: int, 
         tokens, path, new, carry = mtp_round(st, mc, carry, out[-1], count - len(out), sampling, context, copies,
                                              depth=depth, confidence=confidence, ids=head.ids, verify=verify,
                                              step=step, eos=w.config.eos if stop_eos else (),
-                                             in_place=runner is not None)
+                                             in_place=runner is not None, constraint=constraint)
         out.extend(new)
         context.extend(new)
         rounds, drafted, kept = rounds + 1, drafted + len(tokens) - 1, kept + len(path) - 1
@@ -174,9 +189,15 @@ def mtp_decode(w, head: Head, st: State, mc: Cache, carry: Carry, pending: int, 
 
 def mtp_round(st: State, mc: Cache, carry: Carry, pending: int, room: int, sampling: Sampling | None,
               context: Sequence[int], copies: CopyIndex, *, depth: int, confidence: float, ids, verify, step,
-              eos: Sequence[int] = (), in_place: bool = False) -> tuple[list[int], list[int], list[int], Carry]:
+              eos: Sequence[int] = (), in_place: bool = False,
+              constraint=None) -> tuple[list[int], list[int], list[int], Carry]:
     """One round: absorb the carry, propose a copied continuation or an MTP chain, verify, commit the kept path (at
-    most ``room`` rows). Returns the window's tokens, the kept rows, the new tokens and the next carry."""
+    most ``room`` rows). Returns the window's tokens, the kept rows, the new tokens and the next carry.
+
+    With ``constraint`` (a reply's grammar, ``tensorfold.cuda.grammar``), the chain loses its first draft the grammar
+    rejects, or a stop token, and every row after it (a window's kept rows are a prefix of the chain); the verify
+    forward (a graph replay with ``runner``) runs unchanged, and its logits are masked by each row's path before they
+    are sampled. The drafts are the head's own: the grammar only drops them."""
 
     n = st.pos                                            # the pending token's position
     normed, logits = step(carry.states, carry.tokens, mc.pos)
@@ -190,9 +211,17 @@ def mtp_round(st: State, mc: Cache, carry: Carry, pending: int, room: int, sampl
             token, prob = draft(logits, n + 1 + len(guesses), sampling, ids)
             guesses.append(token)
     tokens = [pending] + guesses
+    window = None
+    if constraint is not None:
+        window = constraint.window(tokens, list(range(-1, len(tokens) - 1)))
+        tokens = window.tokens
     logits, record, states = verify(tokens)
+    if window is not None:                                # the replayed (or eager) logits, outside any graph
+        constraint.mask(logits, window)
     sampled = sample_rows(logits, [n + 1 + i for i in range(len(tokens))], sampling)
     path, terminal = accept(tokens, list(range(-1, len(tokens) - 1)), sampled, room, eos)
     commit(st, record, path, in_place=in_place)
     new = [tokens[r] for r in path[1:]] + [terminal]
+    if constraint is not None:                            # the grammar follows the chosen tokens only
+        constraint.advance(new)
     return tokens, path, new, Carry(states[path[0]:path[-1] + 1], new)
