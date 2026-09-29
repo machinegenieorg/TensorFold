@@ -37,8 +37,10 @@ def _model() -> Weights:
 
     gen = torch.Generator(device="cuda").manual_seed(4)
     # the GDN CUDA kernel's state is a fixed (Hv, Dv, 128) tensor: dk must be 128, as the other synthetic-weight
-    # GDN tests (test_qwen27_prompt_end_cache.py) also use.
-    c = Config(hidden=128, intermediate=128, layers=2, heads=2, kv_heads=1, head_dim=128, vocab=V, k_heads=1,
+    # GDN tests (test_qwen27_prompt_end_cache.py) also use. head_dim=256 matches Qwen3.5-4B's own (not just a
+    # round number): attention_texts' shared-memory footprint scales with it, and 128 alone missed the overflow
+    # a real 256-head_dim request hit (see the TEXT_BM fix in prefill_attention.py).
+    c = Config(hidden=128, intermediate=128, layers=2, heads=2, kv_heads=1, head_dim=256, vocab=V, k_heads=1,
               v_heads=2, dk=128, dv=128, conv_kernel=4, interval=2, eps=1e-6, rope_dims=32, rope_theta=10000000.0,
               eos=(0,))
 
