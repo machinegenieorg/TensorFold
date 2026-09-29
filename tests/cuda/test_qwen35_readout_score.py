@@ -89,13 +89,16 @@ def _same_bits(a: torch.Tensor, b: torch.Tensor) -> bool:
 def test_prefill_logits_is_chunk_invariant_on_dense_weights(w, n, size):
     """The readout's one-forward logits do not depend on how the prompt was chunked, on plain bf16 weights."""
 
-    from tensorfold.families.qwen3_5.cuda.forward import State, _mm
+    from tensorfold.cuda.kernels import dense as dense_kernel
+    from tensorfold.families.qwen3_5.cuda.forward import State
 
     prompt = _prompt(n, seed=3)
     whole, _ = prefill_logits(w, prompt)
     st = State(w)
     normed = prefill_state(w, prompt, st, size=size)
-    chunked = _mm(normed, w.head).float()
+    # the same head projection prefill_logits itself takes for a dense (bf16) checkpoint (forward.py's decode-path
+    # _mm would round through the generic, decode-oriented dense kernel instead: a different, merely close answer)
+    chunked = dense_kernel.prefill_matmul(normed, w.head.weight, f32=True)
     assert _same_bits(whole, chunked)
 
 
