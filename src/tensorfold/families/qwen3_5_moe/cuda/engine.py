@@ -56,6 +56,9 @@ class Qwen36Engine:
         from tensorfold.cuda.markers import resume_points
         from tensorfold.cuda.streams import PrefixCache
 
+        from tensorfold.families.qwen4_exp.cuda.weights import draft_token_ids
+
+        from . import modelopt
         from .mtp import Head
         from .weights import MTP_FILE, load, load_mtp
 
@@ -64,25 +67,31 @@ class Qwen36Engine:
         many = streams > 1
         if many:             # streams' caches of many sizes come and go: growable segments, less slack
             torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+        nvfp4 = modelopt.is_modelopt(model_dir)          # the NVFP4 checkpoint as it ships (MTP layer in its index)
+        ids = draft_token_ids("default") if self.depth else None       # the same tokenizer's ids
+        if ids is not None:
+            from tensorfold.families.qwen3_5.cuda.weights import Config
+
+            ids = ids[ids < Config.read(model_dir).vocab]                 # rows the head has
         extra = (Path(model_dir) / MTP_FILE,) if self.depth and (Path(model_dir) / MTP_FILE).is_file() else ()
+        transform = (modelopt.weight_bytes(len(ids) if ids is not None else 0, self.depth > 0) if nvfp4 else
+                     lambda name, info: (mtp_weights(name, info) if ".mtp." in name else linear_weights(name, info)))
         # one admission for one stream or many (every stream's states and caches, kept prompt ends), before any load
         geometry = ((lambda text: stream_geometry(text, streams, KEEP_MANY, self.depth)) if many else
                     (lambda text: gdn_geometry(text, 1, self.depth + 1, mtp=self.depth > 0)))
-        self.capacity_plan = admit(model_dir, context, context_explicit, torch, geometry,
-                                   lambda name, info: (mtp_weights(name, info) if ".mtp." in name
-                                                       else linear_weights(name, info)),
-                                   extra_files=extra)
+        self.capacity_plan = admit(model_dir, context, context_explicit, torch, geometry, transform,
+                                   extra_files=() if nvfp4 else extra)
         self.context_window = self.capacity_plan["context_window"]
         self.w = load(model_dir)
         self.head = self.graphs = None
         if self.depth:
             m = load_mtp(model_dir, self.w)
             if m is None:
-                raise ValueError("this checkpoint has no MTP layer (mtp-4bit.safetensors), which the CUDA engine "
-                                 "drafts with; add it, or pass --no-drafts for the serial reference")
-            from tensorfold.families.qwen4_exp.cuda.weights import draft_token_ids
-
-            self.head = Head(self.w, m, draft_token_ids("default"))    # the same tokenizer's ids
+                where = "an mtp.* layer" if nvfp4 else "mtp-4bit.safetensors"
+                raise ValueError(f"this checkpoint has no MTP layer ({where}), which the CUDA engine drafts with; "
+                                 "add it, or pass --no-drafts for the serial reference")
+            # the NVFP4 route drafts with the draft vocabulary's rows of its own NVFP4 head
+            self.head = Head(self.w, m, ids, modelopt.draft_head(model_dir, ids) if nvfp4 else None)
             from .graphs import Graphs
 
             # decoding buffers that outlive requests (with --parallel, the one stream decoding alone's)
