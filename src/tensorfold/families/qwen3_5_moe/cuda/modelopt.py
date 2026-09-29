@@ -9,13 +9,12 @@ tensors, on ``tensorfold.cuda.nvfp4``'s kernels:
   four times faster than on ``nvfp4.experts``), the head (and the draft head, its draft vocabulary's rows) an
   ``Fp4Linear``. Activations stay bf16.
 * ``FP8``: DeltaNet's ``in_proj_qkv``, ``in_proj_z`` and ``out_proj`` and attention's four projections: e4m3 codes
-  and one fp32 scale a tensor, ``Fp8Linear``s: decode's rows bf16 on the exact weights (W8A16), a prompt chunk's
-  rows FP8 with a scale a row (the 27B's NVFP4 route's prompt GEMM); ``input_scale`` is vLLM's static activation
-  scale and is not read.
-* bf16 as stored: the embedding, the routers and shared-expert gates, ``in_proj_a`` and ``in_proj_b`` (with the
-  e4m3 copy prompt chunks read, as the 27B's gates have), the convolution, the norms and the MTP layer's
-  projections. The MTP layer's experts only draft: they ride the NVFP4 experts kernel, quantized at load by
-  ``nvfp4.experts.quantize``.
+  and one fp32 scale a tensor, weight-only (``fp8.py``): every row bf16, decode's and a prompt chunk's alike, on the
+  exact weights; ``input_scale`` is vLLM's static activation scale and is not read.
+* bf16 as stored: the embedding, the routers and shared-expert gates, ``in_proj_a`` and ``in_proj_b``, the
+  convolution, the norms and the MTP layer's projections. The MTP layer's experts only draft: they ride the NVFP4
+  experts kernel, quantized at load by ``nvfp4.experts.quantize``. Prompt chunks' rows stay bf16 everywhere
+  (quant "modelopt"), the prompt path the checkpoint's own arithmetic as closely as decode's.
 
 The checkpoint keeps the RMSNorm weights zero-centred (the model scales by ``1 + w``); they are widened to fp32
 as ``1 + w`` once, at load, so the norms compute what the model does. DeltaNet's gated norm is stored absolute.
@@ -35,10 +34,11 @@ import torch
 from tensorfold.cuda.moe import Routed
 from tensorfold.cuda.nvfp4 import experts as nvx
 from tensorfold.cuda.nvfp4 import experts_split as nvs
-from tensorfold.cuda.nvfp4.linear import Fp4Linear, Fp8Linear
-from tensorfold.families.qwen3_5.cuda.nvfp4_load import Plain8
+from tensorfold.cuda.nvfp4.linear import Fp4Linear
 from tensorfold.families.qwen3_5.cuda.weights import GDN, Attention, Config, Layer, Plain, Weights
 from tensorfold.families.qwen4_exp.cuda import bf16
+
+from .fp8 import make_fp8
 
 # RMSNorm weights the model applies as ``1 + w`` (Qwen3.5's zero-centred norm); DeltaNet's gated norm is absolute
 CENTRED = (".input_layernorm.weight", ".post_attention_layernorm.weight", ".q_norm.weight", ".k_norm.weight",
@@ -165,16 +165,10 @@ class _Builder:
             return Fp4Linear.from_checkpoint(w.to(self.device), self.tensor(name + ".weight_scale"),
                                              float(self.rd.get(name + ".weight_scale_2")))
         if w.dtype == torch.float8_e4m3fn:
-            scale = self.rd.get(name + ".weight_scale").float().reshape(-1)
-            if scale.numel() != 1:
-                raise ValueError(f"{name}: FP8 with {scale.numel()} scales; the CUDA engine reads one a tensor")
-            return Fp8Linear.from_checkpoint(w.to(self.device), float(scale[0]))
+            return make_fp8(w.view(torch.uint8).to(self.device), self.rd.get(name + ".weight_scale"))
         if w.dtype not in (torch.bfloat16, torch.float16, torch.float32) or w.dim() != 2:
             raise ValueError(f"{name}: a {w.dtype} {tuple(w.shape)} weight is neither FP8, NVFP4 nor bf16")
-        w = w.to(self.device).to(torch.bfloat16).contiguous()
-        if prompt:
-            return Plain8(w, rows8=Fp8Linear.from_bf16(w))     # prompt chunks read its e4m3 copy
-        return Dense(w)
+        return Dense(w.to(self.device).to(torch.bfloat16).contiguous())
 
     def _fp4(self, name: str) -> tuple:
         return (self.tensor(name + ".weight"), self.tensor(name + ".weight_scale"),
@@ -245,7 +239,7 @@ def load(model_dir: str | Path, device: str = "cuda") -> Weights:
         torch.cuda.empty_cache()
     w = Weights(config=cfg, embed=Plain(b.tensor("model.embed_tokens.weight").to(torch.bfloat16).contiguous()),
                 layers=layers, norm=b.norm("model.norm.weight"), head=b.linear("lm_head", prompt=False),
-                quant="nvfp4")
+                quant="modelopt")
     half = cfg.rope_dims // 2
     w.inv_freq = (cfg.rope_theta ** (-torch.arange(0, half, dtype=torch.float64) / half)).to(torch.float32).to(device)
     left = b.rd.left(mtp=False)
@@ -314,13 +308,10 @@ def weight_bytes(draft_rows: int, mtp: bool) -> Callable[[str, dict], tuple[int,
         size = math.prod(shape) * itemsize(info, name)
         if name == "lm_head.weight" and mtp:                           # and the draft vocabulary's rows
             size += draft_rows * (shape[1] + shape[1] // 8) + 64 * shape[1]
-        elif info["dtype"] == "F8_E4M3" and name.endswith(".weight"):  # FP8 bytes, rows padded to 128
-            size = -(-shape[0] // 128) * 128 * shape[1]
+        elif info["dtype"] == "F8_E4M3" and name.endswith(".weight"):  # FP8 bytes, each row's fp32 scale
+            size += 4 * shape[0]
         elif name.endswith((".A_log", ".dt_bias")) or name.endswith(CENTRED):
             size *= 2                                                   # widened to fp32
-        elif name.endswith(("in_proj_a.weight", "in_proj_b.weight")):  # and the e4m3 copy prompts read
-            npad = -(-shape[0] // 128) * 128
-            size += npad * shape[1] + shape[1] // 64 * npad * 2
         elif in_mtp and (".experts." in name or ".shared_expert." in name):
             size = size * 9 // 32                                       # bf16 as NVFP4 (they only draft)
         return size, 0

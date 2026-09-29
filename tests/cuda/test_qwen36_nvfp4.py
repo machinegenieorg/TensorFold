@@ -1,6 +1,7 @@
 """Qwen3.6 MoE's NVFP4 route: nvidia/Qwen3.6-35B-A3B-NVFP4 read as it ships, on ``tensorfold.cuda.nvfp4``.
 
-The loader against the checkpoint's own arrays, the tiny model against the fp32 reference, the draft head, and the
+The FP8 projections' kernel kernel-first (exact decode, row invariance), the loader against the checkpoint's own
+arrays, the tiny model against the fp32 reference, the draft head, and the
 engine: capacity admitted before any load, drafted equal to ``"draft": false``, ``--parallel`` equal to solo.
 ``test_qwen36_moe.py`` runs the family's window, graph, resume and stream tests on this route's tiny model too.
 """
@@ -16,27 +17,66 @@ if not torch.cuda.is_available():
 from qwen36_nvfp4_tiny import LM, tensors, write  # noqa: E402  (pytest puts tests/cuda on sys.path)
 
 from tensorfold.cuda.nvfp4 import experts_split as nvs  # noqa: E402
-from tensorfold.cuda.nvfp4.linear import Fp4Linear, Fp8Linear, fragment_index  # noqa: E402
+from tensorfold.cuda.nvfp4.linear import Fp4Linear  # noqa: E402
 from tensorfold.engine.exact_sampling import Sampling  # noqa: E402
-from tensorfold.families.qwen3_5_moe.cuda import modelopt  # noqa: E402
-from tensorfold.families.qwen4_exp.cuda import nvfp4  # noqa: E402
+from tensorfold.families.qwen3_5_moe.cuda import fp8, modelopt  # noqa: E402
+from tensorfold.families.qwen4_exp.cuda import bf16, nvfp4  # noqa: E402
 
 FP4 = ("weight", "weight_scale", "weight_scale_2")
-
-
-def _fp8_rows(lin: Fp8Linear) -> torch.Tensor:
-    """An Fp8Linear's stored bytes back to [n, K] (its fragment order undone)."""
-
-    kk, nn = fragment_index(lin.k, lin.npad, lin.w8.device)
-    rows = torch.empty((lin.npad, lin.k), dtype=torch.uint8, device=lin.w8.device)
-    rows.t()[kk, nn] = lin.w8.view(kk.shape)
-    return rows[:lin.n]
 
 
 def _reference(raw: dict, name: str) -> torch.Tensor:
     """The exact fp32 weight of an NVFP4 projection in the checkpoint, code x (e4m3 x scale)."""
 
     return nvfp4.dequantize(*(raw[f"{name}.{t}"] for t in FP4))
+
+
+def _codes(n, k, seed=0):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    return (torch.randn(n, k, generator=g, device="cuda") * 40).clamp(-448, 448).to(torch.float8_e4m3fn)
+
+
+def test_every_e4m3_code_decodes_to_its_value():
+    b = torch.arange(256, dtype=torch.uint8, device="cuda")
+    finite = ~torch.isnan(b.view(torch.float8_e4m3fn).float())
+    codes = b[finite]
+    q = fp8.FP8Linear(codes[:, None].repeat(1, 64).contiguous(), torch.ones(codes.numel(), device="cuda"))
+    x = torch.zeros((1, 64), dtype=torch.bfloat16, device="cuda")
+    x[0, 0] = 1
+    assert torch.equal(fp8.matmul(x, q)[0].float(), codes.view(torch.float8_e4m3fn).float())
+
+
+@pytest.mark.parametrize("n, k", [(8192, 2048), (512, 2048), (2048, 4096), (384, 256), (100, 128), (1, 256)])
+def test_fp8_rows_keep_their_bits_in_any_window(n, k):
+    """Each row's bits alone equal its bits among up to 1,200 rows (decode windows and prompt chunks), for the
+    stored bytes and for the widened codes; the widened codes give Flash Next's ``bf16.matmul`` times the scale; the
+    prompt form (K in one slice) keeps a row's bits in any chunk."""
+
+    q = fp8.make_fp8(_codes(n, k), torch.tensor(0.000913))
+    wide = q.widen()
+    x = torch.randn((1200, k), device="cuda").bfloat16()
+    for lin in (q, wide):
+        full = fp8.matmul(x, lin)
+        for m in (1, 3, 16, 17, 64, 128, 129, 1000):
+            for a in (0, 7):
+                assert torch.equal(fp8.matmul(x[a:a + m], lin), full[a:a + m]), (m, a)
+    assert torch.equal(fp8.matmul(x, wide),
+                       (bf16.matmul(x, bf16.make_b16(wide.weight), f32=True) * q.scale).to(torch.bfloat16))
+    prompt = q.prefill(x)                                    # the prompt form: chunk-invariant bits of its own
+    for m in (1, 17, 129, 1000):
+        assert torch.equal(q.prefill(x[3:3 + m]), prompt[3:3 + m]), m
+    ref = x.float() @ fp8.dequantize(q).T
+    assert ((fp8.matmul(x, q).float() - ref).abs().max() / ref.abs().max()).item() < 1e-2
+    assert q.nbytes() == n * k + 4 * n and wide.nbytes() == 2 * n * k + 4 * n
+
+
+def test_an_fp8_scale_is_one_a_tensor_or_one_a_row():
+    codes = _codes(128, 64)
+    assert torch.equal(fp8.make_fp8(codes, torch.tensor(0.5)).scale, torch.full((128,), 0.5, device="cuda"))
+    rows = torch.rand(128, device="cuda")
+    assert torch.equal(fp8.make_fp8(codes, rows[:, None]).scale, rows)
+    with pytest.raises(ValueError, match="one a tensor or one a row"):
+        fp8.make_fp8(codes, torch.ones(64))
 
 
 @pytest.fixture(scope="module")
@@ -54,14 +94,15 @@ def test_the_checkpoint_loads_as_it_ships(checkpoint):
     raw = tensors()
     w = load(checkpoint)
     m = load_mtp(checkpoint, w)
-    assert w.quant == "nvfp4" and w.fast_prefill and isinstance(w.embed, Plain)
+    assert w.quant == "modelopt" and not w.fast_prefill and isinstance(w.embed, Plain)
     gdn, attn = w.layers[0].gdn, w.layers[1].attn
     a, s = LM + "layers.0.linear_attn.", LM + "layers.1.self_attn."
     for lin, name in ((gdn.qkv, a + "in_proj_qkv"), (gdn.z, a + "in_proj_z"), (gdn.out, a + "out_proj"),
                       (attn.q, s + "q_proj"), (attn.o, s + "o_proj")):
-        assert isinstance(lin, Fp8Linear) and lin.scale == raw[name + ".weight_scale"].item()
-        assert torch.equal(_fp8_rows(lin).cpu(), raw[name + ".weight"].view(torch.uint8))
-    assert torch.equal(gdn.b.weight.cpu(), raw[a + "in_proj_b.weight"]) and gdn.b.rows8 is not None
+        assert isinstance(lin, fp8.FP8Linear) and lin.weight.dtype == torch.uint8
+        assert torch.equal(lin.weight.cpu(), raw[name + ".weight"].view(torch.uint8))
+        assert torch.equal(lin.scale.cpu(), raw[name + ".weight_scale"].expand(lin.n))
+    assert isinstance(gdn.b, modelopt.Dense) and torch.equal(gdn.b.b.weight.cpu(), raw[a + "in_proj_b.weight"])
     assert torch.equal(gdn.norm.cpu(), raw[a + "norm.weight"])                       # absolute, as stored
     assert gdn.A_log.dtype == torch.float32 and gdn.conv.shape == (384, 4)
     for got, name in ((w.layers[0].input_norm, LM + "layers.0.input_layernorm.weight"),
@@ -109,11 +150,9 @@ def test_a_tensor_the_loader_does_not_read_is_refused(tmp_path):
 @pytest.mark.parametrize("top_k", [16, 4])
 def test_the_route_scores_like_the_fp32_reference(tmp_path, top_k):
     """The verify windows' and the prompt path's next-token scores against the fp32 forward of the exactly dequantized
-    weights. Verify rows are bf16: with every expert selected no routing decision can flip, so every position's score
-    agrees to rounding (a near tie between two tokens can still swap the top one); with the top 4 of 16 a near tie
-    can also pick another expert for one token. Prompt rows reach the FP8 projections as FP8 with a scale a row (the
-    27B's NVFP4 prompt path): three mantissa bits, which this tiny model's flat logits feel more than the real
-    model's (97% of its top tokens are the fp32 forward's)."""
+    weights, bf16 activations the only difference. With every expert selected no routing decision can flip, so every
+    position's score agrees to rounding (a near tie between two tokens can still swap the top one); with the top 4
+    of 16 a near tie can also pick another expert for one token."""
 
     from tensorfold.families.qwen3_5_moe.cuda.reference import forward, route
 
@@ -123,7 +162,7 @@ def test_the_route_scores_like_the_fp32_reference(tmp_path, top_k):
     got = route(folder, ids, window=16)
     assert ref["logits"].std(-1).mean() > 1.0              # a model whose next token is not a coin toss
     bounds = {("", 16): (0.95, 0.02), ("", 4): (0.95, 0.03),                      # (top tokens equal, gap)
-              ("prefill_", 16): (0.85, 0.12), ("prefill_", 4): (0.75, 0.12)}
+              ("prefill_", 16): (0.95, 0.02), ("prefill_", 4): (0.95, 0.03)}
     for kind in ("", "prefill_"):
         agree = (got[kind + "top"] == ref["top"]).float().mean()
         gap = (got[kind + "logp"] - ref["logp"]).abs()
