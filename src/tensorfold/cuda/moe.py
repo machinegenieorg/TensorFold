@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from . import experts as grouped
+from .nvfp4 import experts as nvx
 
 
 def _tile(m: int) -> int:
@@ -115,15 +116,16 @@ def select(logits: torch.Tensor, buf: MoEBuffers, top_k: int, experts: int) -> N
     grouped.route(buf.pick[:logits.shape[0]], buf.plan)
 
 
-def moe(x: torch.Tensor, router_rows: torch.Tensor, ex: grouped.Experts, buf: MoEBuffers, top_k: int,
-        experts: int) -> MoEBuffers:
+def moe(x: torch.Tensor, router_rows: torch.Tensor, ex: grouped.Experts | nvx.Experts4, buf: MoEBuffers,
+        top_k: int, experts: int) -> MoEBuffers:
     """Route x [R, D] and run its experts into buf.y [R, k + 1, D] (bf16 in prefill); slot k is the shared expert."""
 
     rows = x.shape[0]
     router(x, router_rows, buf.logits[:rows])
     select(buf.logits[:rows], buf, top_k, experts)
-    grouped.gate_up(x, ex, buf.plan, buf.act.view(-1, ex.width), rows)
-    grouped.down(buf.act.view(-1, ex.width), ex, buf.plan, buf.y.view(-1, ex.dims), rows)
+    kernels = nvx if isinstance(ex, nvx.Experts4) else grouped    # NVFP4 tables (the shared expert in them) or MLX
+    kernels.gate_up(x, ex, buf.plan, buf.act.view(-1, ex.width), rows)
+    kernels.down(buf.act.view(-1, ex.width), ex, buf.plan, buf.y.view(-1, ex.dims), rows)
     return buf
 
 
