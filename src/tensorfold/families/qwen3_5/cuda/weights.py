@@ -242,7 +242,8 @@ class _Tensors:
 
         from safetensors import safe_open
 
-        skip = skip or (lambda name: name.startswith("vision_tower") or ".mtp." in name or name.startswith("mtp."))
+        skip = skip or (lambda name: name.startswith(("vision_tower", "model.visual.")) or ".mtp." in name
+                        or name.startswith("mtp."))
         self.device, self.files, self.where = device, ExitStack(), {}
         for path in sorted(model_dir.glob("*.safetensors")):
             f = self.files.enter_context(safe_open(str(path), framework="pt", device="cpu"))
@@ -277,18 +278,38 @@ def load(model_dir: str | Path, device: str = "cuda", *, tiled: bool = False, ml
     cfg = Config.read(model_dir)
     raw = json.loads((model_dir / "config.json").read_text())
     t = _Tensors(model_dir, device)
-    prefix = "language_model." if any(k.startswith("language_model.") for k in t) else ""
+    # a wrapped multimodal checkpoint nests the text decoder either as "language_model." ahead of the usual
+    # "model.X" names, or (Qwen3.5's own ``Qwen3_5ForConditionalGeneration``) as "model.language_model.X" in
+    # place of "model.X" itself; a plain causal LM checkpoint uses neither.
+    strip_model = any(k.startswith("model.language_model.") for k in t)
+    if strip_model:
+        prefix = "model.language_model."
+    elif any(k.startswith("language_model.") for k in t):
+        prefix = "language_model."
+    else:
+        prefix = ""
+
+    def key(name: str) -> str:
+        return prefix + (name[len("model."):] if strip_model and name.startswith("model.") else name)
 
     def get(name: str) -> torch.Tensor:
-        return t.pop(prefix + name)
+        return t.pop(key(name))
+
+    def norm(name: str) -> torch.Tensor:
+        """A centred RMSNorm weight (stored as gamma - 1) with its 1 back (as ``exl3_load``/``nvfp4_load`` already
+        do for their formats): every plain ``Qwen3_5RMSNorm`` (input/post/final norms, attention's q_norm/k_norm)
+        computes ``x * (1 + weight)``, unlike the GDN block's gated norm, which is plain ``x * weight``."""
+
+        w = get(name)
+        return (w.float() + 1.0).to(w.dtype).contiguous()
 
     def qlinear(name: str, pack: bool = True) -> QLinear:
         from tensorfold.quantization import resolve_affine, validate_shapes
 
         w = get(name + ".weight")
-        spec = resolve_affine(raw, prefix + name)
+        spec = resolve_affine(raw, key(name))
         if spec is None:
-            if (prefix + name + ".scales") in t or (prefix + name + ".biases") in t:
+            if key(name + ".scales") in t or key(name + ".biases") in t:
                 raise ValueError(f"{name} has packed weights but no enabled affine metadata")
             if w.ndim != 2 or w.dtype not in (torch.bfloat16, torch.float16, torch.float32):
                 raise ValueError(f"{name} needs floating weights or declared affine metadata")
@@ -322,16 +343,15 @@ def load(model_dir: str | Path, device: str = "cuda", *, tiled: bool = False, ml
         else:
             attn = Attention(q=qlinear(p + "self_attn.q_proj"), k=qlinear(p + "self_attn.k_proj"),
                              v=qlinear(p + "self_attn.v_proj"), o=qlinear(p + "self_attn.o_proj"),
-                             q_norm=get(p + "self_attn.q_norm.weight").contiguous(),
-                             k_norm=get(p + "self_attn.k_norm.weight").contiguous())
+                             q_norm=norm(p + "self_attn.q_norm.weight"), k_norm=norm(p + "self_attn.k_norm.weight"))
         fields = mlp(p + "mlp.", get, qlinear, cfg) if mlp is not None else \
             {"gate": qlinear(p + "mlp.gate_proj"), "up": qlinear(p + "mlp.up_proj"), "down": qlinear(p + "mlp.down_proj")}
-        layers.append(Layer(linear=cfg.is_linear(i), input_norm=get(p + "input_layernorm.weight").contiguous(),
-                            post_norm=get(p + "post_attention_layernorm.weight").contiguous(), gdn=gdn, attn=attn,
+        layers.append(Layer(linear=cfg.is_linear(i), input_norm=norm(p + "input_layernorm.weight"),
+                            post_norm=norm(p + "post_attention_layernorm.weight"), gdn=gdn, attn=attn,
                             **{"gate": None, "up": None, "down": None, **fields}))
     embed = qlinear("model.embed_tokens", pack=False)
     tied = bool(raw.get("tie_word_embeddings") or (raw.get("text_config") or {}).get("tie_word_embeddings"))
-    if (prefix + "lm_head.weight") in t:
+    if key("lm_head.weight") in t:
         head = qlinear("lm_head")
     elif tied:
         from .qmm_fast import tile
@@ -339,7 +359,7 @@ def load(model_dir: str | Path, device: str = "cuda", *, tiled: bool = False, ml
         head = tile(embed) if tiled else embed             # the embedding table read the other way: (vocab, hidden)
     else:
         raise ValueError("no lm_head.weight, and the checkpoint does not declare tied embeddings")
-    w = Weights(config=cfg, embed=embed, layers=layers, norm=get("model.norm.weight"), head=head)
+    w = Weights(config=cfg, embed=embed, layers=layers, norm=norm("model.norm.weight"), head=head)
     half = cfg.rope_dims // 2
     inv = cfg.rope_theta ** (-torch.arange(0, half, dtype=torch.float64) / half)
     w.inv_freq = inv.to(torch.float32).to(device)
