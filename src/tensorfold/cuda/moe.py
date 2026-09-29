@@ -181,10 +181,10 @@ def run(x: torch.Tensor, m: Routed, *, prefill: bool = False) -> torch.Tensor:
     buf = _scratch.get(key)
     if buf is None:
         buf = _scratch[key] = MoEBuffers(size, _Shape(m), x.device, prefill=prefill)
-    if getattr(m.experts, "kernel", "qmm") == "nvfp4":        # an NVFP4 checkpoint's experts, on the same plan
-        from tensorfold.families.qwen4_exp.cuda import nvfp4_moe
+    if getattr(m.experts, "kernel", "qmm") == "nvfp4-grouped":   # an NVFP4 table, the shared expert in it
+        from . import nvfp4_experts
 
-        nvfp4_moe.moe(x.contiguous(), None, m.router, m.experts, buf, _Shape(m))
+        nvfp4_experts.moe(x.contiguous(), m.router, m.experts, buf, m.top_k, m.count)
     else:
         moe(x.contiguous(), m.router, m.experts, buf, m.top_k, m.count)
     return combine(buf.y[:rows], buf.wts[:rows])
