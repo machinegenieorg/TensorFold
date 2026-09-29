@@ -7,14 +7,15 @@ from dataclasses import dataclass
 
 import torch
 
+from tensorfold.cuda.grammar import GrammarError
 from tensorfold.cuda.markers import MIN_GAP
-from tensorfold.cuda.sampling import sample_rows, sample_streams
+from tensorfold.cuda.sampling import sample_streams
 from tensorfold.cuda.streams import PrefixCache, Stream, accept
 from tensorfold.families.qwen3_5.cuda.decode import CopyIndex
-from tensorfold.families.qwen3_5.cuda.forward import State, _mm, commit_streams, multi_tree_forward
+from tensorfold.families.qwen3_5.cuda.forward import State, commit_streams, multi_tree_forward
 from tensorfold.families.qwen3_5.cuda.multi import kept, private
 
-from .decode import COPY_ROWS, Carry, extend, mtp_round, picks
+from .decode import COPY_ROWS, Carry, extend, first_token, mtp_round, picks
 from .mtp import Cache, Head
 
 STEP = 1024          # prompt rows a prefill step takes while other streams decode
@@ -41,7 +42,9 @@ def own(mc: Cache, rows: int) -> Cache:
 class MultiDecoder:
     """The ``Scheduler``'s decoder: each round a prefill step for the oldest queued prompt, then every stream's MTP
     chain (or copied continuation) verified in one forward; a stream's window holds at most 16 rows. With
-    ``graphs`` (a ``graphs.Graphs``), a stream decoding alone replays the one-stream engine's CUDA graphs."""
+    ``graphs`` (a ``graphs.Graphs``), a stream decoding alone replays the one-stream engine's CUDA graphs. A stream
+    with a grammar (``Stream.constraint``) keeps the drafts it allows and has its rows masked by their paths, as the
+    one-stream engine does; a grammar that fails ends its own stream only."""
 
     def __init__(self, w, head: Head | None, *, depth: int, confidence: float, context: int = 0, keep: int = 3,
                  points=None, stop_eos: bool = True, graphs=None) -> None:
@@ -123,7 +126,7 @@ class MultiDecoder:
             if stop in s.stops:
                 self._keep(list(s.prompt[:stop]), s)
             first = None if stop < len(s.prompt) else \
-                sample_rows(_mm(normed[-1:], self.w.head), [len(s.prompt)], s.sampling)[0]
+                first_token(self.w, normed[-1:], len(s.prompt), s.sampling, s.constraint)
             if first is not None and d is not None and not (s.stops and len(s.prompt) - s.stops[-1] < MIN_GAP):
                 self._keep(list(s.prompt), s)         # a message start just before the end covers it
         finally:
@@ -151,9 +154,12 @@ class MultiDecoder:
             return done + self._alone(live[0])
         self._propose(live)
         wins = [[s.out[-1]] + s.drafts for s in live]
+        grammars = self._constrain(live, wins)
         chains = [list(range(-1, len(t) - 1)) for t in wins]
         logits, record, hidden, starts = multi_tree_forward(
             self.w, [(t, p, s.st) for t, p, s in zip(wins, chains, live)], hidden=True)
+        for k, window in grammars.items():            # a constrained stream's rows, each masked by its path
+            live[k].constraint.mask(logits[starts[k]:starts[k + 1]], window)
         positions = [[s.st.pos + 1 + i for i in range(len(t))] for s, t in zip(live, wins)]
         sampled = sample_streams(logits, starts, positions, [s.sampling for s in live])
         kept_rows = [accept(t, p, rows, s.count - len(s.out), self.eos)
@@ -162,12 +168,37 @@ class MultiDecoder:
                                                       for k, (path, _) in enumerate(kept_rows)], in_place=True)
         for k, (s, tokens, (path, end)) in enumerate(zip(live, wins, kept_rows)):
             new = [tokens[r] for r in path[1:]] + [end]
+            if s.constraint is not None and s.error is None:
+                try:
+                    s.constraint.advance(new)
+                except GrammarError as exc:
+                    s.error = exc
+            if s.error is not None:                   # its grammar failed: this request ends alone, with the error
+                s.done, s.finished = True, time.perf_counter()
+                continue
             s.committed.extend(tokens[r] for r in path)
             s.counted(len(tokens))
             if s.snap is not None:                    # the kept rows' final states, for the head to absorb next
                 s.snap.carry = Carry(hidden[starts[k] + path[0]:starts[k] + path[-1] + 1], new)
             s.take(new, self.eos)
         return done + [s for s in live if s.done]
+
+    def _constrain(self, live: list[Stream], wins: list[list[int]]) -> dict:
+        """Each constrained stream's window without the drafts its grammar rules out (a prefix of its chain), and its
+        rows' masks by position in ``live``; a grammar that fails ends its stream after the round."""
+
+        grammars = {}
+        for k, s in enumerate(live):
+            if s.constraint is None or s.error is not None:
+                continue
+            try:
+                window = s.constraint.window(wins[k], list(range(-1, len(wins[k]) - 1)))
+            except GrammarError as exc:
+                s.error = exc
+                continue
+            wins[k] = window.tokens
+            grammars[k] = window
+        return grammars
 
     def _fits(self, s: Stream) -> bool:
         """Whether a drafting stream's caches fit the graphs' buffers (else it decodes eagerly in its own)."""
@@ -183,10 +214,15 @@ class MultiDecoder:
         if self.resident is not s:
             s.st, d.cache = g.load(s.st, d.cache, min(g.capacity, len(s.prompt) + s.count + COPY_ROWS))
             self.resident = s
-        tokens, path, new, d.carry = mtp_round(s.st, d.cache, d.carry, s.out[-1], s.count - len(s.out), s.sampling,
-                                               s.context, s.copies, depth=self.depth, confidence=self.confidence,
-                                               ids=self.head.ids, verify=g.verify, step=g.draft, eos=self.eos,
-                                               in_place=True)
+        try:
+            tokens, path, new, d.carry = mtp_round(s.st, d.cache, d.carry, s.out[-1], s.count - len(s.out),
+                                                   s.sampling, s.context, s.copies, depth=self.depth,
+                                                   confidence=self.confidence, ids=self.head.ids, verify=g.verify,
+                                                   step=g.draft, eos=self.eos, in_place=True,
+                                                   constraint=s.constraint)
+        except GrammarError as exc:                   # its grammar failed: this request ends with the error
+            s.error, s.done, s.finished = exc, True, time.perf_counter()
+            return [s]
         s.committed.extend(tokens[r] for r in path)
         s.counted(len(tokens))
         s.take(new, self.eos)

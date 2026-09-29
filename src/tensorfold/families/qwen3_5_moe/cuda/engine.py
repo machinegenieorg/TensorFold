@@ -47,6 +47,8 @@ class Qwen36Engine:
     """``eos``, ``generate`` and ``context_window`` for ``tensorfold.cuda.server``; ``streams`` > 1 decodes up to
     that many requests together (``concurrent``)."""
 
+    structured_output = True     # generate takes a response_format constraint (tensorfold.cuda.grammar)
+
     def __init__(self, model_dir: Path, *, depth: int = DEPTH, confidence: float = CONFIDENCE,
                  context: int | None = None, context_explicit: bool | None = None, streams: int = 1) -> None:
         import torch
@@ -118,8 +120,9 @@ class Qwen36Engine:
         return best
 
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens: Callable[[list[int]], bool | None],
-                 draft: bool = True) -> dict[str, Any]:
-        """``draft=False``: serial decoding from a fresh prefill, no drafts and no kept states (the reference)."""
+                 draft: bool = True, constraint=None) -> dict[str, Any]:
+        """``draft=False``: serial decoding from a fresh prefill, no drafts and no kept states (the reference).
+        ``constraint``: the reply's grammar, which masks every row where a token is chosen and follows the chosen."""
 
         from tensorfold.families.qwen3_5.cuda.decode import draft_decode, prefill as serial_prefill
 
@@ -132,15 +135,15 @@ class Qwen36Engine:
                              "shorten the prompt or reserve fewer reply tokens")
         max_tokens = max(1, min(int(max_tokens), self.context_window - len(prompt)))
         if self.scheduler is not None:
-            return self.scheduler.submit(list(prompt), max_tokens, sampling, draft, on_tokens)
+            return self.scheduler.submit(list(prompt), max_tokens, sampling, draft, on_tokens, constraint=constraint)
         t0 = time.perf_counter()
         if not draft or self.head is None:
-            st, first = serial_prefill(self.w, prompt, sampling)
+            st, first = serial_prefill(self.w, prompt, sampling, constraint=constraint)
             stats: dict[str, Any] = {"prefill_s": round(time.perf_counter() - t0, 4), "cached": 0, "drafts": False}
             if on_tokens([first]) or first in self.eos or max_tokens <= 1:
                 return stats
             res = draft_decode(self.w, st, prompt, first, max_tokens, sampling, None, allow_copy=False,
-                               on_tokens=on_tokens)
+                               on_tokens=on_tokens, constraint=constraint)
             stats.update(decode_s=round(res.seconds, 4), rounds=res.rounds, min_rows=min(res.widths, default=0))
             return stats
         hit = self._resume(prompt)
@@ -149,7 +152,8 @@ class Qwen36Engine:
         keep = lambda p, st, mc, held: self.cache.add(list(prompt[:p]), st, (mc, held))       # noqa: E731
         st, mc, first, carry = prefill(self.w, self.head, prompt, sampling,
                                        state=hit[1] if hit else None, cache=hit[2][0] if hit else None,
-                                       held=hit[2][1] if hit else None, stops=stops, keep=keep)
+                                       held=hit[2][1] if hit else None, stops=stops, keep=keep,
+                                       constraint=constraint)
         if not (stops and len(prompt) - stops[-1] < MIN_GAP):
             self.cache.add(list(prompt), st, (mc.view(), carry.states))
         stats = {"prefill_s": round(time.perf_counter() - t0, 4), "cached": len(hit[0]) if hit else 0,
@@ -158,7 +162,7 @@ class Qwen36Engine:
             return stats
         res = mtp_decode(self.w, self.head, st, mc, carry, first, max_tokens, sampling, depth=self.depth,
                          confidence=self.confidence, on_tokens=on_tokens, prompt=prompt,
-                         runner=self.graphs)
+                         runner=self.graphs, constraint=constraint)
         stats.update(decode_s=round(res.seconds, 4), rounds=res.rounds, drafted=res.drafted, accepted=res.accepted,
                      min_rows=min(res.widths, default=0))
         return stats
