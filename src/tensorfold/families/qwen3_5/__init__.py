@@ -11,9 +11,10 @@ from typing import Any
 MODEL_TYPES = ("qwen3_5",)
 TITLE = "Qwen3.8 dense"
 LANES = True
-MODELS = ("Vontra/Qwen3.8-27B-MLX-4bit", "turboderp/Qwen3.8-27B-exl3", "nvidia/Qwen3.8-27B-NVFP4")
+MODELS = ("Vontra/Qwen3.8-27B-MLX-4bit", "turboderp/Qwen3.8-27B-exl3", "nvidia/Qwen3.8-27B-NVFP4", "Qwen/Qwen3.5-4B")
 DRAFTER = "z-lab/Qwen3.8-27B-DFlash2"
-QUANT_METHODS = {"cuda": ("mlx", "exl3", "modelopt", "compressed-tensors")}   # MLX affine, EXL3, NVFP4 / FP8
+# MLX affine, EXL3, NVFP4 / FP8, or (CUDA only) a plain bf16/fp16/fp32 checkpoint read at its stored precision
+QUANT_METHODS = {"cuda": ("mlx", "exl3", "modelopt", "compressed-tensors", None)}
 EXL3_VARIANT = "any"                           # every EXL3 codebook and width (tensorfold.families.EXL3_VARIANT_ANY)
 KERNEL_PACKAGE = "tensorfold.kernels.qwen.dense.v1"
 KERNEL_VERSION = "v1"
