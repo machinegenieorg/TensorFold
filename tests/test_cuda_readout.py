@@ -12,9 +12,11 @@ VALID = {
 }
 
 
-def test_is_score_request_keys_on_allowed_token_ids():
+def test_is_score_request_keys_on_return_tokens_as_token_ids():
     assert is_score_request(VALID)
+    assert is_score_request({k: v for k, v in VALID.items() if k != "allowed_token_ids"})  # the no-options fallback
     assert not is_score_request({"model": "x", "prompt": "hi"})
+    assert not is_score_request({**VALID, "return_tokens_as_token_ids": False})
     assert not is_score_request("not a dict")
 
 
@@ -64,6 +66,16 @@ def test_return_tokens_as_token_ids_must_be_true(value):
 def test_allowed_token_ids_must_be_a_nonempty_list_of_distinct_ints(value):
     with pytest.raises(ScoreError, match="allowed_token_ids"):
         parse_score_request({**VALID, "allowed_token_ids": value})
+
+
+def test_missing_allowed_token_ids_is_the_no_options_fallback():
+    """A readout whose options tokenize to nothing sends the request without allowed_token_ids at all."""
+
+    body = {**VALID, "logprobs": 20}
+    del body["allowed_token_ids"]
+    parsed = parse_score_request(body)
+    assert parsed.allowed_token_ids is None
+    assert parsed.num_logprobs == 20
 
 
 @pytest.mark.parametrize("value", [0, 65, -1, 1.5, True, "3"])
@@ -159,3 +171,17 @@ def test_rank_allowed_matches_manual_masked_log_softmax():
     assert got[2] == pytest.approx(expect[1].item(), abs=1e-6)
     assert got[4] == pytest.approx(expect[2].item(), abs=1e-6)
     assert chosen == 2
+
+
+def test_rank_allowed_none_is_unrestricted_top_k_over_the_vocab():
+    """The wrapper's no-options fallback: no masking, ranked over the whole vocabulary's top ``num_logprobs``."""
+
+    torch = pytest.importorskip("torch")
+    from tensorfold.cuda.readout import rank_allowed
+
+    logits = torch.tensor([[1.0, 5.0, 2.0, -3.0, 0.5]])
+    chosen, ranked = rank_allowed(logits, None, num_logprobs=3)
+    expect = logits[0].log_softmax(dim=-1)
+    assert chosen == 1                                  # argmax of the raw (unmasked) logits
+    assert [tid for tid, _ in ranked] == [1, 2, 0]       # top 3 by logprob, descending
+    assert ranked[0][1] == pytest.approx(expect[1].item(), abs=1e-6)

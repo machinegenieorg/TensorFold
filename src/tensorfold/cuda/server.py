@@ -422,7 +422,7 @@ class App:
                 logits = self.engine.score(prepared.prompt)
             except ValueError as exc:
                 raise RequestError(str(exc)) from exc
-        chosen, ranked = rank_allowed(logits, prepared.allowed_token_ids)
+        chosen, ranked = rank_allowed(logits, prepared.allowed_token_ids, prepared.num_logprobs)
         return build_choice(chosen, ranked, prepared.num_logprobs)
 
     def _call_gate(self, prompt: list[int], tools: list[dict[str, Any]]) -> CallGate:

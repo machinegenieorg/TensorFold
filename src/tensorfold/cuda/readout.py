@@ -1,8 +1,10 @@
 """The readout wrapper's scoring contract: token-id prompts, an allowed set, one forward, vLLM-shaped logprobs.
 
-The wrapper sends exactly one request shape to ``POST /v1/completions``: a token-id ``prompt``, ``max_tokens: 1``,
-``temperature: 0``, ``return_tokens_as_token_ids: true``, an integer ``logprobs`` and ``allowed_token_ids``. Anything
-outside that contract is refused (400) rather than guessed at.
+The wrapper (``readout/readout_server.py``'s ``_backend_logp``) sends one request shape to ``POST
+/v1/completions``: a token-id ``prompt``, ``max_tokens: 1``, ``temperature: 0``, ``return_tokens_as_token_ids:
+true``, an integer ``logprobs``, and ``allowed_token_ids`` — except when a readout's options tokenize to no
+first-token ids at all, in which case it sends the same request without ``allowed_token_ids`` (unrestricted,
+``logprobs: 20``) instead. Anything outside those two shapes is refused (400) rather than guessed at.
 
 vLLM's ``--logprobs-mode processed_logprobs`` at ``temperature: 0`` (v0.25.1, ``vllm/v1/sample/sampler.py``):
 ``Sampler.apply_logits_processors`` masks every id outside ``allowed_token_ids`` to ``-inf`` on the raw logits
@@ -33,14 +35,14 @@ class ScoreError(ValueError):
 @dataclass(slots=True)
 class ScoreRequest:
     prompt: list[int]
-    allowed_token_ids: list[int]
+    allowed_token_ids: list[int] | None    # None: the wrapper's no-options fallback, unrestricted over the vocab
     num_logprobs: int
 
 
 def is_score_request(body: Any) -> bool:
-    """Only the readout wrapper sends ``allowed_token_ids``; every other completion is served as before."""
+    """Only the readout wrapper sends this flag; every other completion is served as before."""
 
-    return isinstance(body, dict) and "allowed_token_ids" in body
+    return isinstance(body, dict) and body.get("return_tokens_as_token_ids") is True
 
 
 def _int_list(value: Any, name: str, *, vocab: int | None) -> list[int]:
@@ -71,15 +73,17 @@ def parse_score_request(body: dict[str, Any], *, vocab: int | None = None) -> Sc
         raise ScoreError('scoring requires "temperature": 0')
     if body.get("return_tokens_as_token_ids") is not True:
         raise ScoreError('scoring requires "return_tokens_as_token_ids": true')
-    allowed = _int_list(body.get("allowed_token_ids"), "allowed_token_ids", vocab=vocab)
-    if len(set(allowed)) != len(allowed):
-        raise ScoreError('"allowed_token_ids" must not repeat a token id')
+    allowed = None
+    if "allowed_token_ids" in body:
+        allowed = _int_list(body.get("allowed_token_ids"), "allowed_token_ids", vocab=vocab)
+        if len(set(allowed)) != len(allowed):
+            raise ScoreError('"allowed_token_ids" must not repeat a token id')
     logprobs = body.get("logprobs")
     if isinstance(logprobs, bool) or not isinstance(logprobs, int):
         raise ScoreError(f'"logprobs" must be an integer between 1 and {MAX_LOGPROBS}')
     if not 1 <= logprobs <= MAX_LOGPROBS:
         raise ScoreError(f'"logprobs" must be between 1 and {MAX_LOGPROBS}')
-    if logprobs < min(len(allowed), MAX_LOGPROBS):
+    if allowed is not None and logprobs < min(len(allowed), MAX_LOGPROBS):
         raise ScoreError('"logprobs" must cover at least min(len(allowed_token_ids), 64) entries')
     return ScoreRequest(prompt=prompt, allowed_token_ids=allowed, num_logprobs=logprobs)
 
@@ -90,21 +94,29 @@ def token_id_key(token_id: int) -> str:
     return f"token_id:{token_id}"
 
 
-def rank_allowed(logits, allowed_token_ids: list[int]) -> tuple[int, list[tuple[int, float]]]:
+def rank_allowed(logits, allowed_token_ids: list[int] | None,
+                 num_logprobs: int = MAX_LOGPROBS) -> tuple[int, list[tuple[int, float]]]:
     """Mask to the allowed set and log-softmax the raw logits (vLLM's ``processed_logprobs`` at temperature 0).
 
     ``logits`` is a ``(1, vocab)`` float tensor. Returns the argmax id and every allowed id's logprob, sorted by
-    logprob descending (vLLM's ``top_logprobs`` order).
+    logprob descending (vLLM's ``top_logprobs`` order). ``allowed_token_ids=None`` (the wrapper's no-options
+    fallback): no masking, ranked over the whole vocabulary's top ``num_logprobs`` instead.
     """
 
     import torch
 
     if logits.dim() != 2 or logits.shape[0] != 1:
         raise ValueError("rank_allowed takes one row of vocab-wide logits")
+    row = logits[0].float()
+    if allowed_token_ids is None:
+        logprobs = row.log_softmax(dim=-1)
+        values, idx = logprobs.topk(min(num_logprobs, logprobs.shape[-1]))
+        ranked = list(zip((int(t) for t in idx.tolist()), values.tolist()))
+        return int(row.argmax()), ranked
     idx = torch.tensor(allowed_token_ids, device=logits.device, dtype=torch.long)
     mask = torch.ones(logits.shape[-1], dtype=torch.bool, device=logits.device)
     mask[idx] = False
-    masked = logits[0].float().masked_fill(mask, float("-inf"))
+    masked = row.masked_fill(mask, float("-inf"))
     logprobs = masked.log_softmax(dim=-1)
     values = logprobs[idx].tolist()
     ranked = sorted(zip(allowed_token_ids, values), key=lambda kv: -kv[1])
