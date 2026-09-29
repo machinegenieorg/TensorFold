@@ -364,6 +364,19 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     print(f"[tensorfold] loading {served}: {family.title} ({family.model_type}) on CUDA{where}", flush=True)
     engine = family.package.cuda_engine(model_dir, **options)
     stacks.arm()            # its warmup may have loaded a compiler that took USR1
+    if hasattr(engine, "score") and getattr(engine, "vocab_size", 0) and args.tp != 2:
+        # compile the scoring path's kernels now, at a realistic prompt length, instead of on a live request:
+        # a lazily-JIT-compiled kernel can take longer than a caller's own request timeout (readout/backend_parity.py
+        # uses 10s), which reads as a spurious error on the first requests after startup, not a real failure.
+        import random
+
+        width = min(4096, max(2, engine.context_window - 1))
+        warm_prompt = [random.Random(0).randrange(1, engine.vocab_size) for _ in range(width)]
+        try:
+            engine.score(warm_prompt)
+        except Exception as exc:        # noqa: BLE001 - warm-up must never block serving; a real request re-raises
+            print(f"[tensorfold] scoring warm-up failed ({exc}); the first live request will compile instead",
+                  flush=True)
     if args.tp == 2 and args.rank == 1:
         print(f"[tensorfold] rank 1 ready in {time.perf_counter() - started:.1f}s, following rank 0", flush=True)
         engine.follow()
