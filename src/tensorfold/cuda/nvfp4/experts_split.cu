@@ -1,6 +1,7 @@
 // NVFP4 grouped experts with K split in slices: the MLX experts kernel's decode form (experts.cu) on NVIDIA's FP4
-// format, and a prompt form (K in one slice, four row tiles a warp). A proposed alternative to experts.cu for few rows
-// a call: measured on an RTX PRO 6000 Max-Q with Qwen3.6's experts, see experts_split.py.
+// format, and its prompt form (experts_prefill.cu: K in one slice, an item's rows and weights staged in shared
+// memory). A proposed alternative to experts.cu: measured on an RTX PRO 6000 Max-Q and a GB10 with Qwen3.6's
+// experts, see experts_split.py.
 //
 // A table keeps the checkpoint's E2M1 nibbles in the MLX experts' fragment order (experts.pack; the two formats pack
 // nibbles alike) and, where an MLX group keeps its scales and biases, the 64-input group's e4m3 block scales: one
@@ -269,6 +270,153 @@ __global__ void __launch_bounds__(UPB * SK * 32)
   }
 }
 
+// The prompt form: a CTA takes an item's pairs (WM warps down, RT row tiles each) against WN column blocks, every
+// 64-input group of their rows and weights brought to shared memory once (cp.async, STAGES deep) and read by all its
+// warps: the MLX experts' prefill kernel (experts_prefill.cu) on NVIDIA's FP4. Each (pair, column) is one fp32 mma
+// chain over K in order, the decode form's fragments in one slice. On a GB10 it takes a 4,096-row chunk's experts in
+// 382 ms where one warp a unit (four row tiles, no staging) took 465; on an RTX PRO 6000 Max-Q, 74 ms against 71.
+template <int M, int RT, int WM, int WN>
+struct Staged {
+  static constexpr int THREADS = WM * WN * 32, BM = 16 * RT * WM, XC = GS / 8, WB = M * G::BLOCK;
+  static constexpr int XU = BM * XC, SU = XU + WN * WB;          // uint4 a stage: the rows' group, the weight blocks
+  static constexpr int XPT = (XU + THREADS - 1) / THREADS;
+  static constexpr int STAGE_BYTES = SU * 16;
+  static constexpr int STAGES = STAGE_BYTES * 4 <= 49152 ? 4 : STAGE_BYTES * 3 <= 49152 ? 3 : 2;
+  static __device__ __forceinline__ int xslot(int r, int c) { return r * XC + (c ^ (r & 1)); }
+};
+
+template <int M, int EPI, int RT, int WM, int WN>
+__global__ void __launch_bounds__(WM * WN * 32)
+    fp4_prefill_kernel(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
+                       const float* __restrict__ S2, int KG, int NB, const int* __restrict__ items,
+                       const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out,
+                       int N) {
+  using P = Staged<M, RT, WM, WN>;
+  constexpr int STAGES = P::STAGES;
+  extern __shared__ uint4 sm[];
+  const int nbt = (NB + WN - 1) / WN, it = blockIdx.x / nbt, cbt = blockIdx.x - it * nbt;
+  if (it >= __ldg(counts)) return;
+  const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wm = warp / WN, wn = warp - wm * WN;
+  const int t = lane & 3, gq = lane >> 2, cb = cbt * WN + wn, cbs = min(WN, NB - cbt * WN);
+  const __nv_bfloat16* xsrc[P::XPT];
+  int xdst[P::XPT];
+#pragma unroll
+  for (int i = 0; i < P::XPT; ++i) {
+    const int q = tid + i * P::THREADS, r = q / P::XC, c = q - r * P::XC;
+    xdst[i] = P::xslot(r, c);
+    xsrc[i] = nullptr;
+    if (q < P::XU && r < cnt) {
+      const int p = __ldg(members + first + r);
+      xsrc[i] = X + (size_t)(slots ? p / slots : p) * x_stride + 8 * c;
+    }
+  }
+  const uint4* wsrc = W + ((size_t)e * NB + cbt * WN) * (size_t)KG * P::WB;
+  auto stage = [&](int s, int g) {
+    uint4* xs = sm + s * P::SU;
+#pragma unroll
+    for (int i = 0; i < P::XPT; ++i)
+      if (xsrc[i]) cp16(xs + xdst[i], xsrc[i] + (size_t)g * GS);
+    uint4* ws = xs + P::XU;
+    for (int q = tid; q < cbs * P::WB; q += P::THREADS) {
+      const int j = q / P::WB, o = q - j * P::WB;
+      cp16(ws + q, wsrc + ((size_t)j * KG + g) * P::WB + o);
+    }
+  };
+  const int base = 16 * RT * wm;
+  const int nt = max(0, min(RT, (cnt - base + 15) >> 4));
+  const bool active = nt > 0 && cb < NB;
+  float acc[M][RT][NTW][4];
+#pragma unroll
+  for (int m = 0; m < M; ++m)
+#pragma unroll
+    for (int r = 0; r < RT; ++r)
+#pragma unroll
+      for (int j = 0; j < NTW; ++j) acc[m][r][j][0] = acc[m][r][j][1] = acc[m][r][j][2] = acc[m][r][j][3] = 0.f;
+#pragma unroll
+  for (int s = 0; s < STAGES - 1; ++s) {
+    if (s < KG) stage(s, s);
+    cp_commit();
+  }
+  for (int g = 0; g < KG; ++g) {
+    cp_wait<STAGES - 2>();
+    __syncthreads();
+    if (g + STAGES - 1 < KG) stage((g + STAGES - 1) % STAGES, g + STAGES - 1);
+    cp_commit();
+    if (!active) continue;
+    const uint4* xs = sm + (g % STAGES) * P::SU;
+    const uint4* ws = xs + P::XU + wn * P::WB;
+    uint4 wv[M][G::WV];
+    uint32_t sp[M][NTW];
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+#pragma unroll
+      for (int c = 0; c < G::WV; ++c) wv[m][c] = ws[m * G::BLOCK + c * 32 + lane];
+      const uint32_t sw = reinterpret_cast<const uint32_t*>(ws + m * G::BLOCK + SCALES)[lane];
+#pragma unroll
+      for (int j = 0; j < NTW; ++j) sp[m][j] = scale_pair(sw, j);
+    }
+#pragma unroll
+    for (int kk = 0; kk < G::XV; ++kk) {
+      uint4 xa[RT], xb[RT];
+#pragma unroll
+      for (int r = 0; r < RT; ++r) {
+        if (r >= nt) break;
+        const int r0 = base + 16 * r + gq;
+        xa[r] = xs[P::xslot(r0, t * G::XV + kk)];
+        xb[r] = xs[P::xslot(r0 + 8, t * G::XV + kk)];
+      }
+#pragma unroll
+      for (int m = 0; m < M; ++m)
+#pragma unroll
+        for (int j = 0; j < NTW; ++j) {
+          const int wi = j * (GS / 32) + kk;
+          const uint32_t word = comp(wv[m][wi >> 2], wi & 3);
+#pragma unroll
+          for (int h = 0; h < 2; ++h) {        // k-step 2 kk + h, the one-warp form's order
+            const uint32_t b0 = bmul(fp4x2(word, 8 * h), sp[m][j]), b1 = bmul(fp4x2(word, 8 * h + 4), sp[m][j]);
+#pragma unroll
+            for (int r = 0; r < RT; ++r) {
+              if (r >= nt) break;
+              mma(acc[m][r][j], comp(xa[r], 2 * h), comp(xb[r], 2 * h), comp(xa[r], 2 * h + 1),
+                  comp(xb[r], 2 * h + 1), b0, b1);
+            }
+          }
+        }
+    }
+  }
+  if (!active) return;
+#pragma unroll
+  for (int r = 0; r < RT; ++r) {
+    if (r >= nt) break;
+    const int m0 = base + 16 * r + gq, m1 = m0 + 8;
+    const bool v0 = m0 < cnt, v1 = m1 < cnt;
+    const int p0 = v0 ? __ldg(members + first + m0) : 0, p1 = v1 ? __ldg(members + first + m1) : 0;
+    store<M, EPI, RT>(acc, r, S2 + (size_t)e * M, out, N, cb * COLS + 2 * t, p0, p1, v0, v1);
+  }
+}
+
+template <int M, int EPI, int RT, int WM, int WN>
+void launch_prefill(const at::Tensor& x, int x_stride, int slots, const at::Tensor& w, const at::Tensor& s2, int kg,
+                    int nb, const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members,
+                    at::Tensor& out, int n, int64_t max_items) {
+  using P = Staged<M, RT, WM, WN>;
+  constexpr int SMEM = P::STAGES * P::STAGE_BYTES;
+  auto* kern = fp4_prefill_kernel<M, EPI, RT, WM, WN>;
+  static bool ready = false;
+  if (!ready) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
+    ready = true;
+  }
+  const int64_t grid = max_items * ((nb + WN - 1) / WN);
+  if (grid < 1) return;
+  kern<<<static_cast<unsigned>(grid), P::THREADS, SMEM, at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), x_stride, slots,
+      reinterpret_cast<const uint4*>(w.data_ptr()), s2.data_ptr<float>(), kg, nb, items.data_ptr<int>(),
+      counts.data_ptr<int>(), members.data_ptr<int>(), out.data_ptr(), n);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 template <int M, int EPI, int SK, int UPB, int D, int RT>
 void launch(const at::Tensor& x, int x_stride, int slots, const at::Tensor& w, const at::Tensor& s2, int kg, int nb,
             int rg, const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor& out,
@@ -293,6 +441,21 @@ void launch(const at::Tensor& x, int x_stride, int slots, const at::Tensor& w, c
 
 }  // namespace
 
+void nvfp4_prefill_experts_cuda(int64_t m, int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots,
+                                const at::Tensor& w, const at::Tensor& s2, int64_t kg, int64_t nb,
+                                const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members,
+                                at::Tensor& out, int64_t n, int64_t max_items) {
+  const c10::cuda::CUDAGuard guard(x.device());
+  const int xs = static_cast<int>(x_stride), sl = static_cast<int>(slots), k = static_cast<int>(kg);
+  const int b = static_cast<int>(nb), nn = static_cast<int>(n);
+  // 8 warps a CTA, 64 pairs x 128 columns: two row tiles a warp, two warps down, four across
+  if (m == 2 && epi == 2) return launch_prefill<2, 2, 2, 2, 4>(x, xs, sl, w, s2, k, b, items, counts, members, out, nn,
+                                                               max_items);
+  if (m == 1 && epi == 3) return launch_prefill<1, 3, 2, 2, 4>(x, xs, sl, w, s2, k, b, items, counts, members, out, nn,
+                                                               max_items);
+  TORCH_CHECK(false, "nvfp4 experts: no staged prompt kernel for ", m, " matrices, epilogue ", epi);
+}
+
 void nvfp4_split_experts_cuda(int64_t m, int64_t epi, int64_t sk, int64_t upb, int64_t d, int64_t rt,
                         const at::Tensor& x, int64_t x_stride, int64_t slots, const at::Tensor& w,
                         const at::Tensor& s2, int64_t kg, int64_t nb, int64_t rg, const at::Tensor& items,
@@ -311,8 +474,6 @@ void nvfp4_split_experts_cuda(int64_t m, int64_t epi, int64_t sk, int64_t upb, i
 #define TF_DECODE(M_, EPI_, UPB_, D_) \
   TF_FP4(M_, EPI_, 1, UPB_, D_, 1) TF_FP4(M_, EPI_, 2, UPB_, D_, 1) TF_FP4(M_, EPI_, 4, UPB_, D_, 1)
   TF_DECODE(2, 2, 1, 4) TF_DECODE(2, 2, 1, 2) TF_DECODE(2, 2, 2, 2) TF_DECODE(1, 0, 2, 2) TF_DECODE(1, 0, 4, 2)
-  // prompt form: K in one slice, four row tiles a warp (a decoded fragment feeds 64 rows), one register stage
-  TF_FP4(2, 2, 1, 2, 1, 4) TF_FP4(1, 3, 1, 2, 1, 4)
 #undef TF_DECODE
 #undef TF_FP4
   TORCH_CHECK(false, "nvfp4 experts: no kernel for ", m, " matrices, epilogue ", epi, ", ", sk, " slices, ", upb,
