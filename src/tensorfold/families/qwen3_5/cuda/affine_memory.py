@@ -18,7 +18,7 @@ def weight_transform(model_dir):
         return json.loads((path / "config.json").read_text()), headers(path)
 
     def transform(name, info):
-        if name.startswith("vision_tower") or ".mtp." in name or name.startswith("mtp."):
+        if name.startswith(("vision_tower", "model.visual.")) or ".mtp." in name or name.startswith("mtp."):
             return 0, 0
         if info["dtype"] not in ("U32", "I32") or not name.endswith(".weight"):
             return linear_weights(name, info)
