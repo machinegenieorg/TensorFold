@@ -35,7 +35,8 @@ def build_parser() -> argparse.ArgumentParser:
     endpoint.add_argument("--host", default="127.0.0.1", help="address to listen on (0.0.0.0: every interface)")
     endpoint.add_argument("--port", type=int, default=8080)
     endpoint.add_argument("--name", default="", help="model id clients ask for (default: the model's name)")
-    endpoint.add_argument("--alias", action="append", default=[], help="another model id to answer to (repeatable)")
+    endpoint.add_argument("--alias", action="append", default=[],
+                          help="another model id to answer to (repeatable)")
     endpoint.add_argument("--vision", action="store_true", help="enable image input for Qwen3.5/3.8 dense vision checkpoints")
     endpoint.add_argument("--vision-urls", action="store_true",
                           help="with --vision, accept public HTTP(S) image URLs (default: data URLs only)")

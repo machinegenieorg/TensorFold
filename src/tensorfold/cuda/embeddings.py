@@ -181,9 +181,10 @@ class _Job:
 class EmbedQueue:
     """One worker thread runs the engine; each step takes waiting texts by (priority, arrival) up to a token budget.
 
-    A lower ``priority`` number goes first, as in vLLM's priority scheduling: a waiting query enters the next step
-    ahead of the rest of a bulk request, so it waits for one step, not for the whole bulk batch. Requests of equal
-    priority are served in arrival order, and small ones share steps. A text longer than the budget runs alone.
+    A lower ``priority`` number goes first, as in vLLM's priority scheduling: a waiting query gets the next step to
+    itself (with any other waiting texts of its priority), so it waits for the step in flight, not for the whole
+    bulk batch. Requests of equal priority are served in arrival order and share steps. A text longer than the
+    budget runs alone.
     """
 
     def __init__(self, engine: Any, budget: int, *, poll: float = 0.05):
@@ -211,11 +212,15 @@ class EmbedQueue:
         return job.rows
 
     def _take(self) -> list[tuple[_Job, int]]:
-        """The next step: waiting texts in (priority, arrival) order while they fit the budget (always one)."""
+        """The next step: the most urgent priority's waiting texts in arrival order while they fit the budget (always
+        one). Texts of a later priority never fill it, so an urgent step is only as long as its own texts."""
 
         self.jobs = [j for j in self.jobs if not j.cancelled and j.taken < len(j.texts)]
         step, used = [], 0
-        for job in sorted(self.jobs, key=lambda j: (j.priority, j.seq)):
+        waiting = sorted(self.jobs, key=lambda j: (j.priority, j.seq))
+        for job in waiting:
+            if job.priority != waiting[0].priority:
+                break
             while job.taken < len(job.texts):
                 n = len(job.texts[job.taken])
                 if step and used + n > self.budget:

@@ -74,7 +74,7 @@ def attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, p0:
 @triton.jit
 def _attend_texts(Q, K, V, OUT, BLOCKS, H: tl.constexpr, HK: tl.constexpr, D: tl.constexpr, BM: tl.constexpr,
                   BN: tl.constexpr, SCALE: tl.constexpr):
-    """``_attend`` for one 64-row block of one text: (first row, length, block's first position) from ``BLOCKS``."""
+    """``_attend`` for one block of one text's rows: (first row, length, block's first position) from ``BLOCKS``."""
 
     block = tl.program_id(0)
     head = tl.program_id(1)
@@ -106,14 +106,17 @@ def _attend_texts(Q, K, V, OUT, BLOCKS, H: tl.constexpr, HK: tl.constexpr, D: tl
     tl.store(OUT + ((start + pos)[:, None] * H + head) * D + d[None, :], out.to(tl.bfloat16), mask=ok[:, None])
 
 
+TEXT_BM = 128          # query rows a text-attention block (the keys stay in ``BN`` tiles from the text's start)
+
+
 def text_blocks(lengths, device) -> torch.Tensor:
-    """(blocks, 3) int32: each text's first row, its length and a block's first position, in ``BM``-row blocks."""
+    """(blocks, 3) int32: each text's first row, its length and a block's first position, in ``TEXT_BM``-row blocks."""
 
     rows, start = [], 0
     for n in lengths:
         if n < 1:
             raise ValueError("every text needs at least one token")
-        rows.extend((start, n, first) for first in range(0, n, BM))
+        rows.extend((start, n, first) for first in range(0, n, TEXT_BM))
         start += n
     return torch.tensor(rows, dtype=torch.int32).to(device, non_blocking=True)
 
@@ -122,8 +125,9 @@ def attention_texts(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, blocks: t
                     scale: float) -> torch.Tensor:
     """Causal attention within each text of a packed batch: q (T, H, D), k and v (T, HK, D) bf16, texts back to back.
 
-    A row reads only its own text's keys, in the tiles ``attention`` gives that text alone from position 0, so its
-    bits never depend on the other texts, their lengths or their order.
+    A row reads only its own text's keys, in 64-key tiles from the text's start, in blocks of ``TEXT_BM`` rows from
+    that start, so its bits never depend on the other texts, their lengths or their order. (``attention``'s 64-row
+    blocks sum a row's softmax weights in another order, so its bits for the same text differ slightly.)
     """
 
     t, h, d = q.shape
@@ -133,6 +137,6 @@ def attention_texts(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, blocks: t
     if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous() and blocks.is_contiguous()):
         raise ValueError("text attention takes contiguous tensors")
     out = torch.empty_like(q)
-    _attend_texts[(blocks.shape[0], h)](q, k, v, out, blocks, H=h, HK=hk, D=d, BM=BM, BN=BN, SCALE=scale,
+    _attend_texts[(blocks.shape[0], h)](q, k, v, out, blocks, H=h, HK=hk, D=d, BM=TEXT_BM, BN=BN, SCALE=scale,
                                         num_warps=8, num_stages=1 if d > 128 else 2)
     return out

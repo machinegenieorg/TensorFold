@@ -75,7 +75,7 @@ class Qwen3EmbedEngine:
         self.torch.cuda.synchronize()
 
     def embed(self, texts: Sequence[Sequence[int]]):
-        """(len(texts), hidden) fp32 numpy rows: each text's last token after the final norm, bits independent of the batch."""
+        """(len(texts), hidden) fp32 numpy rows: each text's last token after the final norm, whatever the batch."""
 
         from .forward import embed
 

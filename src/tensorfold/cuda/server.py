@@ -468,8 +468,8 @@ def make_handler(app: App):
 
         def do_GET(self):
             if self.path.rstrip("/") in ("/v1/models", "/models"):
-                self._json(200, {"object": "list", "data": [{"id": model_id, "object": "model", "owned_by": "tensorfold"}
-                                                            for model_id in app.model_ids]})
+                models = [{"id": model_id, "object": "model", "owned_by": "tensorfold"} for model_id in app.model_ids]
+                self._json(200, {"object": "list", "data": models})
             elif self.path.rstrip("/") in ("/health", "/v1/health"):
                 self._json(200, {"ok": True})
             else:
