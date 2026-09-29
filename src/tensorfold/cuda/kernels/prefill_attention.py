@@ -106,7 +106,10 @@ def _attend_texts(Q, K, V, OUT, BLOCKS, H: tl.constexpr, HK: tl.constexpr, D: tl
     tl.store(OUT + ((start + pos)[:, None] * H + head) * D + d[None, :], out.to(tl.bfloat16), mask=ok[:, None])
 
 
-TEXT_BM = 128          # query rows a text-attention block (the keys stay in ``BN`` tiles from the text's start)
+TEXT_BM = 64           # query rows a text-attention block (the keys stay in ``BN`` tiles from the text's start);
+# matches ``_attend``'s own BM: at D=256 (Qwen3.5-4B's head_dim, past the embed lane's own models) 128 rows'
+# Q/K/V tiles overflow this GPU's shared memory ("out of resource: shared memory, Required: 114688, Hardware
+# limit: 101376"); 64 works at every D in (64, 128, 256) this kernel claims to support.
 
 
 def text_blocks(lengths, device) -> torch.Tensor:
