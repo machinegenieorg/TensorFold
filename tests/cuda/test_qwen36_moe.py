@@ -945,3 +945,41 @@ def test_a_constrained_stream_grows_the_graph_buffers_past_8192_rows(monkeypatch
     assert any(bucket > BUCKET for _, bucket in runner.target) and any(bucket > BUCKET for _, bucket in runner.mtp)
     for s in (short, grown, joined, last):
         assert s.error is None and s.out == refs[tuple(s.prompt)], s.prompt
+
+
+@pytest.mark.parametrize("sampling", [None, Sampling(1234, 1.0, 20, 0.95)])
+def test_a_constrained_prompt_filled_between_rounds_beside_a_stream_past_its_end_tokens(sampling):
+    """A constrained prompt of over two fill steps prefills STEP rows at a time between the decoding streams' rounds
+    and chooses its first token under its grammar at the last step; beside it a constrained stream decodes and a plain
+    one ignores end tokens (stop_eos=False). Each emits its serial tokens."""
+
+    w, head = _model()
+    st, first = serial_prefill(w, PROMPTS[0], SAMPLED[1])
+    free = draft_decode(w, st, PROMPTS[0], first, 96, SAMPLED[1], None, allow_copy=False, stop_eos=False).tokens
+    w.config.eos = (0, free[5])                          # the grammar's stop token, and an end token in the plain reply
+    long = [3 + (i * 7) % 200 for i in range(2 * multi.STEP + 300)]
+    refs = {"short": _cserial(w, PROMPTS[1], sampling, 32, "object"),
+            "long": _cserial(w, long, sampling, 24, "object")}
+    dec = MultiDecoder(w, head, depth=3, confidence=0.3)
+    short = Stream(PROMPTS[1], 32, sampling, constraint=_grammar("object"))
+    plain = Stream(PROMPTS[0], 96, SAMPLED[1], stop_eos=False)
+    for s in (short, plain):
+        dec.admit(s)
+    while len(short.out) < 2 or len(plain.out) < 2:
+        dec.finish(dec.round())
+    late = Stream(long, 24, sampling, constraint=_grammar("object"))
+    dec.admit(late)
+    fills = 0
+    while any(x is late for x in dec.filling):
+        before = len(plain.out)
+        dec.finish(dec.round())
+        fills += 1
+        assert plain.done or len(plain.out) > before           # the others decode while the long prompt fills
+    assert fills >= 3
+    _drain(dec)
+    assert plain.out == free and len(free) == 96
+    assert short.error is None and short.out == refs["short"]
+    assert late.error is None and late.out == refs["long"]
+    for s in (short, late):
+        if s.out[-1] == 0:
+            assert _follows("object", s.out)
