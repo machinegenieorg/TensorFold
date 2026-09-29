@@ -118,6 +118,34 @@ def test_the_checkpoint_loads_as_it_ships(checkpoint):
     assert isinstance(m.moe.experts, MoE4) and not m.moe.experts.gate_up.packed
 
 
+def test_the_shared_experts_buffers_stay_bounded(checkpoint):
+    """Prompt chunks of every length and rounds of every width share one pool of shared-expert buffers: each row gets
+    the bits Flash Next's per-count buffers give it, and the pool stops growing once each power of two has come."""
+
+    from tensorfold.cuda import moe
+    from tensorfold.cuda.moe import Routed
+    from tensorfold.families.qwen3_5_moe.cuda.weights import load
+
+    w = load(checkpoint)
+    m = w.layers[0].moe
+    assert isinstance(m.experts, modelopt.PooledMoE4)
+    plain = Routed(m.router, MoE4(m.experts.gate_up, m.experts.down_proj, m.experts.shared), m.top_k)
+    x = torch.randn((600, 256), device="cuda").bfloat16()
+    for prefill in (False, True):
+        for rows in (1, 3, 16, 17, 100, 129, 600):
+            assert torch.equal(moe.run(x[:rows], m, prefill=prefill), moe.run(x[:rows], plain, prefill=prefill))
+    for rows in range(1, 601):
+        for layer in w.layers:
+            moe.run(x[:rows], layer.moe, prefill=rows > 16)
+    torch.cuda.synchronize()
+    keys, held = len(modelopt._POOL), torch.cuda.memory_allocated()
+    for rows in range(600, 0, -7):
+        for layer in w.layers:
+            moe.run(x[:rows], layer.moe, prefill=rows > 16)
+    torch.cuda.synchronize()
+    assert len(modelopt._POOL) == keys <= 2 * 7 and torch.cuda.memory_allocated() == held
+
+
 def test_a_tensor_the_loader_does_not_read_is_refused(tmp_path):
     from safetensors.torch import save_file
 

@@ -139,6 +139,57 @@ def shared_fp4(gate: tuple, up: tuple, down: tuple) -> Expert4:
     return Expert4(gu, dn)
 
 
+class PooledMoE4(MoE4):
+    """Flash Next's ``MoE4``, with the shared expert's output and split-K buffers drawn from one pool that every
+    layer shares, a pair for each power of two of rows (slices of it, contiguous, for the rows of a call).
+
+    ``MoE4`` keeps a pair for each row count, in each layer: sized for Flash Next's fixed buffers. Here the MoE runs
+    at every prompt chunk's length and every round's width, and those pairs (about 100 KB a row a layer) grew
+    without bound. The pool's buffers are never freed, so a captured graph's addresses stay valid; layers use them
+    one after another, each reading its output before the next writes."""
+
+    def shared_out(self, x: torch.Tensor, fp: nvfp4.FP4, *, f32: bool = False):
+        rows, sk = int(x.shape[0]), nvfp4.split_for(fp.n, fp.k)
+        size = 1 << max(4, (rows - 1).bit_length())
+        key = (size, fp.n, sk, f32, x.device)
+        got = _POOL.get(key)
+        if got is None:
+            got = _POOL[key] = (torch.empty(size * fp.n, dtype=torch.float32 if f32 else torch.bfloat16,
+                                            device=x.device),
+                                torch.empty(sk * size * fp.n, dtype=torch.float32, device=x.device) if sk > 1 else None)
+        out, part = got
+        return (out[:rows * fp.n].view(rows, fp.n),
+                part[:sk * rows * fp.n].view(sk, rows, fp.n) if part is not None else None)
+
+
+_POOL: dict[tuple, tuple] = {}
+
+
+def pool_bytes(text: dict, rows: int = 4096) -> int:
+    """The pool's most (every power of two of rows up to a prompt chunk's, gate/up and down): for admission."""
+
+    width = int(text.get("shared_expert_intermediate_size") or text["moe_intermediate_size"])
+    d = int(text["hidden_size"])
+    per_row = 0
+    for n, k, item in ((2 * width, d, 2), (d, width, 4)):
+        sk = nvfp4.split_for(n, k)
+        per_row += n * item + (sk * n * 4 if sk > 1 else 0)
+    return per_row * sum(1 << b for b in range(4, rows.bit_length()))
+
+
+def with_pool(geometry, text: dict):
+    """``geometry`` plus the shared-expert pool (``PooledMoE4``)."""
+
+    from tensorfold.cuda.capacity import Geometry
+
+    extra = pool_bytes(text)
+    return Geometry(lambda slots: geometry.bytes_at(slots) + extra, geometry.reserve, geometry.minimum_slots)
+
+
+def pooled(m: MoE4) -> PooledMoE4:
+    return PooledMoE4(m.gate_up, m.down_proj, m.shared, m.kernel)
+
+
 def experts_fp4(gate: tuple, up: tuple, down: tuple, shared: Expert4) -> MoE4:
     """One layer's routed experts from stacked checkpoint arrays (each ([E, n, k/2] uint8, [E, n, k/16] e4m3,
     [E] fp32)): gate and up rows joined per expert (gate first), each half with its expert's own scale."""
@@ -147,7 +198,7 @@ def experts_fp4(gate: tuple, up: tuple, down: tuple, shared: Expert4) -> MoE4:
     e, ni, d = int(gw.shape[0]), int(gw.shape[1]), int(dw.shape[1])
     gu = nvfp4.stacked_fp4(torch.cat([gw, uw], dim=1), torch.cat([gs, us], dim=1),
                            torch.cat([g2[:, None].expand(e, ni), u2[:, None].expand(e, ni)], dim=1))
-    return MoE4(gu, nvfp4.stacked_fp4(dw, ds, d2[:, None].expand(e, d)), shared)
+    return PooledMoE4(gu, nvfp4.stacked_fp4(dw, ds, d2[:, None].expand(e, d)), shared)
 
 
 def centred(w: torch.Tensor) -> torch.Tensor:
@@ -251,8 +302,9 @@ class _Builder:
             experts = experts_fp4(self._stack(prefix, "gate_proj"), self._stack(prefix, "up_proj"),
                                   self._stack(prefix, "down_proj"), shared)
         elif self.rd.has(prefix + "experts.gate_up_proj") and not fp4_shared:     # stacked bf16 (the MTP layer's)
-            experts = moe4_from_bf16(self.tensor(prefix + "experts.gate_up_proj").to(torch.bfloat16),
-                                     self.tensor(prefix + "experts.down_proj").to(torch.bfloat16), shared_bf16())
+            experts = pooled(moe4_from_bf16(self.tensor(prefix + "experts.gate_up_proj").to(torch.bfloat16),
+                                            self.tensor(prefix + "experts.down_proj").to(torch.bfloat16),
+                                            shared_bf16()))
         else:
             raise ValueError(f"{prefix}experts: neither NVFP4 experts nor stacked bf16 ones with a bf16 shared expert")
         return Routed(router.to(torch.bfloat16).contiguous(), experts, int(self.cfg.top_k))

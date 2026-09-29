@@ -236,8 +236,8 @@ def passages(tokenizer: str | Path, count: int = 8, tokens: int = 1024) -> torch
 
     tok = Tokenizer.from_file(str(tokenizer))
     texts = ["\n\n".join(topics[k] for k in names) for names in (
-        ("assignment", "augassign"), ("class", "classes"), ("exceptions", "try"), ("for", "while", "if"),
-        ("import", "lambda"), ("typesseq", "typesmapping"))]
+        ("assignment", "augassign"), ("class", "function", "customization"), ("exceptions", "try", "raise"),
+        ("for", "while", "if", "with", "execmodel"), ("import", "lambda", "naming"), ("typesseq", "typesmapping"))]
     texts += [inspect.getsource(textwrap), inspect.getsource(json_module.decoder)]
     rows = []
     for text in texts[:count]:
