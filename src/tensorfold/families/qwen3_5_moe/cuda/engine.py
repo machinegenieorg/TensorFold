@@ -81,8 +81,6 @@ class Qwen36Engine:
         # one admission for one stream or many (every stream's states and caches, kept prompt ends), before any load
         geometry = ((lambda text: stream_geometry(text, streams, KEEP_MANY, self.depth)) if many else
                     (lambda text: gdn_geometry(text, 1, self.depth + 1, mtp=self.depth > 0)))
-        if nvfp4:                                        # and the shared experts' buffer pool
-            geometry = (lambda base: lambda text: modelopt.with_pool(base(text), text))(geometry)
         self.capacity_plan = admit(model_dir, context, context_explicit, torch, geometry, transform,
                                    extra_files=() if nvfp4 else extra)
         self.context_window = self.capacity_plan["context_window"]

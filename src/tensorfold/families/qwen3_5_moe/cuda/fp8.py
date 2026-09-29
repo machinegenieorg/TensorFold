@@ -9,7 +9,8 @@ Activations stay bf16. K is split into slices fixed by the weight's shape (``bf1
 count) and the slices are summed in slice order, so a row's bits depend only on its own input: the chain
 Flash Next's ``bf16.matmul`` runs, with a scale after it. ``weight`` holds the checkpoint's bytes, decoded in the
 kernel (what the engine loads), or the codes widened to bf16 (``widen``: Flash Next's ``bf16.matmul`` times the
-scale, bit for bit, at twice the memory). Each form is row-invariant; they agree to rounding, not bit for bit, as
+scale, bit for bit, at twice the memory). Prompt chunks (``prefill``) take K in one slice: chunk-invariant bits of
+their own, as the 27B's prompt path has. Each form is row-invariant; they agree to rounding, not bit for bit, as
 the tensor cores may order a step's products differently for operands decoded in registers. The checkpoint's
 ``input_scale`` quantizes activations for vLLM's FP8 GEMMs; it is not part of the weights and is not read.
 """
@@ -26,6 +27,7 @@ from tensorfold.families.qwen4_exp.cuda import bf16, nvfp4
 
 BN = bf16.BN              # output columns a program
 BK = bf16.BK              # inputs a step (the split keeps slices whole steps)
+PROMPT_BN = 128           # a prompt chunk's: 4,096 rows through the model's FP8 projections in 51 ms, not 93
 
 
 @dataclass
@@ -51,7 +53,10 @@ class FP8Linear:
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         return matmul(x, self)
 
-    prefill = __call__
+    def prefill(self, x: torch.Tensor) -> torch.Tensor:
+        """The prompt form: K in one slice and wider tiles, the bits the same for any chunk (not decode's)."""
+
+        return matmul(x, self, sk=1, block_n=PROMPT_BN)
 
     def widen(self) -> "FP8Linear":
         """The codes as bf16 values (exact), read without decoding: ``bf16.matmul``'s bits, times the scale."""
