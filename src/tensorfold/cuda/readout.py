@@ -199,11 +199,22 @@ class ScoreBatcher:
         batched = (len(batch) > 1 and hasattr(self.engine, "score_batch")
                   and max(len(p) for p in prompts) <= self.max_batch_prompt_tokens)
         with self.lock:
-            try:
-                results = self.engine.score_batch(prompts) if batched else [self.engine.score(p) for p in prompts]
-            except BaseException as exc:      # noqa: BLE001 - delivered to every waiter, never raised here
-                for _, box in batch:
-                    box.put(exc)
-                return
-        for (_, box), result in zip(batch, results):
-            box.put(result)
+            if batched:
+                # one forward for everyone: every box necessarily fills at the same moment, there is no way (or
+                # reason) to release an early one sooner.
+                try:
+                    results = self.engine.score_batch(prompts)
+                except BaseException as exc:  # noqa: BLE001 - delivered to every waiter, never raised here
+                    for _, box in batch:
+                        box.put(exc)
+                    return
+                for (_, box), result in zip(batch, results):
+                    box.put(result)
+            else:
+                # sequential, not batched: fill each box the moment its own call returns, so a request is never
+                # made to wait for its batch-mates' calls too (the only difference from no batcher at all).
+                for prompt, box in batch:
+                    try:
+                        box.put(self.engine.score(prompt))
+                    except BaseException as exc:  # noqa: BLE001 - this request's own waiter only
+                        box.put(exc)
