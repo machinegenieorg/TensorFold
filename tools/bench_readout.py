@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import statistics
 import subprocess
 import threading
 import time
@@ -21,11 +22,23 @@ import urllib.request
 MAX_LOGPROBS = 64
 
 
-def build_requests(model: str, vocab: int, total: int, prefix: int, n: int, allowed: int, seed: int) -> list[dict]:
-    """``n`` requests sharing the first ``prefix`` token ids, each with its own random tail and allowed set."""
+def build_requests(model: str, vocab: int, total: int, prefix: int, n: int, allowed: int,
+                   seed: int) -> tuple[dict, list[dict]]:
+    """A warm-up request for the first ``prefix`` token ids alone, and ``n`` requests sharing them, each with its
+    own random tail and allowed set.
+
+    The engine only caches a prefill's own prompt (one token short of it); it does not know two sibling requests
+    share a prefix until something has prefilled exactly that prefix on its own. Sending the shared prefix once as
+    its own request (max_tokens 1, uncounted in the latency stats) gives the server a cache entry the round's
+    parallel requests can all resume from, matching how the readout wrapper's traffic actually benefits from
+    prefix reuse (a shared system/prompt block prefilled once, e.g. by the round's first arrival or an earlier
+    question).
+    """
 
     rng = random.Random(seed)
     shared = [rng.randrange(1, vocab) for _ in range(prefix)]
+    warmup = {"model": model, "prompt": shared, "max_tokens": 1, "temperature": 0,
+             "return_tokens_as_token_ids": True, "logprobs": 1, "allowed_token_ids": [1]}
     requests = []
     for i in range(n):
         tail = [rng.randrange(1, vocab) for _ in range(total - prefix)]
@@ -33,7 +46,7 @@ def build_requests(model: str, vocab: int, total: int, prefix: int, n: int, allo
         requests.append({"model": model, "prompt": shared + tail, "max_tokens": 1, "temperature": 0,
                          "return_tokens_as_token_ids": True, "logprobs": min(len(allowed_ids), MAX_LOGPROBS),
                          "allowed_token_ids": allowed_ids})
-    return requests
+    return warmup, requests
 
 
 def one(base: str, body: dict) -> dict:
@@ -112,6 +125,8 @@ def main() -> None:
     p.add_argument("--allowed", type=int, default=4, help="allowed_token_ids per request")
     p.add_argument("--reps", type=int, default=10, help="rounds of --concurrency requests each")
     p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--no-warmup", action="store_true",
+                   help="skip priming each round's shared prefix first (measures cold, unshared prefills instead)")
     p.add_argument("--mem", action="store_true")
     p.add_argument("--ignore", default="", help="comma list of process names nvidia-smi should not count")
     p.add_argument("--label", default="")
@@ -126,9 +141,12 @@ def main() -> None:
         memory.start()
 
     all_results: list[dict] = []
+    warmups: list[dict] = []
     for rep in range(args.reps):
-        requests = build_requests(args.model, args.vocab, args.total, args.prefix, args.concurrency, args.allowed,
-                                  args.seed + rep)
+        warmup, requests = build_requests(args.model, args.vocab, args.total, args.prefix, args.concurrency,
+                                          args.allowed, args.seed + rep)
+        if not args.no_warmup:
+            warmups.append(one(args.base, warmup))
         all_results.extend(run_round(args.base, requests))
 
     if memory:
@@ -145,12 +163,15 @@ def main() -> None:
         "latency_s_p90": round(_percentile(latencies, 0.9), 4) if latencies else None,
         "latency_s_max": round(max(latencies), 4) if latencies else None,
         "latency_s_min": round(min(latencies), 4) if latencies else None,
+        "warmup": not args.no_warmup,
+        "warmup_latency_s_median": (round(statistics.median(w["latency_s"] for w in warmups if not w["error"]), 4)
+                                    if warmups and any(not w["error"] for w in warmups) else None),
     }
     if memory and memory.samples:
         summary.update(idle_gpu_gib=round(idle_gib, 2), peak_gpu_gib=round(max(s[1] for s in memory.samples), 2))
     print(json.dumps(summary), flush=True)
     if args.output:
-        json.dump({"summary": summary, "results": all_results,
+        json.dump({"summary": summary, "results": all_results, "warmups": warmups,
                    "memory": [list(s) for s in memory.samples] if memory else []}, open(args.output, "w"), indent=1)
 
 
