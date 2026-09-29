@@ -218,6 +218,40 @@ def test_a_long_prompt_absorbs_through_the_prefill_kernel_and_decodes_serially()
     assert res.tokens == want
 
 
+@pytest.mark.parametrize("rows", [7, 300])
+def test_the_head_absorbs_prompt_rows_as_the_keys_forward_writes(rows):
+    """A prompt's rows enter the head as keys and values alone (no queries, attention, experts or outputs), through
+    the tree kernel's 128 rows and past them: ``forward``'s bits on the MLX route's head; on the NVFP4 route's bf16
+    projections their wide form's, ``forward``'s values to rounding, the same bits for the rows in any split."""
+
+    from tensorfold.families.qwen3_5_moe.cuda.mtp import Cache
+
+    w, head = _model()
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    states = (torch.randn((rows, D), generator=g, device="cuda") * 2).bfloat16()
+    tokens = [3 + (i * 7) % 200 for i in range(rows)]
+
+    def fresh(n):
+        c = Cache(w, n)
+        c.k.zero_()
+        c.v.zero_()
+        return c
+
+    for p0 in (0, 9):
+        full, keys, split = fresh(p0 + rows), fresh(p0 + rows), fresh(p0 + rows)
+        head.forward(full, states, tokens, p0)
+        head.absorb(keys, states, tokens, p0)
+        cut = rows // 3
+        head.absorb(split, states[:cut], tokens[:cut], p0)
+        head.absorb(split, states[cut:], tokens[cut:], p0 + cut)
+        assert torch.equal(split.k, keys.k) and torch.equal(split.v, keys.v), p0
+        if FORMAT[0] == "mlx":
+            assert torch.equal(full.k, keys.k) and torch.equal(full.v, keys.v), p0
+        else:
+            for a, b in ((full.k, keys.k), (full.v, keys.v)):
+                assert ((a.float() - b.float()).abs().max() <= 0.02 * a.float().abs().max()).item(), p0
+
+
 def test_ignore_eos_decodes_past_end_tokens_as_serial_does():
     """``stop_eos=False`` (ignore_eos) runs drafted rounds through an end token to the count, as serial rounds do."""
 

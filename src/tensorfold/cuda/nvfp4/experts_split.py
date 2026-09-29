@@ -5,12 +5,14 @@ the E2M1 nibbles in ``tensorfold.cuda.experts.pack``'s fragment order (the MLX a
 alike) and each 64-input group's e4m3 block scales a word a lane. Lane t of a quad carries one NVFP4 block's inputs,
 so it decodes its fragment to exact bf16 values, 2 x code x block scale (at most six significant bits), and each
 (pair, column) is one fp32 mma chain over K: in slices fixed by K (``split``: 4 at 2,048 inputs, 2 at 512), added in
-order in shared memory, times the expert's per-tensor scale over two. A prompt plan's call takes K in one slice and
-four row tiles a warp (chunk-invariant bits of its own).
+order in shared memory, times the expert's per-tensor scale over two. A prompt plan's call takes K in one slice,
+a CTA an item (64 pairs) against 128 columns, each 64-input group of its rows and weights staged in shared memory
+once for its eight warps (the MLX experts' prompt kernel on this format): chunk-invariant bits of its own.
 
 On an RTX PRO 6000 Max-Q with Qwen3.6's experts (257 of 512 x 2,048), a layer's gate/up and down against
 ``experts``: one row 12 and 6 us (54 and 11), four rows 32 and 17 (55 and 17), 16 rows 93 and 47 (97 and 46),
-128 rows 243 and 121 (241 and 118), a 4,096-row prompt chunk 1.07 and 0.82 ms (2.22 and 1.54).
+128 rows 243 and 121 (241 and 118), a 4,096-row prompt chunk 1.13 and 0.73 ms (2.06 and 1.19; the MLX experts'
+1.04 and 0.67). On a GB10 (shared with a serving engine) the chunk's 40 layers take 382 ms (the MLX experts' 391).
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_nvfp4_split_v1", sources=[str(here / "experts_split.cpp"),
+    return load(name="tensorfold_nvfp4_split_v2", sources=[str(here / "experts_split.cpp"),
                                                              str(here / "experts_split.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
 
@@ -111,31 +113,31 @@ def split(k: int) -> int:
     return sk
 
 
-def _shape(m: int, pairs: int, prompt: bool) -> tuple[int, int, int]:
-    """(units a block, register stages, row tiles a warp) for a call of ``pairs``: none changes a bit (measured on an
-    RTX PRO 6000 Max-Q with Qwen3.6's experts)."""
+def _shape(m: int, pairs: int) -> tuple[int, int, int]:
+    """(units a block, register stages, row tiles a warp) for a decode call of ``pairs``: none changes a bit
+    (measured on an RTX PRO 6000 Max-Q with Qwen3.6's experts)."""
 
-    if prompt:
-        return PROMPT
     if m == 2:
         return (1, 4, 1) if pairs <= 16 else (1, 2, 1) if pairs <= 160 else (2, 2, 1)
     return (2, 2, 1) if pairs <= 80 else (4, 2, 1)
 
 
-PROMPT = (2, 1, 4)        # a prompt chunk's 4,096 rows: gate/up 1.07 ms and down 0.69 ms a layer, the MLX prompt form's
-
-
 def _run(m: int, epi: int, x: torch.Tensor, slots: int, w: torch.Tensor, s2: torch.Tensor, n: int, plan,
          out: torch.Tensor, rows: int) -> None:
-    """A decode plan's call takes K in ``split`` slices; a prompt plan's (items of 64 pairs) one slice: the prompt
-    form, chunk-invariant bits of its own, as the MLX experts' prompt form has."""
+    """A decode plan's call takes K in ``split`` slices, a warp a unit; a prompt plan's (items of 64 pairs) one slice,
+    staged in shared memory a CTA an item: the prompt form, chunk-invariant bits of its own, as the MLX experts'
+    prompt form has."""
 
     kg, nb = x.shape[1] // GS, n // 32
     pairs = rows * plan.slots
-    upb, d, rt = _shape(m, pairs, plan.prefill)
+    if plan.prefill:
+        _ext().prefill(m, epi, x, slots, w, s2, kg, nb, plan.items, plan.counts, plan.members, out, n,
+                       grouped.max_items(pairs, plan.experts, plan.tile))
+        return
+    upb, d, rt = _shape(m, pairs)
     rg = plan.tile // (16 * rt)
     units = grouped.max_items(pairs, plan.experts, plan.tile) * nb * rg
-    _ext().run(m, epi, 1 if plan.prefill else split(x.shape[1]), upb, d, rt, x, slots, w, s2, kg, nb, rg,
+    _ext().run(m, epi, split(x.shape[1]), upb, d, rt, x, slots, w, s2, kg, nb, rg,
                plan.items, plan.counts, plan.members, out, n, units)
 
 

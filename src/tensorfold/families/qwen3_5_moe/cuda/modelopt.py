@@ -9,12 +9,18 @@ tensors, on ``tensorfold.cuda.nvfp4``'s kernels:
   four times faster than on ``nvfp4.experts``), the head (and the draft head, its draft vocabulary's rows) an
   ``Fp4Linear``. Activations stay bf16.
 * ``FP8``: DeltaNet's ``in_proj_qkv``, ``in_proj_z`` and ``out_proj`` and attention's four projections: e4m3 codes
-  and one fp32 scale a tensor, weight-only (``fp8.py``): every row bf16, decode's and a prompt chunk's alike, on the
-  exact weights; ``input_scale`` is vLLM's static activation scale and is not read.
+  and one fp32 scale a tensor, ``Fp8Linear``s: decode's rows bf16 on the exact weights (W8A16), a prompt chunk's
+  rows FP8 with a scale a row through the FP8 GEMM (the 27B's NVFP4 prompt convention); ``input_scale`` is vLLM's
+  static activation scale and is not read.
 * bf16 as stored: the embedding, the routers and shared-expert gates, ``in_proj_a`` and ``in_proj_b``, the
-  convolution, the norms and the MTP layer's projections. The MTP layer's experts only draft: they ride the NVFP4
-  experts kernel, quantized at load by ``nvfp4.experts.quantize``. Prompt chunks' rows stay bf16 everywhere
-  (quant "modelopt"), the prompt path the checkpoint's own arithmetic as closely as decode's.
+  convolution, the norms and the MTP layer's projections. ``in_proj_a`` and ``in_proj_b`` take a prompt chunk's FP8
+  rows on the stored weights (``rows8``). The MTP layer's experts only draft: they ride the NVFP4 experts kernel,
+  quantized at load by ``nvfp4.experts.quantize``. The routed experts read bf16 rows in prompts as in decode.
+
+``TF_NVFP4_PROMPT_ROWS=bf16`` keeps prompt chunks' rows bf16 everywhere instead (quant "modelopt"): the FP8
+projections then load as ``fp8.py``'s row-major W8A16 matmul, decode's and prompts' rows alike on the exact weights,
+closer to the checkpoint's arithmetic and slower (a 4,096-row chunk's projections 50 ms against 28 on an RTX PRO
+6000 Max-Q, 288 against 126 on a GB10).
 
 The checkpoint keeps the RMSNorm weights zero-centred (the model scales by ``1 + w``); they are widened to fp32
 as ``1 + w`` once, at load, so the norms compute what the model does. DeltaNet's gated norm is stored absolute.
@@ -24,6 +30,7 @@ The vision tower and the ``input_scale`` tensors are not read.
 from __future__ import annotations
 
 import json
+import os
 import re
 from contextlib import ExitStack
 from pathlib import Path
@@ -34,10 +41,11 @@ import torch
 from tensorfold.cuda.moe import Routed
 from tensorfold.cuda.nvfp4 import experts as nvx
 from tensorfold.cuda.nvfp4 import experts_split as nvs
-from tensorfold.cuda.nvfp4.linear import Fp4Linear
+from tensorfold.cuda.nvfp4.linear import Fp4Linear, Fp8Linear
 from tensorfold.families.qwen3_5.cuda.weights import GDN, Attention, Config, Layer, Plain, Weights
 from tensorfold.families.qwen4_exp.cuda import bf16
 
+from . import rows8
 from .fp8 import make_fp8
 
 # RMSNorm weights the model applies as ``1 + w`` (Qwen3.5's zero-centred norm); DeltaNet's gated norm is absolute
@@ -45,6 +53,15 @@ CENTRED = (".input_layernorm.weight", ".post_attention_layernorm.weight", ".q_no
            "model.norm.weight", "mtp.norm.weight", "mtp.pre_fc_norm_embedding.weight",
            "mtp.pre_fc_norm_hidden.weight")
 SKIPPED = re.compile(r"(^|\.)(visual|vision_tower)\.|\.input_scale$")
+
+
+def prompt_rows() -> str:
+    """How prompt chunks take their rows to the projections: "fp8" (a scale a row, the default) or "bf16"."""
+
+    rows = os.environ.get("TF_NVFP4_PROMPT_ROWS", "fp8").strip().lower() or "fp8"
+    if rows not in ("fp8", "bf16"):
+        raise ValueError(f"TF_NVFP4_PROMPT_ROWS={rows!r}: fp8 or bf16")
+    return rows
 
 
 def quant_block(config: dict) -> dict:
@@ -57,13 +74,15 @@ def is_modelopt(model_dir: str | Path) -> bool:
 
 
 class Dense:
-    """A bf16 projection as stored, through Flash Next's row-invariant ``bf16.matmul``."""
+    """A bf16 projection as stored, through Flash Next's row-invariant ``bf16.matmul``; ``prompt``: prompt chunks'
+    FP8 rows through ``rows8`` on the same weights."""
 
     layout = "b16"
     fast = False
 
-    def __init__(self, weight: torch.Tensor) -> None:
+    def __init__(self, weight: torch.Tensor, prompt: bool = False) -> None:
         self.b = bf16.make_b16(weight)
+        self.rows8 = rows8.Rows8.make(weight) if prompt else None
 
     @property
     def n(self) -> int:
@@ -74,12 +93,25 @@ class Dense:
         return self.b.k
 
     def nbytes(self) -> int:
-        return self.b.nbytes()
+        return self.b.nbytes() + (self.rows8.nbytes() if self.rows8 is not None else 0)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         return bf16.matmul(x, self.b)
 
-    prefill = __call__
+    def prefill(self, xq) -> torch.Tensor:
+        """A prompt chunk's rows: FP8 (``prefill_glue``'s) through ``rows8``, or bf16 as decode reads them."""
+
+        if not isinstance(xq, tuple):
+            return bf16.matmul(xq, self.b)
+        if self.rows8 is None:
+            raise ValueError("this projection is not read by FP8 prompt rows")
+        return rows8.matmul(xq, self.rows8)
+
+    def wide(self, x: torch.Tensor) -> torch.Tensor:
+        """Many bf16 rows at once (a prompt's, into the MTP head): K in one slice and wider tiles, no partial sums;
+        row-invariant bits of their own (drafts only)."""
+
+        return bf16.matmul(x, self.b, sk=1, block_n=128)
 
 
 def experts_table(gate: tuple, up: tuple, down: tuple, shared: tuple) -> nvs.Experts:
@@ -149,6 +181,7 @@ class _Builder:
 
     def __init__(self, model_dir: Path, device: str, cfg: Config) -> None:
         self.rd, self.device, self.cfg = _Reader(model_dir), device, cfg
+        self.fp8_rows = prompt_rows() == "fp8"
 
     def tensor(self, name: str) -> torch.Tensor:
         return self.rd.get(name).to(self.device)
@@ -165,10 +198,15 @@ class _Builder:
             return Fp4Linear.from_checkpoint(w.to(self.device), self.tensor(name + ".weight_scale"),
                                              float(self.rd.get(name + ".weight_scale_2")))
         if w.dtype == torch.float8_e4m3fn:
-            return make_fp8(w.view(torch.uint8).to(self.device), self.rd.get(name + ".weight_scale"))
+            scale = self.rd.get(name + ".weight_scale").float().reshape(-1)
+            if scale.numel() != 1:
+                raise ValueError(f"{name}: FP8 with {scale.numel()} scales; the CUDA engine reads one a tensor")
+            if not self.fp8_rows:
+                return make_fp8(w.view(torch.uint8).to(self.device), scale)
+            return Fp8Linear.from_checkpoint(w.to(self.device), float(scale[0]))
         if w.dtype not in (torch.bfloat16, torch.float16, torch.float32) or w.dim() != 2:
             raise ValueError(f"{name}: a {w.dtype} {tuple(w.shape)} weight is neither FP8, NVFP4 nor bf16")
-        return Dense(w.to(self.device).to(torch.bfloat16).contiguous())
+        return Dense(w.to(self.device).to(torch.bfloat16).contiguous(), prompt and self.fp8_rows)
 
     def _fp4(self, name: str) -> tuple:
         return (self.tensor(name + ".weight"), self.tensor(name + ".weight_scale"),
@@ -239,7 +277,7 @@ def load(model_dir: str | Path, device: str = "cuda") -> Weights:
         torch.cuda.empty_cache()
     w = Weights(config=cfg, embed=Plain(b.tensor("model.embed_tokens.weight").to(torch.bfloat16).contiguous()),
                 layers=layers, norm=b.norm("model.norm.weight"), head=b.linear("lm_head", prompt=False),
-                quant="modelopt")
+                quant="nvfp4" if b.fp8_rows else "modelopt")         # "nvfp4": prompts take FP8 rows
     half = cfg.rope_dims // 2
     w.inv_freq = (cfg.rope_theta ** (-torch.arange(0, half, dtype=torch.float64) / half)).to(torch.float32).to(device)
     left = b.rd.left(mtp=False)
@@ -298,6 +336,8 @@ def weight_bytes(draft_rows: int, mtp: bool) -> Callable[[str, dict], tuple[int,
 
     from tensorfold.cuda.capacity import itemsize
 
+    fp8_rows = prompt_rows() == "fp8"
+
     def transform(name: str, info: dict) -> tuple[int, int]:
         if SKIPPED.search(name):
             return 0, 0
@@ -308,10 +348,12 @@ def weight_bytes(draft_rows: int, mtp: bool) -> Callable[[str, dict], tuple[int,
         size = math.prod(shape) * itemsize(info, name)
         if name == "lm_head.weight" and mtp:                           # and the draft vocabulary's rows
             size += draft_rows * (shape[1] + shape[1] // 8) + 64 * shape[1]
-        elif info["dtype"] == "F8_E4M3" and name.endswith(".weight"):  # FP8 bytes, each row's fp32 scale
-            size += 4 * shape[0]
+        elif info["dtype"] == "F8_E4M3" and name.endswith(".weight"):  # FP8 bytes: rows padded to 128, or
+            size = -(-shape[0] // 128) * 128 * shape[1] if fp8_rows else size + 4 * shape[0]   # each row's scale
         elif name.endswith((".A_log", ".dt_bias")) or name.endswith(CENTRED):
             size *= 2                                                   # widened to fp32
+        elif name.endswith(("in_proj_a.weight", "in_proj_b.weight")) and not in_mtp and fp8_rows:
+            size *= 2                                                   # and the prompt rows' copy (rows8)
         elif in_mtp and (".experts." in name or ".shared_expert." in name):
             size = size * 9 // 32                                       # bf16 as NVFP4 (they only draft)
         return size, 0
