@@ -23,6 +23,14 @@ def check(args: argparse.Namespace, family: Any, backend: str, config_dir: Any =
                          "prompt rows")
     if share is not None and share < 0:
         raise ValueError(f"--decode-share is 0 (whole prompts first) or more, not {share}")
+    batch = getattr(args, "batch_tokens", None)
+    if batch is not None:
+        engine = getattr(family.package, "cuda_engine", None) if backend == "cuda" else None
+        if engine is None or "batch_tokens" not in inspect.signature(engine).parameters:
+            raise ValueError(f"--batch-tokens sets how many tokens an embedding step packs; {family.title} on "
+                             f"{'CUDA' if backend == 'cuda' else 'MLX'} does not embed")
+        if batch < 1:
+            raise ValueError(f"--batch-tokens is a positive token count, not {batch}")
     kv = getattr(args, "kv_dtype", "bf16")
     if kv != "bf16" and backend != "cuda":
         raise ValueError(f"--kv-dtype {kv} is a CUDA engine option: the MLX path caches keys and values as bf16")

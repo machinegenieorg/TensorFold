@@ -16,7 +16,7 @@ from typing import Any, Callable
 
 from tensorfold.server.cancellation import RequestCancelled, socket_cancellation
 from tensorfold.server.errors import CapacityError, RequestError
-from tensorfold.server.http import Server
+from tensorfold.server.http import Server, served_model_ids
 from tensorfold.server.stacks import Rearming
 from tensorfold.server.messages import (_normalize_tool_call_arguments, late_system_role, normalize_messages,
                                         validate_modalities)
@@ -100,6 +100,11 @@ class App:
     """Serve one engine with sampling and reply-length defaults for requests that omit them."""
 
     reads_ignore_eos = False            # True where the engine reads ``ignore_eos`` itself; a ``stop_eos`` engine is given it
+    aliases: tuple[str, ...] = ()       # --alias: more model IDs /v1/models lists and requests may name
+
+    @property
+    def model_ids(self) -> list[str]:
+        return served_model_ids(self.served, list(self.aliases))
 
     def __init__(self, engine, model_dir: Path, served: str, *, default_thinking: bool = False,
                  sampling: dict[str, Any] | None = None, max_tokens: int = 4096,
@@ -125,6 +130,8 @@ class App:
 
         if not isinstance(body, dict):
             return "the request body must be a JSON object"
+        if not callable(getattr(self.engine, "generate", None)):
+            return f"{self.served} serves embeddings only: POST /v1/embeddings"
         if body.get("draft", True) is False and "draft" not in inspect.signature(self.engine.generate).parameters:
             return "this model's CUDA engine has no serial switch (\"draft\": false)"
         if not isinstance(body.get("messages", []), list):
@@ -428,6 +435,9 @@ def _log_error(exc: BaseException) -> None:
     traceback.print_exception(exc)
 
 
+_ANSWERED = object()      # a request body the handler has already refused
+
+
 def make_handler(app: App):
     class Handler(Rearming):              # USR1's stack dump armed again after each request
         protocol_version = "HTTP/1.1"
@@ -458,25 +468,57 @@ def make_handler(app: App):
 
         def do_GET(self):
             if self.path.rstrip("/") in ("/v1/models", "/models"):
-                self._json(200, {"object": "list", "data": [{"id": app.served, "object": "model", "owned_by": "tensorfold"}]})
+                self._json(200, {"object": "list", "data": [{"id": model_id, "object": "model", "owned_by": "tensorfold"}
+                                                            for model_id in app.model_ids]})
             elif self.path.rstrip("/") in ("/health", "/v1/health"):
                 self._json(200, {"ok": True})
             else:
                 self._json(404, {"error": "not found"})
 
-        def do_POST(self):
-            chat = self.path.rstrip("/").endswith("/chat/completions")
-            if not chat and not self.path.rstrip("/").endswith("/completions"):
-                return self._json(404, {"error": "not found"})
+        def _body(self) -> Any:
+            """The JSON body, or ``_ANSWERED`` after refusing one that is too long or not JSON."""
+
             try:
                 length = int(self.headers.get("Content-Length", 0))
                 if not 0 <= length <= 32 * 1024**2:
                     self.close_connection = True             # the unread body must not reach the next request
-                    return self._json(400, {"error": {"message": "request body exceeds the 32 MiB limit",
-                                                      "type": "invalid_request_error"}})
-                body = json.loads(self.rfile.read(length) or b"{}")
+                    self._json(400, {"error": {"message": "request body exceeds the 32 MiB limit",
+                                               "type": "invalid_request_error"}})
+                    return _ANSWERED
+                return json.loads(self.rfile.read(length) or b"{}")
             except (json.JSONDecodeError, UnicodeDecodeError):
-                return self._json(400, {"error": {"message": "the request body is not JSON", "type": "invalid_request_error"}})
+                self._json(400, {"error": {"message": "the request body is not JSON", "type": "invalid_request_error"}})
+                return _ANSWERED
+
+        def _embeddings(self) -> None:
+            from tensorfold.cuda import embeddings
+
+            body = self._body()
+            if body is _ANSWERED:
+                return
+            gone = socket_cancellation(self.connection)
+            try:
+                payload = embeddings.serve(app, body, lambda: gone.cancelled)
+            except RequestCancelled:
+                self.close_connection = True
+                return
+            except RequestError as exc:
+                return self._json(503 if isinstance(exc, CapacityError) else 400,
+                                  {"error": {"message": str(exc), "type": "invalid_request_error"}})
+            except Exception as exc:
+                _log_error(exc)
+                return self._json(500, {"error": {"message": _error_message(exc), "type": "server_error"}})
+            self._json(200, payload)
+
+        def do_POST(self):
+            if self.path.rstrip("/").endswith("/embeddings"):
+                return self._embeddings()
+            chat = self.path.rstrip("/").endswith("/chat/completions")
+            if not chat and not self.path.rstrip("/").endswith("/completions"):
+                return self._json(404, {"error": "not found"})
+            body = self._body()
+            if body is _ANSWERED:
+                return
             try:
                 prepared = app.prepare(body, chat)
             except RequestError as exc:

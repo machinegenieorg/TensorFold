@@ -35,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     endpoint.add_argument("--host", default="127.0.0.1", help="address to listen on (0.0.0.0: every interface)")
     endpoint.add_argument("--port", type=int, default=8080)
     endpoint.add_argument("--name", default="", help="model id clients ask for (default: the model's name)")
-    endpoint.add_argument("--alias", action="append", default=[], help="another model id to answer to")
+    endpoint.add_argument("--alias", action="append", default=[], help="another model id to answer to (repeatable)")
     endpoint.add_argument("--vision", action="store_true", help="enable image input for Qwen3.5/3.8 dense vision checkpoints")
     endpoint.add_argument("--vision-urls", action="store_true",
                           help="with --vision, accept public HTTP(S) image URLs (default: data URLs only)")
@@ -113,6 +113,9 @@ def build_parser() -> argparse.ArgumentParser:
     cuda.add_argument("--kv-dtype", choices=("bf16", "int8", "int4"), default="bf16",
                       help="KV cache: bf16 (the default), int8, or int4. Quantized keys and values use one "
                            "fp16 scale per 32 values (changes the output; Flash Next on CUDA only)")
+    cuda.add_argument("--batch-tokens", type=int, default=None,
+                      help="embedding models: most tokens one forward step packs from waiting requests (default "
+                           "8192; a longer text runs alone). Vectors are the same at any setting")
     serve.set_defaults(func=cmd_serve)
 
     pull = commands.add_parser("pull", help="download models (or draft models) from Hugging Face")
@@ -354,6 +357,8 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
         options["ple_on_ssd"] = True
     if getattr(args, "mtp_confidence", None) is not None:
         options["mtp_confidence"] = float(args.mtp_confidence)
+    if getattr(args, "batch_tokens", None) is not None:
+        options["batch_tokens"] = int(args.batch_tokens)
     options["context"] = context if context is not None else args.context
     options["context_explicit"] = args.context is not None
     streams = 1 if str(args.parallel).strip().lower() == "auto" else _parallel(args.parallel)
@@ -377,10 +382,20 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     app_class = getattr(family.package, "CUDA_APP", None) or App
     app = app_class(engine, model_dir, served, default_thinking=bool(args.thinking), sampling=sampling,
                     max_tokens=int(args.max_tokens), context_window=context if context is not None else args.context)
+    if getattr(args, "alias", None):
+        app.aliases = tuple(args.alias)
     shown = "greedy" if float(sampling.get("temperature", 1.0)) <= 0 else ", ".join(
         f"{k} {v}" for k, v in sampling.items())
     effective_context = app.effective_context_window
-    print(f"[tensorfold] serving {served} at http://{args.host}:{args.port}/v1 on CUDA{where} "
+    ids = getattr(app, "model_ids", None) or [served]
+    also = f" (also {', '.join(ids[1:])})" if len(ids) > 1 else ""
+    if callable(getattr(engine, "embed", None)) and not callable(getattr(engine, "generate", None)):
+        print(f"[tensorfold] serving {served}{also} embeddings at http://{args.host}:{args.port}/v1/embeddings on CUDA "
+              f"({engine.dimensions} dimensions; texts of up to {effective_context} tokens; loaded in "
+              f"{time.perf_counter() - started:.1f}s)", flush=True)
+        serve(app, args.host, int(args.port))
+        return 0
+    print(f"[tensorfold] serving {served}{also} at http://{args.host}:{args.port}/v1 on CUDA{where} "
           f"(sampling: {shown}; drafts: {'off' if args.no_drafts else 'on'}; "
           f"context: {'unlimited' if effective_context is None else effective_context}; "
           f"loaded in {time.perf_counter() - started:.1f}s)", flush=True)
