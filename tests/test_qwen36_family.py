@@ -72,3 +72,14 @@ def test_parallel_reaches_the_engine(tmp_path, monkeypatch, options, streams, de
     monkeypatch.setattr(engine, "Qwen36Engine", lambda path, **kw: made.update(kw) or "engine")
     assert qwen3_5_moe.cuda_engine(_config(tmp_path), **options) == "engine"
     assert made["streams"] == streams and made["depth"] == depth
+
+
+def test_the_engine_enforces_response_format():
+    """The server hands the engine a request's grammar (``structured_output``) rather than refusing it."""
+
+    import inspect
+
+    from tensorfold.families.qwen3_5_moe.cuda import engine
+
+    assert engine.Qwen36Engine.structured_output is True
+    assert "constraint" in inspect.signature(engine.Qwen36Engine.generate).parameters
