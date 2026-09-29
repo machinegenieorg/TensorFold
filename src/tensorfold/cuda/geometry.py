@@ -21,7 +21,7 @@ def padded(info: dict, shape: list[int], *, float32: bool = False, name: str = "
 
 
 def linear_weights(name: str, info: dict) -> tuple[int, int]:
-    if name.startswith("vision_tower") or ".mtp." in name or name.startswith("mtp."):
+    if name.startswith(("vision_tower", "model.visual.")) or ".mtp." in name or name.startswith("mtp."):
         return 0, 0
     amount = padded(info, info["shape"], float32=name.endswith((".A_log", ".dt_bias")), name=name)
     return amount * (2 if "lm_head." in name else 1), 0
