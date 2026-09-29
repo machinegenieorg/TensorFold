@@ -12,7 +12,7 @@ from tensorfold.engine.exact_sampling import Sampling
 
 from .forward import State, _paths, commit, tree_forward
 from tensorfold.cuda.sampling import sample_rows
-from .weights import Weights
+from .weights import QLinear, Weights
 
 
 def clone_state(st: State) -> State:
@@ -73,6 +73,8 @@ def prefill_logits(w: Weights, prompt: Sequence[int], *, state: State | None = N
     """Like ``prefill``, but returns the last position's full-vocab logits instead of sampling: the readout
     scoring contract is one forward over the prompt, never a decode round."""
 
+    from tensorfold.cuda.kernels import dense as dense_kernel
+
     from .forward import _mm
 
     if not prompt:
@@ -84,7 +86,12 @@ def prefill_logits(w: Weights, prompt: Sequence[int], *, state: State | None = N
         raise ValueError("a reused state must leave at least one prompt token to process")
     out = prefill_stops(w, prompt, st, None, stops=stops, keep=keep, keep_at=keep_at)
     normed = out if keep_at is None else out[0]
-    logits = _mm(normed, w.head).float()
+    # the vocab-wide head projection, off the decode path: the tensor-core prefill kernel for a dense (bf16)
+    # checkpoint's head, the row-invariant decode kernel (correct but slow past a couple of rows) otherwise
+    if isinstance(w.head, QLinear) and w.head.layout == "dense":
+        logits = dense_kernel.prefill_matmul(normed, w.head.weight, f32=True)
+    else:
+        logits = _mm(normed, w.head).float()
     return (logits, None) if keep_at is None else (logits, out[1])
 
 

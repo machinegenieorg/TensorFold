@@ -7,6 +7,7 @@ from typing import Sequence
 import torch
 
 from tensorfold.cuda import moe
+from tensorfold.cuda.kernels import dense as dense_kernel
 from tensorfold.cuda.kernels import gdn as deltanet
 from tensorfold.cuda.kernels import qmm as shared
 from tensorfold.cuda.kernels.prefill_attention import attention
@@ -29,6 +30,10 @@ def _mm(x, w: QLinear, f32: bool = False) -> torch.Tensor:
         return w.prefill(x)                               # an EXL3 pack's projection
     if isinstance(x, tuple):
         return shared.prefill_matmul8(x, tile(w), f32=f32)
+    if w.layout == "dense":
+        # a plain (unquantized) checkpoint's prompt rows: tensor-core GEMM, not the generic per-4-column
+        # reference kernel affine.matmul falls back to (correct there, but far too slow for a 4,096-row chunk)
+        return dense_kernel.prefill_matmul(x, w.weight, f32=f32)
     packed = tile(w)                                      # an affine format past the FP8 four-bit path
     return matmul_partial(x, packed) if f32 else matmul(x, packed)
 
