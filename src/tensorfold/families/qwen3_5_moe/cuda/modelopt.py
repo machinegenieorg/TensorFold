@@ -4,15 +4,15 @@ The checkpoint names each quantized layer's algorithm in ``quantized_layers``, a
 tensors:
 
 * ``W4A16_NVFP4`` (blocks of 16): the routed experts, the shared expert and ``lm_head``. Each is packed E2M1
-  nibbles, an e4m3 scale a block and an fp32 scale a tensor, kept as stored and decoded by Flash Next's NVFP4
-  kernels (``qwen4_exp/cuda/nvfp4*.py``): the experts through ``nvfp4_moe`` on the plan of
-  ``tensorfold.cuda.experts``, the shared expert and the head through ``nvfp4.matmul``. Activations stay bf16.
+  nibbles, an e4m3 scale a block and an fp32 scale a tensor, kept as stored: the experts, the shared one last, in
+  one table of ``tensorfold.cuda.nvfp4_experts`` (the grouped kernel on the experts plan), the head and the draft
+  head through its dense form. Activations stay bf16.
 * ``FP8``: DeltaNet's ``in_proj_qkv``, ``in_proj_z`` and ``out_proj`` and attention's four projections: e4m3
   codes and one fp32 scale a tensor (``fp8.py``, weight-only; ``input_scale`` is vLLM's activation scale and is
   not read).
 * bf16 as stored: the embedding, the routers and shared-expert gates, ``in_proj_a`` and ``in_proj_b``, the
-  convolution, the norms and the MTP layer (its projections through ``bf16.matmul``; its stacked experts ride the
-  NVFP4 tables as exact identity-scaled bf16, as Flash Next's do).
+  convolution, the norms and the MTP layer's projections (``bf16.matmul``). The MTP layer's experts only draft: they
+  ride the MLX route's 4-bit experts kernel, requantized at load (``affine4``).
 
 The checkpoint keeps the RMSNorm weights zero-centred (the model scales by ``1 + w``); they are widened to fp32
 as ``1 + w`` once, at load, so the norms compute what the model does. DeltaNet's gated norm is stored absolute.
@@ -29,10 +29,11 @@ from typing import Callable
 
 import torch
 
+from tensorfold.cuda import experts as grouped
+from tensorfold.cuda import nvfp4_experts
 from tensorfold.cuda.moe import Routed
 from tensorfold.families.qwen3_5.cuda.weights import GDN, Attention, Config, Layer, Plain, Weights
 from tensorfold.families.qwen4_exp.cuda import bf16, nvfp4
-from tensorfold.families.qwen4_exp.cuda.nvfp4_moe import Expert4, MoE4, expert4_from_bf16, moe4_from_bf16
 
 from .fp8 import make_fp8
 
@@ -79,14 +80,14 @@ class Dense:
 
 
 class FP4Linear:
-    """An NVFP4 projection through ``nvfp4.matmul`` on the stored bytes; ``rows`` of the table are real (the rest
-    pad the table to whole 64-row tiles and are cut from the output)."""
+    """An NVFP4 projection as stored, through ``nvfp4_experts``' dense form (the vocabulary heads): ``rows`` of the
+    table are real, the rest pad it to whole 32-row blocks and are cut from the output."""
 
     layout = "nvfp4"
     fast = False
 
-    def __init__(self, fp: nvfp4.FP4, rows: int | None = None) -> None:
-        self.fp, self.rows = fp, int(fp.n if rows is None else rows)
+    def __init__(self, d: nvfp4_experts.Dense, rows: int) -> None:
+        self.d, self.rows = d, int(rows)
 
     @property
     def n(self) -> int:
@@ -94,111 +95,59 @@ class FP4Linear:
 
     @property
     def k(self) -> int:
-        return self.fp.k
+        return self.d.k
 
     def nbytes(self) -> int:
-        return self.fp.nbytes()
+        return self.d.nbytes()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        y = nvfp4.matmul(x, self.fp)
-        return y if self.rows == self.fp.n else y[:, :self.rows]
+        y = nvfp4_experts.dense(x, self.d)
+        return y if self.rows == self.d.n else y[:, :self.rows]
 
     prefill = __call__
 
+    def dequantize(self) -> torch.Tensor:
+        """The exact fp32 weight [rows, k] (the reference for checks)."""
 
-def fp4_table(parts: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | float]]) -> tuple[nvfp4.FP4, int]:
-    """Row blocks of NVFP4 arrays ([n, k/2] uint8 words, [n, k/16] e4m3 scales, scalar scale) joined as one table,
-    each block's per-tensor scale on its own rows, zero rows padding it to whole tiles: (table, real rows)."""
-
-    words = torch.cat([w for w, _, _ in parts])
-    scales = torch.cat([s.contiguous().view(torch.uint8) for _, s, _ in parts])
-    factor = torch.cat([torch.full((w.shape[0],), float(s2), dtype=torch.float32, device=w.device)
-                        for w, _, s2 in parts])
-    rows = words.shape[0]
-    pad = -rows % nvfp4.BN
-    if pad:
-        words = torch.cat([words, words.new_zeros((pad, words.shape[1]))])
-        scales = torch.cat([scales, scales.new_zeros((pad, scales.shape[1]))])
-        factor = torch.cat([factor, factor.new_zeros(pad)])
-    fp = nvfp4.make_fp4(words, scales, 1.0)
-    fp.scale2 = factor
-    return fp, rows
+        words, scales = nvfp4_experts.unpack(self.d.w[:, :, :, 0])
+        return nvfp4.dequantize(words[0], scales[0].view(torch.float8_e4m3fn), float(self.d.s2) * 2)[:self.rows]
 
 
 def fp4_linear(words: torch.Tensor, scales: torch.Tensor, scale2: torch.Tensor | float) -> FP4Linear:
-    return FP4Linear(*fp4_table([(words, scales, scale2)]))
+    return FP4Linear(nvfp4_experts.make_dense(words, scales, scale2), words.shape[0])
 
 
-def shared_fp4(gate: tuple, up: tuple, down: tuple) -> Expert4:
-    """An NVFP4 shared expert: gate and up rows in one table (each with its own per-tensor scale), and down."""
+def experts_table(gate: tuple, up: tuple, down: tuple, shared: tuple) -> nvfp4_experts.Experts:
+    """One layer's routed experts from stacked checkpoint arrays (each ([E, n, k/2] uint8, [E, n, k/16] e4m3, [E]
+    fp32)) and the NVFP4 shared expert's (the same, unstacked) as expert E of one table."""
 
-    gu, rows = fp4_table([gate, up])
-    dn, drows = fp4_table([down])
-    if rows != gu.n or drows != dn.n:
-        raise ValueError("the shared expert's widths must be whole 64-row tiles")
-    return Expert4(gu, dn)
+    def join(stack: tuple, one: tuple) -> tuple:
+        (w, sc, s2), (ow, osc, os2) = stack, one
+        return (torch.cat([w, ow[None]]), torch.cat([sc, osc.contiguous().view(torch.uint8)[None]]),
+                torch.cat([s2, torch.as_tensor(os2, dtype=torch.float32).reshape(1).to(s2.device)]))
 
-
-class PooledMoE4(MoE4):
-    """Flash Next's ``MoE4``, with the shared expert's output and split-K buffers drawn from one pool that every
-    layer shares, a pair for each power of two of rows (slices of it, contiguous, for the rows of a call).
-
-    ``MoE4`` keeps a pair for each row count, in each layer: sized for Flash Next's fixed buffers. Here the MoE runs
-    at every prompt chunk's length and every round's width, and those pairs (about 100 KB a row a layer) grew
-    without bound. The pool's buffers are never freed, so a captured graph's addresses stay valid; layers use them
-    one after another, each reading its output before the next writes."""
-
-    def shared_out(self, x: torch.Tensor, fp: nvfp4.FP4, *, f32: bool = False):
-        rows, sk = int(x.shape[0]), nvfp4.split_for(fp.n, fp.k)
-        size = 1 << max(4, (rows - 1).bit_length())
-        key = (size, fp.n, sk, f32, x.device)
-        got = _POOL.get(key)
-        if got is None:
-            got = _POOL[key] = (torch.empty(size * fp.n, dtype=torch.float32 if f32 else torch.bfloat16,
-                                            device=x.device),
-                                torch.empty(sk * size * fp.n, dtype=torch.float32, device=x.device) if sk > 1 else None)
-        out, part = got
-        return (out[:rows * fp.n].view(rows, fp.n),
-                part[:sk * rows * fp.n].view(sk, rows, fp.n) if part is not None else None)
+    return nvfp4_experts.make(join(gate, shared[0]), join(up, shared[1]), join(down, shared[2]))
 
 
-_POOL: dict[tuple, tuple] = {}
+def affine4(w: torch.Tensor, gs: int = 64, chunk: int = 8) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """bf16 [E, N, K] as MLX affine 4-bit (words [E, N, K/8] int32, bf16 scales and biases a group of ``gs``,
+    q = round((w - min) / scale)): for weights that only draft (the MTP layer's experts), where the rounding changes
+    speed, never bits."""
 
-
-def pool_bytes(text: dict, rows: int = 4096) -> int:
-    """The pool's most (every power of two of rows up to a prompt chunk's, gate/up and down): for admission."""
-
-    width = int(text.get("shared_expert_intermediate_size") or text["moe_intermediate_size"])
-    d = int(text["hidden_size"])
-    per_row = 0
-    for n, k, item in ((2 * width, d, 2), (d, width, 4)):
-        sk = nvfp4.split_for(n, k)
-        per_row += n * item + (sk * n * 4 if sk > 1 else 0)
-    return per_row * sum(1 << b for b in range(4, rows.bit_length()))
-
-
-def with_pool(geometry, text: dict):
-    """``geometry`` plus the shared-expert pool (``PooledMoE4``)."""
-
-    from tensorfold.cuda.capacity import Geometry
-
-    extra = pool_bytes(text)
-    return Geometry(lambda slots: geometry.bytes_at(slots) + extra, geometry.reserve, geometry.minimum_slots)
-
-
-def pooled(m: MoE4) -> PooledMoE4:
-    return PooledMoE4(m.gate_up, m.down_proj, m.shared, m.kernel)
-
-
-def experts_fp4(gate: tuple, up: tuple, down: tuple, shared: Expert4) -> MoE4:
-    """One layer's routed experts from stacked checkpoint arrays (each ([E, n, k/2] uint8, [E, n, k/16] e4m3,
-    [E] fp32)): gate and up rows joined per expert (gate first), each half with its expert's own scale."""
-
-    (gw, gs, g2), (uw, us, u2), (dw, ds, d2) = gate, up, down
-    e, ni, d = int(gw.shape[0]), int(gw.shape[1]), int(dw.shape[1])
-    gu = nvfp4.stacked_fp4(torch.cat([gw, uw], dim=1), torch.cat([gs, us], dim=1),
-                           torch.cat([g2[:, None].expand(e, ni), u2[:, None].expand(e, ni)], dim=1))
-    return PooledMoE4(gu, nvfp4.stacked_fp4(dw, ds, d2[:, None].expand(e, d)), shared)
+    e, n, k = w.shape
+    words = torch.empty((e, n, k // 8), dtype=torch.int32, device=w.device)
+    scales = torch.empty((e, n, k // gs), dtype=torch.bfloat16, device=w.device)
+    biases = torch.empty_like(scales)
+    shifts = 4 * torch.arange(8, device=w.device, dtype=torch.int64)
+    for a in range(0, e, chunk):
+        g = w[a:a + chunk].float().reshape(-1, n, k // gs, gs)
+        lo = g.amin(-1).to(torch.bfloat16)
+        s = ((g.amax(-1) - lo.float()) / 15).clamp(min=1e-8).to(torch.bfloat16)
+        q = ((g - lo.float()[..., None]) / s.float()[..., None]).round().clamp(0, 15).to(torch.int64)
+        packed = (q.reshape(-1, n, k // 8, 8) << shifts).sum(-1)
+        words[a:a + chunk] = torch.where(packed >= 2 ** 31, packed - 2 ** 32, packed).to(torch.int32)
+        scales[a:a + chunk], biases[a:a + chunk] = s, lo
+    return words, scales, biases
 
 
 def centred(w: torch.Tensor) -> torch.Tensor:
@@ -287,26 +236,27 @@ class _Builder:
         return words.to(self.device), scales.to(self.device), s2.to(self.device)
 
     def routed(self, prefix: str) -> Routed:
-        """A layer's router rows (the shared expert's gate row last) and its experts, the shared one beside them."""
+        """A layer's router rows (the shared expert's gate row last) and its experts, the shared one last: NVFP4
+        experts in one NVFP4 table, or the MTP layer's stacked bf16 experts on the MLX 4-bit kernels."""
 
         router = torch.cat([self.tensor(prefix + "gate.weight"), self.tensor(prefix + "shared_expert_gate.weight")])
         sp = prefix + "shared_expert."
         fp4_shared = self.rd.has(sp + "gate_proj.weight_scale_2")
-
-        def shared_bf16() -> tuple[torch.Tensor, ...]:
-            return tuple(self.tensor(sp + f"{p}_proj.weight").to(torch.bfloat16) for p in ("gate", "up", "down"))
-
-        if self.rd.has(prefix + "experts.0.gate_proj.weight_scale_2"):
-            shared = (shared_fp4(self._fp4(sp + "gate_proj"), self._fp4(sp + "up_proj"), self._fp4(sp + "down_proj"))
-                      if fp4_shared else expert4_from_bf16(*shared_bf16()))
-            experts = experts_fp4(self._stack(prefix, "gate_proj"), self._stack(prefix, "up_proj"),
-                                  self._stack(prefix, "down_proj"), shared)
+        if self.rd.has(prefix + "experts.0.gate_proj.weight_scale_2") and fp4_shared:
+            experts = experts_table(*(self._stack(prefix, f"{p}_proj") for p in ("gate", "up", "down")),
+                                    tuple(self._fp4(sp + f"{p}_proj") for p in ("gate", "up", "down")))
         elif self.rd.has(prefix + "experts.gate_up_proj") and not fp4_shared:     # stacked bf16 (the MTP layer's)
-            experts = pooled(moe4_from_bf16(self.tensor(prefix + "experts.gate_up_proj").to(torch.bfloat16),
-                                            self.tensor(prefix + "experts.down_proj").to(torch.bfloat16),
-                                            shared_bf16()))
+            gu = self.tensor(prefix + "experts.gate_up_proj").to(torch.bfloat16)   # [E, 2 ni, d], gate rows first
+            dn = self.tensor(prefix + "experts.down_proj").to(torch.bfloat16)
+            sg, su, sd = (self.tensor(sp + f"{p}_proj.weight").to(torch.bfloat16) for p in ("gate", "up", "down"))
+            ni = gu.shape[1] // 2
+            tables = [affine4(torch.cat([part, one[None]])) for part, one in
+                      ((gu[:, :ni], sg), (gu[:, ni:], su), (dn, sd))]
+            del gu, dn
+            experts = grouped.make(tables[:2], tables[2], 64)
         else:
-            raise ValueError(f"{prefix}experts: neither NVFP4 experts nor stacked bf16 ones with a bf16 shared expert")
+            raise ValueError(f"{prefix}experts: NVFP4 experts with an NVFP4 shared expert, or stacked bf16 experts "
+                             "with a bf16 shared expert, are what this route reads")
         return Routed(router.to(torch.bfloat16).contiguous(), experts, int(self.cfg.top_k))
 
     def attention(self, p: str) -> Attention:
@@ -398,26 +348,21 @@ def weight_bytes(draft_rows: int, mtp: bool) -> Callable[[str, dict], tuple[int,
     from tensorfold.cuda.capacity import itemsize
 
     def transform(name: str, info: dict) -> tuple[int, int]:
-        if SKIPPED.search(name) or name.endswith(".weight_scale_2"):
+        if SKIPPED.search(name) or name == "lm_head.weight_scale_2":   # the head's is a factor on each row
             return 0, 0
         in_mtp = name.startswith("mtp.") or ".mtp." in name
         if in_mtp and not mtp:
             return 0, 0
         shape = [int(n) for n in info["shape"]]
         size = math.prod(shape) * itemsize(info, name)
-        if info["dtype"] == "U8" and name.endswith(".weight"):         # NVFP4 words, each row's fp32 scale
-            size += 4 * shape[0]
-            if name == "lm_head.weight" and mtp:                       # the draft vocabulary's rows
-                size += draft_rows * (shape[1] + shape[1] // 8 + 4)
+        if name == "lm_head.weight":                                   # NVFP4 words, each row's fp32 scale
+            size += 4 * shape[0] + (draft_rows * (shape[1] + shape[1] // 8 + 4) if mtp else 0)   # and the draft rows
         elif info["dtype"] == "F8_E4M3" and name.endswith(".weight"):  # FP8 codes, each row's fp32 scale
             size += 4 * shape[0]
         elif name.endswith((".A_log", ".dt_bias")) or name.endswith(CENTRED):
             size *= 2                                                   # widened to fp32
-        elif in_mtp and ".experts." in name:                            # identity-scaled bf16 tables
-            size += size // 8 + 4 * math.prod(shape[:2])
-        elif name.endswith(".shared_expert.gate_proj.weight") or name.endswith(".shared_expert.up_proj.weight") \
-                or name.endswith(".shared_expert.down_proj.weight"):
-            size += size // 8 if info["dtype"] == "BF16" else 0
+        elif in_mtp and (".experts." in name or ".shared_expert." in name):
+            size = size * 9 // 32                                       # bf16 as MLX 4-bit, groups of 64
         return size, 0
 
     return transform
