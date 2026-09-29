@@ -144,12 +144,23 @@ class ScoreBatcher:
 
     ``lock`` is the engine's own (``App.lock``), taken around the batch's engine call so no two batches (or a
     batch and a solo request) run on the GPU at once, matching how every other engine access here is serialized.
+
+    ``max_batch_prompt_tokens`` bounds when batching is worth it at all: the tensor-core prefill matmul's block
+    shape is already the biggest, most efficient one past a few hundred rows (``tensorfold.cuda.kernels.dense``'s
+    ``blocks_for``), so packing several already-long prompts together adds attention_texts' and the per-text GDN
+    loop's overhead for no matching throughput gain (measured: batching four cold 4,096-token prompts together
+    made p50 worse, 835ms vs ~450ms four separate calls) — while several short prompts, each below that
+    efficient-block threshold alone, genuinely share the GPU better packed together. A prompt longer than this
+    alone skips batching for every request sharing its window, falling back to sequential ``engine.score`` calls
+    (still under one lock: no worse than not batching at all).
     """
 
-    def __init__(self, engine: Any, lock: Any, *, window_s: float = 0.008, max_batch: int = 8) -> None:
+    def __init__(self, engine: Any, lock: Any, *, window_s: float = 0.008, max_batch: int = 8,
+                max_batch_prompt_tokens: int = 1536) -> None:
         import threading
 
         self.engine, self.lock, self.window_s, self.max_batch = engine, lock, window_s, max_batch
+        self.max_batch_prompt_tokens = max_batch_prompt_tokens
         self._gate = threading.Lock()
         self._pending: list[tuple[list[int], Any]] = []
         self._timer: Any = None
@@ -185,7 +196,8 @@ class ScoreBatcher:
         if not batch:
             return
         prompts = [p for p, _ in batch]
-        batched = len(batch) > 1 and hasattr(self.engine, "score_batch")
+        batched = (len(batch) > 1 and hasattr(self.engine, "score_batch")
+                  and max(len(p) for p in prompts) <= self.max_batch_prompt_tokens)
         with self.lock:
             try:
                 results = self.engine.score_batch(prompts) if batched else [self.engine.score(p) for p in prompts]

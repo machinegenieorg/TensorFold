@@ -300,6 +300,55 @@ def test_score_batcher_falls_back_to_solo_calls_without_score_batch():
     assert sorted(engine.calls) == sorted(("score", f"p{i}") for i in range(3))
 
 
+def test_score_batcher_skips_batching_when_prompts_are_already_long():
+    """Batching several already-long prompts adds overhead the tensor-core matmul's block shape does not need
+    past a few hundred rows; falling back to sequential score() calls (still under one lock) is no worse."""
+
+    import threading
+
+    from tensorfold.cuda.readout import ScoreBatcher
+
+    engine = _FakeEngine()
+    batcher = ScoreBatcher(engine, threading.Lock(), window_s=0.05, max_batch=8, max_batch_prompt_tokens=100)
+    long_prompts = [[0] * 200, [0] * 200]
+    results: list = [None, None]
+
+    def worker(i):
+        results[i] = batcher.score(long_prompts[i])
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=2)
+
+    assert results == [f"solo:{p}" for p in long_prompts]
+    assert engine.calls == [("score", long_prompts[0]), ("score", long_prompts[1])]
+
+
+def test_score_batcher_still_batches_several_short_prompts():
+    import threading
+
+    from tensorfold.cuda.readout import ScoreBatcher
+
+    engine = _FakeEngine()
+    batcher = ScoreBatcher(engine, threading.Lock(), window_s=0.05, max_batch=8, max_batch_prompt_tokens=100)
+    short_prompts = [[0] * 50, [0] * 60]
+    results: list = [None, None]
+
+    def worker(i):
+        results[i] = batcher.score(short_prompts[i])
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=2)
+
+    assert results == [f"batch:{p}" for p in short_prompts]
+    assert engine.calls == [("score_batch", tuple(short_prompts))]
+
+
 def test_score_batcher_delivers_the_exception_to_every_waiter():
     import threading
 
