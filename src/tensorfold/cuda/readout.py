@@ -133,3 +133,65 @@ def build_choice(chosen: int, ranked: list[tuple[int, float]], num_logprobs: int
         "logprobs": {"tokens": [token_id_key(chosen)], "token_logprobs": [chosen_lp],
                     "top_logprobs": [top], "text_offset": [0]},
     }
+
+
+class ScoreBatcher:
+    """Coalesces near-simultaneous scoring requests into one forward (``engine.score_batch``), so several parallel
+    readouts cost about one prefill instead of one each. A request left alone at its window's close (nothing else
+    pending) takes the ordinary single-request path (``engine.score``) instead, so it still gets prefix-cache
+    reuse; ``score_batch`` never resumes a cached prefix (see its docstring), so this only takes the coalesced path
+    when it can actually save work.
+
+    ``lock`` is the engine's own (``App.lock``), taken around the batch's engine call so no two batches (or a
+    batch and a solo request) run on the GPU at once, matching how every other engine access here is serialized.
+    """
+
+    def __init__(self, engine: Any, lock: Any, *, window_s: float = 0.008, max_batch: int = 8) -> None:
+        import threading
+
+        self.engine, self.lock, self.window_s, self.max_batch = engine, lock, window_s, max_batch
+        self._gate = threading.Lock()
+        self._pending: list[tuple[list[int], Any]] = []
+        self._timer: Any = None
+
+    def score(self, prompt: list[int]) -> Any:
+        import queue
+        import threading
+
+        box: queue.Queue = queue.Queue(maxsize=1)
+        with self._gate:
+            self._pending.append((prompt, box))
+            if len(self._pending) == 1:
+                self._timer = threading.Timer(self.window_s, self._flush)
+                self._timer.daemon = True
+                self._timer.start()
+            elif len(self._pending) >= self.max_batch:
+                if self._timer is not None:
+                    self._timer.cancel()
+                self._flush_locked()
+        result = box.get()
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def _flush(self) -> None:
+        with self._gate:
+            self._flush_locked()
+
+    def _flush_locked(self) -> None:
+        """Called with ``self._gate`` held: pop everything waiting and run it, outside that lock."""
+
+        batch, self._pending, self._timer = self._pending, [], None
+        if not batch:
+            return
+        prompts = [p for p, _ in batch]
+        batched = len(batch) > 1 and hasattr(self.engine, "score_batch")
+        with self.lock:
+            try:
+                results = self.engine.score_batch(prompts) if batched else [self.engine.score(p) for p in prompts]
+            except BaseException as exc:      # noqa: BLE001 - delivered to every waiter, never raised here
+                for _, box in batch:
+                    box.put(exc)
+                return
+        for (_, box), result in zip(batch, results):
+            box.put(result)

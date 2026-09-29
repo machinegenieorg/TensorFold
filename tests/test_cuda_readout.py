@@ -185,3 +185,143 @@ def test_rank_allowed_none_is_unrestricted_top_k_over_the_vocab():
     assert chosen == 1                                  # argmax of the raw (unmasked) logits
     assert [tid for tid, _ in ranked] == [1, 2, 0]       # top 3 by logprob, descending
     assert ranked[0][1] == pytest.approx(expect[1].item(), abs=1e-6)
+
+
+class _FakeEngine:
+    """Records every call it gets; ``score``/``score_batch`` return the prompt itself so a test can check routing."""
+
+    def __init__(self):
+        import threading
+
+        self.calls: list[tuple[str, object]] = []
+        self.lock = threading.Lock()
+
+    def score(self, prompt):
+        with self.lock:
+            self.calls.append(("score", prompt))
+        return f"solo:{prompt}"
+
+    def score_batch(self, prompts):
+        with self.lock:
+            self.calls.append(("score_batch", tuple(prompts)))
+        return [f"batch:{p}" for p in prompts]
+
+
+class _FakeEngineNoBatch:
+    """Like ``_FakeEngine`` but with no ``score_batch`` at all, as an engine that predates batching would be."""
+
+    def __init__(self):
+        import threading
+
+        self.calls: list[tuple[str, object]] = []
+        self.lock = threading.Lock()
+
+    def score(self, prompt):
+        with self.lock:
+            self.calls.append(("score", prompt))
+        return f"solo:{prompt}"
+
+
+def test_score_batcher_batches_concurrent_submissions():
+    import threading
+
+    from tensorfold.cuda.readout import ScoreBatcher
+
+    engine = _FakeEngine()
+    batcher = ScoreBatcher(engine, threading.Lock(), window_s=0.05, max_batch=8)
+    results: dict[int, str] = {}
+
+    def worker(i):
+        results[i] = batcher.score(f"p{i}")
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=2)
+
+    assert results == {i: f"batch:p{i}" for i in range(4)}
+    assert engine.calls == [("score_batch", ("p0", "p1", "p2", "p3"))]
+
+
+def test_score_batcher_uses_the_solo_path_when_nothing_else_is_pending():
+    import threading
+
+    from tensorfold.cuda.readout import ScoreBatcher
+
+    engine = _FakeEngine()
+    batcher = ScoreBatcher(engine, threading.Lock(), window_s=0.01, max_batch=8)
+    assert batcher.score("only") == "solo:only"
+    assert engine.calls == [("score", "only")]
+
+
+def test_score_batcher_flushes_early_at_max_batch_without_waiting_the_window():
+    import threading
+    import time
+
+    from tensorfold.cuda.readout import ScoreBatcher
+
+    engine = _FakeEngine()
+    batcher = ScoreBatcher(engine, threading.Lock(), window_s=5.0, max_batch=2)   # a window that would never fire
+    results: dict[int, str] = {}
+
+    def worker(i):
+        results[i] = batcher.score(f"p{i}")
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+    start = time.perf_counter()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=2)
+    assert time.perf_counter() - start < 1.0             # did not wait for the 5s window
+    assert results == {0: "batch:p0", 1: "batch:p1"}
+
+
+def test_score_batcher_falls_back_to_solo_calls_without_score_batch():
+    import threading
+
+    from tensorfold.cuda.readout import ScoreBatcher
+
+    engine = _FakeEngineNoBatch()
+    batcher = ScoreBatcher(engine, threading.Lock(), window_s=0.05, max_batch=8)
+    results: dict[int, str] = {}
+
+    def worker(i):
+        results[i] = batcher.score(f"p{i}")
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=2)
+
+    assert results == {i: f"solo:p{i}" for i in range(3)}
+    assert sorted(engine.calls) == sorted(("score", f"p{i}") for i in range(3))
+
+
+def test_score_batcher_delivers_the_exception_to_every_waiter():
+    import threading
+
+    from tensorfold.cuda.readout import ScoreBatcher
+
+    class Failing:
+        def score_batch(self, prompts):
+            raise ValueError("boom")
+
+    batcher = ScoreBatcher(Failing(), threading.Lock(), window_s=0.05, max_batch=8)
+    errors: dict[int, Exception] = {}
+
+    def worker(i):
+        try:
+            batcher.score(f"p{i}")
+        except ValueError as exc:
+            errors[i] = exc
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=2)
+
+    assert len(errors) == 3 and all(str(e) == "boom" for e in errors.values())

@@ -26,7 +26,8 @@ from tensorfold.server.tool_policy import ToolCallPolicy
 from tensorfold.engine.call_gate import CallGate, call_format, generate_gated
 from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
 
-from tensorfold.cuda.readout import ScoreError, build_choice, is_score_request, parse_score_request, rank_allowed
+from tensorfold.cuda.readout import (ScoreBatcher, ScoreError, build_choice, is_score_request, parse_score_request,
+                                     rank_allowed)
 from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, hide_tool_calls, parse_tool_calls
 from tensorfold.server.text import split_thinking
 
@@ -121,6 +122,7 @@ class App:
         if self.context_window < 0:
             raise ValueError("context_window must be 0 or a positive token count")
         self.lock = threading.Lock()
+        self.score_batcher = ScoreBatcher(engine, self.lock)
 
     @property
     def model_ids(self) -> list[str]:
@@ -417,11 +419,10 @@ class App:
             prepared = parse_score_request(body, vocab=getattr(self.engine, "vocab_size", None) or None)
         except ScoreError as exc:
             raise RequestError(str(exc)) from exc
-        with self.lock:
-            try:
-                logits = self.engine.score(prepared.prompt)
-            except ValueError as exc:
-                raise RequestError(str(exc)) from exc
+        try:
+            logits = self.score_batcher.score(prepared.prompt)
+        except ValueError as exc:
+            raise RequestError(str(exc)) from exc
         chosen, ranked = rank_allowed(logits, prepared.allowed_token_ids, prepared.num_logprobs)
         return build_choice(chosen, ranked, prepared.num_logprobs)
 

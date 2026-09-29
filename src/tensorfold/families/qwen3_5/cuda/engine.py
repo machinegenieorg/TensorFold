@@ -238,6 +238,25 @@ class Qwen27Engine:
             self._remember(list(prompt[:end]), *kept)
         return logits
 
+    def score_batch(self, prompts: list[list[int]]) -> list:
+        """Several readout requests in one forward (``prefill.multi_prefill_logits``): each prompt scored cold, no
+        prefix-cache reuse combined with this (batching several *different* prompts trades the reuse a single
+        repeated prefix could give for sharing every projection's matmul across all of them in one bigger call —
+        the win that matters when the prompts do not actually share a resumable prefix). Single-GPU (``tp == 1``)
+        only, like ``score``.
+        """
+
+        from .prefill import multi_prefill_logits
+
+        if self.tp == 2:
+            raise ValueError("scoring runs on a single GPU (tp=1); this engine was started with --tp 2")
+        for prompt in prompts:
+            if len(prompt) >= self.context_window:
+                raise ValueError(f"prompt of {len(prompt)} tokens exceeds the {self.context_window}-token safe "
+                                 "capacity; shorten the prompt")
+        logits = multi_prefill_logits(self.w, prompts)
+        return [logits[i:i + 1] for i in range(len(prompts))]
+
     # two ranks: rank 0 sends each request's header and prompt to rank 1, both run the same calls
     def _generate_tp(self, prompt, max_tokens, sampling, on_tokens, hit, t0, draft, stop_eos=True, vision=None):
         from .decode_tp import _share, decode_tp, pack_sampling, prefill_tp
