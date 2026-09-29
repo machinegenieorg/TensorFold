@@ -307,9 +307,9 @@ def load(model_dir: str | Path, device: str = "cuda", *, tiled: bool = False, ml
         from tensorfold.quantization import resolve_affine, validate_shapes
 
         w = get(name + ".weight")
-        spec = resolve_affine(raw, key(name))
+        spec = resolve_affine(raw, prefix + name)
         if spec is None:
-            if key(name + ".scales") in t or key(name + ".biases") in t:
+            if (prefix + name + ".scales") in t or (prefix + name + ".biases") in t:
                 raise ValueError(f"{name} has packed weights but no enabled affine metadata")
             if w.ndim != 2 or w.dtype not in (torch.bfloat16, torch.float16, torch.float32):
                 raise ValueError(f"{name} needs floating weights or declared affine metadata")
