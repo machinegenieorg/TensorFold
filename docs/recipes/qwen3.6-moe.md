@@ -2,7 +2,7 @@
 
 The `qwen3_5_moe` family serves Qwen3.6-35B-A3B on one NVIDIA GPU. Its layers are the 27B's (Gated DeltaNet
 and gated full attention, every fourth layer attention) with routed experts in place of the dense MLP, and it
-drafts with the checkpoint's own MTP layer.
+drafts with the checkpoint's own MTP layer. It reads the MLX 4-bit conversion and NVIDIA's NVFP4 checkpoint.
 
 ## Checkpoint
 
@@ -20,6 +20,70 @@ is placed in it. After the weights, one Spark keeps about 75 GB for caches: atte
 DeltaNet 63 MB a stream.
 
 `--no-drafts` or request field `"draft": false` selects serial decoding, the reference drafted output equals.
+
+### NVIDIA's NVFP4 checkpoint
+
+```bash
+tensorfold pull nvidia/Qwen3.6-35B-A3B-NVFP4
+tensorfold serve nvidia/Qwen3.6-35B-A3B-NVFP4 --name bench
+```
+
+Tested revision: `1355db6a052410cfd62085d94b58866fd0f2c3c5` (22 GB, ModelOpt 0.44, `MIXED_PRECISION`), the weights
+vLLM serves. The engine reads them as they ship; each layer's format is the checkpoint's:
+
+| Tensors | Stored as | Read by |
+| --- | --- | --- |
+| Routed experts, shared expert, `lm_head` | `W4A16_NVFP4`: E2M1 nibbles, an e4m3 scale per 16 values, an fp32 scale per tensor | Flash Next's NVFP4 kernels (`qwen4_exp/cuda/nvfp4*.py`) on the stored bytes: experts grouped on the experts plan, the shared expert and the head through `nvfp4.matmul`, bf16 activations |
+| DeltaNet `in_proj_qkv`, `in_proj_z`, `out_proj`; attention `q/k/v/o_proj` | `FP8`: e4m3 codes, an fp32 scale per tensor | `fp8.py`: the codes (exact in bf16) are the tensor-core operand and the scale multiplies the fp32 sums, bf16 activations |
+| Embedding, routers, shared-expert gates, `in_proj_a/b`, conv, norms, the MTP layer | bf16 | as stored (`bf16.matmul`; the MTP layer's stacked experts ride the NVFP4 tables as identity-scaled bf16) |
+
+The FP8 projections stay one byte a weight: widened to bf16 at load they would take 2.38 GiB instead of 1.19 GiB,
+and a decode step's 130 FP8 matmuls 2.06 ms instead of 1.31 ms. The checkpoint's `input_scale` tensors are
+calibration scales for vLLM's FP8 activations, and `kv_cache_quant_algo: FP8` names vLLM's cache format: neither
+is part of the weights, so activations and the KV cache stay bf16. The RMSNorm weights are stored zero-centred
+(the model applies `1 + w`, which MLX conversions store instead) and become that scale in fp32 at load; DeltaNet's
+gated norm is stored as applied. The MTP head drafts over the draft vocabulary's rows of the NVFP4 head. The
+vision tower is not read. Exactness is the MLX route's: drafted replies equal `"draft": false`, `--parallel N`
+equals solo, a resumed prompt equals a fresh prefill, and startup admits the window before loading.
+
+Fidelity on eight public passages of 1,024 tokens (`pydoc_data` topics and standard-library source): next-token
+NLL and the share of positions whose top token equals the fp32 forward of the original bf16 release
+(`Qwen/Qwen3.6-35B-A3B` at `995ad96`) or of this checkpoint's exactly dequantized weights. Verify windows give
+the tokens serial decoding gives; the prompt path fills the context.
+
+| Scores | NLL (nats/token) | Top 1 = bf16 release | Top 1 = NVFP4, fp32 |
+| --- | ---: | ---: | ---: |
+| bf16 release, fp32 | 0.4464 | 100% | 93.62% |
+| NVFP4 checkpoint, fp32 | 0.5041 | 93.62% | 100% |
+| NVFP4 route, verify windows | 0.4992 | 93.51% | 98.07% |
+| NVFP4 route, prompt path | 0.5023 | 93.62% | 97.91% |
+| MLX 4-bit route, verify windows | 0.5183 | 90.69% | 89.67% |
+| MLX 4-bit route, prompt path (FP8 activations) | 0.5444 | 89.63% | 88.67% |
+
+```bash
+python -m tensorfold.families.qwen3_5_moe.cuda.reference reference <bf16 or NVFP4 folder> out.pt <tokenizer folder>
+python -m tensorfold.families.qwen3_5_moe.cuda.reference route <any checkpoint folder> out.pt <tokenizer folder>
+python -m tensorfold.families.qwen3_5_moe.cuda.reference compare reference.pt route.pt ...
+```
+
+On one RTX PRO 6000 Blackwell Max-Q (NGC 26.07, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`), with 8 client
+threads over HTTP and the workloads of [Concurrent requests](#concurrent-requests), both checkpoints measured the
+same day:
+
+| | NVFP4, `--parallel 1` | MLX 4-bit, `--parallel 1` | NVFP4, `--parallel 8` | MLX 4-bit, `--parallel 8` |
+| --- | ---: | ---: | ---: | ---: |
+| Label JSON, 32 requests | 292 tok/s | 896 tok/s | 581 tok/s | 1,481 tok/s |
+| p50 / p95 latency | 30.1 / 32.2 s | 8.6 / 9.2 s | 14.8 / 20.5 s | 5.1 / 7.7 s |
+| Chat, 48 requests | 134 tok/s | 427 tok/s | 360 tok/s | 1,099 tok/s |
+| p50 / p95 latency | 10.2 / 12.0 s | 3.3 / 4.0 s | 3.4 / 6.2 s | 1.2 / 2.0 s |
+| Peak memory (nvidia-smi) | 26.4 GB | 22.7 GB | 27.3 GB | 23.4 GB |
+
+Every NVFP4 reply's token SHA-256 is the same at `--parallel 1`, at `--parallel 8` and with `"draft": false`
+(80 of 80), and without expandable segments. Drafts keep as many tokens a round as the MLX route's (label 9.8,
+chat 3.0), so the difference is the forward: one verify forward of up to four rows takes 18 ms of GPU time
+against 4.7 ms. Of that, 10.6 ms is the grouped NVFP4 gate/up kernel, where the MLX route's gate/up experts take
+1.3 ms over the same bytes (an NVFP4 and an MLX 4-bit g64 weight are both 0.5625 bytes); 1.6-2.4 ms is the grouped
+down kernel and 1.0 ms the FP8 projections. GB10 figures are still to be measured.
 
 ## CUDA execution
 

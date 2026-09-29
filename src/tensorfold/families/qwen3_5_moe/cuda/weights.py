@@ -47,8 +47,15 @@ def routed(prefix: str, get: Callable, top_k: int) -> Routed:
 
 
 def load(model_dir: str | Path) -> Weights:
-    """The checkpoint on the GPU, projections packed for the shared matmul and experts for the grouped kernels."""
+    """The checkpoint on the GPU: MLX 4-bit projections packed for the shared matmul and experts for the grouped
+    kernels, or a ModelOpt checkpoint as it ships (``modelopt``)."""
 
+    from .modelopt import is_modelopt
+
+    if is_modelopt(model_dir):
+        from .modelopt import load as load_modelopt
+
+        return load_modelopt(model_dir)
     return load_dense(model_dir, tiled=True,
                       mlp=lambda prefix, get, qlinear, cfg: {"moe": routed(prefix, get, cfg.top_k)})
 
@@ -59,7 +66,7 @@ class MTP:
 
     norm_e: torch.Tensor
     norm_h: torch.Tensor
-    fc_e: QLinear
+    fc_e: QLinear             # or a bf16 projection (``modelopt.Dense``) on the NVFP4 route
     fc_h: QLinear
     input_norm: torch.Tensor
     post_norm: torch.Tensor
@@ -93,6 +100,10 @@ def load_mtp(model_dir: str | Path, w: Weights, device: str = "cuda") -> MTP | N
 
     from tensorfold.families.qwen3_5.cuda.qmm_fast import tile
 
+    if w.quant == "modelopt":
+        from .modelopt import load_mtp as load_modelopt_mtp
+
+        return load_modelopt_mtp(model_dir, w, device)
     raw = mtp_tensors(model_dir)
     if raw is None:
         return None

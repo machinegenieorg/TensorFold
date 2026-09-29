@@ -8,21 +8,45 @@ from typing import Any
 MODEL_TYPES = ("qwen3_5_moe",)
 TITLE = "Qwen3.6 MoE"
 LANES = True
-# MLX 4-bit, groups of 64, routers 8-bit, MTP layer in mtp-4bit.safetensors (mlx-community's files take it too)
-MODELS = ("Vontra/Qwen3.6-35B-A3B-MLX-4bit-MTP",)
+# MLX 4-bit, groups of 64, routers 8-bit, MTP layer in mtp-4bit.safetensors (mlx-community's files take it too);
+# and NVIDIA's NVFP4 checkpoint as it ships: experts, shared expert and lm_head NVFP4, projections FP8, MTP bf16
+MODELS = ("Vontra/Qwen3.6-35B-A3B-MLX-4bit-MTP", "nvidia/Qwen3.6-35B-A3B-NVFP4")
 REQUIRED_FILES = {MODELS[0]: ("mtp-4bit.safetensors",)}
+QUANT_METHODS = {"cuda": ("mlx", "modelopt")}     # MLX affine 4-bit, or ModelOpt NVFP4 with FP8 projections
 # the CUDA engine's kernels read MLX affine weights of this (bits, group size)
 CUDA_QUANTIZATION = (4, 64)
+# the ModelOpt algorithms the NVFP4 route reads: NVFP4 weights in blocks of 16, FP8 weights with a scale a tensor
+# (activations stay bf16 either way: the checkpoint's activation scales are not read)
+MODELOPT_ALGOS = {"W4A16_NVFP4": 16, "NVFP4": 16, "FP8": None}
 
 
 def check(model_dir: str | Path) -> None:
-    """One GPU, MLX 4-bit weights in groups of 64."""
+    """One GPU; MLX 4-bit weights in groups of 64, or a ModelOpt checkpoint of NVFP4 (blocks of 16) and FP8 layers."""
 
-    from tensorfold.families import OWN_MODEL_HELP, describe_quantization, quantization, read_config
+    from tensorfold.families import OWN_MODEL_HELP, describe_quantization, quant_method, quantization, read_config
 
-    if quantization(read_config(model_dir)) != CUDA_QUANTIZATION:
-        raise ValueError(f"{TITLE}'s CUDA engine reads MLX 4-bit weights in groups of 64 ({MODELS[0]}); this "
-                         f"checkpoint has {describe_quantization(read_config(model_dir))}. {OWN_MODEL_HELP}")
+    config = read_config(model_dir)
+    if quant_method(config) == "modelopt":
+        block = config.get("quantization_config") or config.get("quantization") or {}
+        layers = block.get("quantized_layers")
+        extra = Path(model_dir) / "hf_quant_config.json"
+        if not layers and extra.is_file():
+            import json
+
+            layers = (json.loads(extra.read_text()).get("quantization") or {}).get("quantized_layers")
+        algos = {(str(v.get("quant_algo")).upper(), v.get("group_size")) for v in (layers or {}).values()}
+        if not algos:
+            algos = {(str(block.get("quant_algo")).upper(), block.get("group_size"))}
+        bad = sorted(f"{a}" + (f" (blocks of {g})" if g else "") for a, g in algos
+                     if a not in MODELOPT_ALGOS or (MODELOPT_ALGOS[a] and int(g or 16) != MODELOPT_ALGOS[a]))
+        if bad:
+            raise ValueError(f"{TITLE}'s CUDA engine reads ModelOpt NVFP4 weights in blocks of 16 and FP8 weights "
+                             f"({MODELS[1]}); this checkpoint has {', '.join(bad)}. {OWN_MODEL_HELP}")
+        return
+    if quantization(config) != CUDA_QUANTIZATION:
+        raise ValueError(f"{TITLE}'s CUDA engine reads MLX 4-bit weights in groups of 64 ({MODELS[0]}) or NVIDIA's "
+                         f"NVFP4 checkpoint ({MODELS[1]}); this checkpoint has {describe_quantization(config)}. "
+                         f"{OWN_MODEL_HELP}")
 
 
 def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
