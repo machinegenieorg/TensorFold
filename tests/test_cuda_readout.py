@@ -121,3 +121,41 @@ def test_build_choice_trims_top_logprobs_to_num_logprobs():
     ranked = [(1, -0.1), (2, -1.0), (3, -2.0)]
     choice = build_choice(1, ranked, num_logprobs=2)
     assert choice["logprobs"]["top_logprobs"] == [{"token_id:1": -0.1, "token_id:2": -1.0}]
+
+
+def test_rank_allowed_renormalises_over_the_allowed_set_only():
+    """vLLM's processed_logprobs at temperature 0: log-softmax the raw logits after masking to the allowed set, so
+    the allowed set's logprobs alone exponentiate to 1, and the chosen id is the allowed set's argmax raw logit."""
+
+    import math
+
+    torch = pytest.importorskip("torch")
+    from tensorfold.cuda.readout import rank_allowed
+
+    gen = torch.Generator().manual_seed(0)
+    vocab = 1000
+    logits = (torch.randn(1, vocab, generator=gen) * 5)
+    allowed = sorted(torch.randperm(vocab, generator=gen)[:17].tolist())
+
+    chosen, ranked = rank_allowed(logits, allowed)
+
+    assert sorted(tid for tid, _ in ranked) == allowed
+    total = sum(math.exp(lp) for _, lp in ranked)
+    assert total == pytest.approx(1.0, abs=1e-4)
+    assert chosen == allowed[int(logits[0, allowed].argmax())]
+    assert ranked == sorted(ranked, key=lambda kv: -kv[1])
+
+
+def test_rank_allowed_matches_manual_masked_log_softmax():
+    torch = pytest.importorskip("torch")
+    from tensorfold.cuda.readout import rank_allowed
+
+    logits = torch.tensor([[1.0, 5.0, 2.0, -3.0, 0.5]])
+    allowed = [0, 2, 4]
+    chosen, ranked = rank_allowed(logits, allowed)
+    expect = torch.tensor([1.0, 2.0, 0.5]).log_softmax(dim=-1)
+    got = {tid: lp for tid, lp in ranked}
+    assert got[0] == pytest.approx(expect[0].item(), abs=1e-6)
+    assert got[2] == pytest.approx(expect[1].item(), abs=1e-6)
+    assert got[4] == pytest.approx(expect[2].item(), abs=1e-6)
+    assert chosen == 2
