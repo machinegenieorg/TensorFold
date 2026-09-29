@@ -100,7 +100,7 @@ class FlashNextEngine:
         locked = False
         if prefetch and not ple_on_ssd:               # the n-gram tables' pages, read now rather than by requests
             tables = {id(layer.ple.table): layer.ple.table for layer in w.layers if layer.ple is not None}
-            size = sum(a.nbytes for t in tables.values() for a in t.words + t.scales + t.biases)
+            size = sum(t.nbytes for t in tables.values())
             # pinned pages are no longer reclaimable: lock only what the startup budget leaves room for
             room = self.capacity_plan["budget_bytes"] - self.capacity_plan["total_bytes_estimate"]
             for table in tables.values():
@@ -110,13 +110,18 @@ class FlashNextEngine:
         read_s = time.perf_counter() - started
         captured = self.e.graphs.warm(self.depth + 1) if self.e is not None and self.e.graphs is not None else 0
         started = time.perf_counter()
-        if self.concurrent:
+        import os
+        if os.environ.get("TENSORFOLD_SKIP_WARM", "").strip() in ("1", "true", "yes"):
+            print("[tensorfold] prompt-kernel warm skipped (TENSORFOLD_SKIP_WARM)", flush=True)
+            warm_s = 0.0
+        elif self.concurrent:
             self.multi.warm()
+            warm_s = time.perf_counter() - started
         else:
             from .decode import warm
 
             warm(self.e)
-        warm_s = time.perf_counter() - started
+            warm_s = time.perf_counter() - started
         self.eos = tuple(w.cfg.eos)
         self.served = 0
         self.cache: list[tuple[list[int], dict]] = []    # (committed ids, what resuming from them needs)

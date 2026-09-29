@@ -125,7 +125,15 @@ class Engine:
         if graphs:
             from .graphs import Graphs
 
-            self.graphs = Graphs(self, max_rows=max_rows)
+            # Capture is what makes decoding fast, but it cannot hold a step that reads device data on the
+            # host: the NVFP4 expert path walks its plan's item list (a synchronising copy), and a capture
+            # rejects it — as cudaErrorStreamCaptureInvalidated, after the weights are already loaded. Decline
+            # it here, where the model's own answer is known, rather than let the load end in a capture error.
+            if any(getattr(layer.moe.experts, "capturable", True) is False for layer in w.layers):
+                print("[tensorfold] CUDA graphs off: a layer's experts declare themselves uncapturable; "
+                      "decode runs eagerly (correct, slower)")
+            else:
+                self.graphs = Graphs(self, max_rows=max_rows)
 
     def reset(self) -> None:
         self.st.reset(self.w)
@@ -181,13 +189,27 @@ class Engine:
             top, col = row.max(dim=-1, keepdim=True)            # the first maximum: argmax's (and serial's) choice
             got = torch.cat([top, lse, col.float()], dim=1).cpu().numpy()[0]       # one sync
             c = int(got[2])
-            tok = int(self._draft_host[c]) if mapped else c
+            if mapped:
+                if c < 0 or c >= len(self._draft_host):
+                    raise IndexError(f"draft argmax column {c} out of range for draft_ids "
+                                     f"(len={len(self._draft_host)}, logits={row.shape[1]})")
+                tok = int(self._draft_host[c])
+            else:
+                tok = c
             return tok, float(np.exp(float(got[0]) - float(got[1])))
         k = min(row.shape[1], int(sampling.top_k) + MARGIN) if sampling.top_k else row.shape[1]
         vals, idx = torch.topk(row, k, dim=-1, sorted=False)
         got = torch.cat([vals, lse, idx.float()], dim=1).cpu().numpy()[0]          # one sync
         cols = got[k + 1:].astype(np.int64)
-        ids = self._draft_host[cols] if mapped else cols
+        if mapped:
+            # columns are indices into the draft head (length of draft_ids), never the full vocabulary
+            if cols.max(initial=-1) >= len(self._draft_host) or cols.min(initial=0) < 0:
+                raise IndexError(f"draft sample column out of range for draft_ids "
+                                 f"(cols=[{cols.min()}, {cols.max()}], draft_ids={len(self._draft_host)}, "
+                                 f"logits={row.shape[1]})")
+            ids = self._draft_host[cols]
+        else:
+            ids = cols
         tok = choose_rows(got[None, :k].astype(np.float32), ids[None, :], [position], sampling)[0]
         hit = np.nonzero(ids == tok)[0]
         return int(tok), float(np.exp(float(got[hit[0]]) - float(got[k]))) if len(hit) else 0.0
