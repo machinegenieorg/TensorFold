@@ -1,4 +1,5 @@
-"""Load a Qwen3 embedding checkpoint for prompt rows: bf16 as shipped, or MLX affine 4-bit packed once for ``qmm``."""
+"""Load a Qwen3 embedding checkpoint for prompt rows: bf16 as shipped, or MLX affine 4-bit (groups of 32 or 64) packed
+once for ``qmm``."""
 
 from __future__ import annotations
 
@@ -39,9 +40,9 @@ class Linear:
 
 
 def q4_tile(m: int) -> int:
-    """``qmm_prefill``'s block shape for ``m`` rows (64 x 64 spreads a few rows' weights over more SMs); bits never change."""
+    """``qmm_prefill``'s block shape for ``m`` rows (64 x 64 spreads a few rows' weights over the SMs); same bits."""
 
-    return 3 if m <= 64 else 0
+    return 3 if m <= 128 else 0
 
 
 @dataclass
@@ -161,12 +162,13 @@ def load(model_dir: str | Path, device: str = "cuda", *, positions: int = 0) -> 
         if parts[0].layout == "dense":
             w = parts[0].weight if len(parts) == 1 else torch.cat([q.weight for q in parts]).contiguous()
             return Linear(w)
-        if (parts[0].bits, parts[0].gs) != (4, 64):
-            raise ValueError(f"{names[0]}: the prompt kernels read 4-bit weights in groups of 64")
+        if parts[0].bits != 4 or parts[0].gs not in (32, 64):
+            raise ValueError(f"{names[0]}: the prompt kernels read 4-bit weights in groups of 32 or 64")
         cat = (lambda ts: ts[0]) if len(parts) == 1 else (lambda ts: torch.cat(ts).contiguous())
         words, scales, biases = (cat([getattr(q, f) for q in parts]) for f in ("weight", "scales", "biases"))
+        group = parts[0].gs
         del parts
-        return Linear(qmm.pack(words, scales, biases, 64))
+        return Linear(qmm.pack(words, scales, biases, group))
 
     layers = []
     for i in range(cfg.layers):

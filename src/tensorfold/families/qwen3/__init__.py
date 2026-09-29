@@ -1,4 +1,4 @@
-"""Qwen3 dense decoders served as last-token embedding models on CUDA: /v1/embeddings, a row-invariant prompt forward."""
+"""Qwen3 dense decoders as last-token embedding models on CUDA: /v1/embeddings over a row-invariant prompt forward."""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ from typing import Any
 MODEL_TYPES = ("qwen3",)
 TITLE = "Qwen3 embeddings"
 MODELS = ("Qwen/Qwen3-Embedding-8B",)
-# bf16 as shipped, or MLX affine 4-bit in groups of 64 (``python -m tensorfold.families.qwen3.convert``)
+# bf16 as shipped, or MLX affine 4-bit in groups of 64 or 32 (``python -m tensorfold.families.qwen3.convert``)
 QUANT_METHODS = {"cuda": (None, "mlx")}
 CUDA_AFFINE_BITS = (4,)
-CUDA_AFFINE_GROUPS = (64,)
+CUDA_AFFINE_GROUPS = (32, 64)
 EMBED_BITS = (4, 8)            # the token table may keep more bits than the projections
 HEAD_DIMS = (64, 128, 256)     # the prompt attention kernel's head widths
 BATCH_TOKENS = 8192            # tokens one forward step takes by default (--batch-tokens)
@@ -49,7 +49,8 @@ def check(model_dir: str | Path) -> None:
 
 
 def check_quantization(config: dict[str, Any], backend: str) -> None:
-    """MLX affine 4-bit groups of 64 for the projections; the token table 4- or 8-bit, or unquantized."""
+    """MLX affine 4-bit for the projections, groups of 32 or 64; the token table 4- or 8-bit in groups of 64, or
+    unquantized."""
 
     from tensorfold.quantization import checkpoint_specs
 
@@ -57,11 +58,13 @@ def check_quantization(config: dict[str, Any], backend: str) -> None:
         embed = path.endswith("embed_tokens")
         if spec is None and embed:
             continue
-        if spec is None or spec.group_size != 64 or spec.bits not in (EMBED_BITS if embed else CUDA_AFFINE_BITS):
+        groups, widths = ((64,), EMBED_BITS) if embed else (CUDA_AFFINE_GROUPS, CUDA_AFFINE_BITS)
+        if spec is None or spec.group_size not in groups or spec.bits not in widths:
             where = f"'{path}'" if path else "the checkpoint"
-            raise ValueError(f"{TITLE}'s CUDA kernels read MLX affine 4-bit weights in groups of 64 (the token "
-                             f"table may be 4- or 8-bit or unquantized); {where} declares {spec or 'no quantization'}. "
-                             "Convert the bf16 checkpoint with `python -m tensorfold.families.qwen3.convert`")
+            raise ValueError(f"{TITLE}'s CUDA kernels read MLX affine 4-bit weights in groups of 64 or 32 (the "
+                             f"token table 4- or 8-bit in groups of 64, or unquantized); {where} declares "
+                             f"{spec or 'no quantization'}. Convert the bf16 checkpoint with "
+                             "`python -m tensorfold.families.qwen3.convert`")
 
 
 def pooling(model_dir: str | Path) -> None:
