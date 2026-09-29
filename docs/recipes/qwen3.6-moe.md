@@ -69,6 +69,29 @@ Every reply's token SHA-256 is the same at each N and with `"draft": false`. The
 so copied continuations keep 9.3 tokens a round per stream; chats keep 2.9. One client at a time gets 912 tok/s
 on the label requests at `--parallel 8`, as a lone stream replays the graphs.
 
+### Structured output
+
+With `pip install 'tensorfold[grammar]'` (xgrammar), the engine enforces `response_format` JSON schemas, alone and
+with `--parallel N` ([API reference](../api.md#structured-output)). A chain or copied continuation loses its first
+draft the grammar rejects, or a stop token, and every row after it. The verify forward runs as without a schema (a
+graph replay or a shared eager round); its logits are then masked by each row's path before sampling, and the grammar
+follows the kept tokens. The head drafts as it does without a schema. A constrained reply equals its `"draft": false`
+reply and, with `--parallel N`, its solo run.
+
+The label requests above with a JSON schema (an array of `{id, themes, tone, evidence}` objects, themes from the
+allowed list), on the same GPU and settings:
+
+| | `--parallel 1` | `--parallel 4` | `--parallel 8` |
+| --- | ---: | ---: | ---: |
+| Label JSON with the schema | 852 tok/s | 1,162 tok/s | 1,340 tok/s |
+| p50 / p95 latency | 8.1 / 8.9 s | 5.6 / 7.5 s | 4.8 / 8.3 s |
+| The same requests without it | 907 tok/s | 1,248 tok/s | 1,489 tok/s |
+
+26 of the 32 replies end and validate; the other six reach the 1,410-token limit and stop as incomplete JSON
+(`finish_reason: "length"`). Every reply's token SHA-256 is the same at each N and with `"draft": false`. One stream
+decodes 1,097 tok/s against 1,143 without the schema: the grammar's windows and masks add about 0.2 ms to an 8.1 ms
+round. The rest of the gap is prefill spread over shorter replies (27,857 tokens against 32,032).
+
 ## Measurements
 
 One DGX Spark (GB10) in NVIDIA's `pytorch:26.07-py3` container, checkpoint revision 81169a9, against vLLM serving
