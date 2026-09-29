@@ -101,6 +101,7 @@ class Qwen27Engine:
         else:
             full = load(model_dir, tiled=True)
             self.w = full
+        self.vocab_size = self.w.config.vocab
         self.draft = None
         if draft_dir is not None and (rank == 0 or (tp == 2 and tp_draft)):
             from .dflash2 import DFlash2
@@ -212,6 +213,30 @@ class Qwen27Engine:
                               on_tokens=on_tokens, inplace=True)
         return {"prefill_s": prefill_s, "decode_s": result.seconds, "rounds": result.rounds,
                 "cached": hit[1].pos if hit else 0, "drafts": draft, "min_rows": min(result.widths, default=0)}
+
+    def score(self, prompt: list[int]):
+        """One prefill-only forward for the readout scoring contract: the prompt's last-position full-vocab logits.
+
+        Shares ``generate``'s prefix cache and message-start snapshots, so readouts that repeat a long prompt
+        prefix (a shared system block, or the same turns with a different trailing option) only prefill their own
+        tail. Single-GPU (``tp == 1``) only; there is no two-rank scoring forward in this build.
+        """
+
+        from .decode import prefill_logits
+
+        if self.tp == 2:
+            raise ValueError("scoring runs on a single GPU (tp=1); this engine was started with --tp 2")
+        if len(prompt) >= self.context_window:
+            raise ValueError(f"prompt of {len(prompt)} tokens exceeds the {self.context_window}-token safe capacity; "
+                             "shorten the prompt")
+        hit = self._resume(prompt)
+        stops, keep = self._stops(prompt, hit, draft=True)
+        end = entry_end(prompt) if self._ends(prompt, stops) else None
+        logits, kept = prefill_logits(self.w, prompt, state=hit[1] if hit else None, limit=self.context_window,
+                                      stops=stops, keep=keep, keep_at=end)
+        if end is not None:
+            self._remember(list(prompt[:end]), *kept)
+        return logits
 
     # two ranks: rank 0 sends each request's header and prompt to rank 1, both run the same calls
     def _generate_tp(self, prompt, max_tokens, sampling, on_tokens, hit, t0, draft, stop_eos=True, vision=None):

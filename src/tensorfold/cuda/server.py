@@ -26,6 +26,7 @@ from tensorfold.server.tool_policy import ToolCallPolicy
 from tensorfold.engine.call_gate import CallGate, call_format, generate_gated
 from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
 
+from tensorfold.cuda.readout import ScoreError, build_choice, is_score_request, parse_score_request, rank_allowed
 from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, hide_tool_calls, parse_tool_calls
 from tensorfold.server.text import split_thinking
 
@@ -399,6 +400,31 @@ class App:
         return {"final": final, "calls": calls, "finish": finish, "content": content, "reasoning": reasoning,
                 "prompt_tokens": len(prompt), "completion_tokens": len(out), "stats": stats}
 
+    def score(self, body: dict[str, Any], chat: bool) -> dict[str, Any]:
+        """The readout wrapper's scoring contract: one prefill forward, masked and renormalised over
+        ``allowed_token_ids`` (see ``tensorfold.cuda.readout`` for the vLLM ``processed_logprobs`` semantics this
+        matches). Raises ``RequestError`` for anything outside the contract, including a model this engine cannot
+        score with."""
+
+        if chat:
+            raise RequestError("scoring is served at /v1/completions, not /v1/chat/completions")
+        if not hasattr(self.engine, "score"):
+            raise RequestError("this engine does not implement the readout scoring contract")
+        asked = body.get("model") if isinstance(body, dict) else None
+        if not isinstance(asked, str) or asked not in self.model_ids:
+            raise RequestError(f"unknown model {asked!r}; this endpoint serves {self.model_ids}")
+        try:
+            prepared = parse_score_request(body, vocab=getattr(self.engine, "vocab_size", None) or None)
+        except ScoreError as exc:
+            raise RequestError(str(exc)) from exc
+        with self.lock:
+            try:
+                logits = self.engine.score(prepared.prompt)
+            except ValueError as exc:
+                raise RequestError(str(exc)) from exc
+        chosen, ranked = rank_allowed(logits, prepared.allowed_token_ids)
+        return build_choice(chosen, ranked, prepared.num_logprobs)
+
     def _call_gate(self, prompt: list[int], tools: list[dict[str, Any]]) -> CallGate:
         """The gate a required tool call needs, from this template's call markup and the rendered prompt."""
 
@@ -495,6 +521,21 @@ def make_handler(app: App):
                 body = json.loads(self.rfile.read(length) or b"{}")
             except (json.JSONDecodeError, UnicodeDecodeError):
                 return self._json(400, {"error": {"message": "the request body is not JSON", "type": "invalid_request_error"}})
+            if is_score_request(body):
+                try:
+                    choice = app.score(body, chat)
+                except RequestError as exc:
+                    return self._json(503 if isinstance(exc, CapacityError) else 400,
+                                      {"error": {"message": str(exc), "type": "invalid_request_error"}})
+                except Exception as exc:
+                    _log_error(exc)
+                    return self._json(500, {"error": {"message": _error_message(exc)}})
+                prompt_tokens = len(body.get("prompt") or [])
+                payload = {"id": f"cmpl-{uuid.uuid4().hex[:24]}", "object": "text_completion",
+                          "created": int(time.time()), "model": app.reply_model(body), "choices": [choice],
+                          "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 1,
+                                    "total_tokens": prompt_tokens + 1}}
+                return self._json(200, payload)
             try:
                 prepared = app.prepare(body, chat)
             except RequestError as exc:

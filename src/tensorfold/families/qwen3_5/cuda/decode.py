@@ -67,6 +67,27 @@ def prefill(w: Weights, prompt: Sequence[int], sampling: Sampling | None,
     return (st, pending) if keep_at is None else (st, pending, out[1])
 
 
+@torch.no_grad()
+def prefill_logits(w: Weights, prompt: Sequence[int], *, state: State | None = None, limit: int = 0,
+                   stops: Sequence[int] = (), keep: Callable | None = None, keep_at: int | None = None):
+    """Like ``prefill``, but returns the last position's full-vocab logits instead of sampling: the readout
+    scoring contract is one forward over the prompt, never a decode round."""
+
+    from .forward import _mm
+
+    if not prompt:
+        raise ValueError("prefill requires at least one token")
+    st = clone_state(state) if state is not None else State(w)
+    if state is None:
+        st.limit = limit
+    if st.pos >= len(prompt):
+        raise ValueError("a reused state must leave at least one prompt token to process")
+    out = prefill_stops(w, prompt, st, None, stops=stops, keep=keep, keep_at=keep_at)
+    normed = out if keep_at is None else out[0]
+    logits = _mm(normed, w.head).float()
+    return (logits, None) if keep_at is None else (logits, out[1])
+
+
 @dataclass
 class DecodeResult:
     tokens: list[int]

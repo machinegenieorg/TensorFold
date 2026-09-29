@@ -329,8 +329,17 @@ def load(model_dir: str | Path, device: str = "cuda", *, tiled: bool = False, ml
         layers.append(Layer(linear=cfg.is_linear(i), input_norm=get(p + "input_layernorm.weight").contiguous(),
                             post_norm=get(p + "post_attention_layernorm.weight").contiguous(), gdn=gdn, attn=attn,
                             **{"gate": None, "up": None, "down": None, **fields}))
-    w = Weights(config=cfg, embed=qlinear("model.embed_tokens", pack=False), layers=layers,
-                norm=get("model.norm.weight"), head=qlinear("lm_head"))
+    embed = qlinear("model.embed_tokens", pack=False)
+    tied = bool(raw.get("tie_word_embeddings") or (raw.get("text_config") or {}).get("tie_word_embeddings"))
+    if (prefix + "lm_head.weight") in t:
+        head = qlinear("lm_head")
+    elif tied:
+        from .qmm_fast import tile
+
+        head = tile(embed) if tiled else embed             # the embedding table read the other way: (vocab, hidden)
+    else:
+        raise ValueError("no lm_head.weight, and the checkpoint does not declare tied embeddings")
+    w = Weights(config=cfg, embed=embed, layers=layers, norm=get("model.norm.weight"), head=head)
     half = cfg.rope_dims // 2
     inv = cfg.rope_theta ** (-torch.arange(0, half, dtype=torch.float64) / half)
     w.inv_freq = inv.to(torch.float32).to(device)
