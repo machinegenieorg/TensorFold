@@ -346,6 +346,17 @@ class App:
                                      encode=lambda t: list(self.tok.encode(t, add_special_tokens=False).ids))
 
 
+def usage_of(result: dict[str, Any]) -> dict[str, Any]:
+    """OpenAI usage, with ``prompt_tokens_details.cached_tokens`` when the engine reports the prompt tokens it resumed."""
+
+    usage: dict[str, Any] = {"prompt_tokens": result["prompt_tokens"], "completion_tokens": result["completion_tokens"],
+                             "total_tokens": result["prompt_tokens"] + result["completion_tokens"]}
+    cached = (result.get("stats") or {}).get("cached")
+    if isinstance(cached, int) and not isinstance(cached, bool):
+        usage["prompt_tokens_details"] = {"cached_tokens": cached}
+    return usage
+
+
 def token_sha(tokens: list[int]) -> str:
     """A reply's token ids, hashed as the Mac server does: drafted and ``"draft": false`` replies must match."""
 
@@ -444,8 +455,7 @@ def make_handler(app: App):
                                                            "arguments": call["function"]["arguments"]}}]})
                 end = chunk({}, result["finish"])
                 end["tensorfold"] = result["stats"]
-                usage = {"prompt_tokens": result["prompt_tokens"], "completion_tokens": result["completion_tokens"],
-                         "total_tokens": result["prompt_tokens"] + result["completion_tokens"]}
+                usage = usage_of(result)
                 if (body.get("stream_options") or {}).get("include_usage"):
                     end["usage"] = usage
                 try:
@@ -462,8 +472,7 @@ def make_handler(app: App):
                 return
             except RequestError as exc:
                 return self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
-            usage = {"prompt_tokens": result["prompt_tokens"], "completion_tokens": result["completion_tokens"],
-                     "total_tokens": result["prompt_tokens"] + result["completion_tokens"]}
+            usage = usage_of(result)
             if chat:
                 message: dict[str, Any] = {"role": "assistant", "content": result["content"] or None}
                 if result["reasoning"]:
