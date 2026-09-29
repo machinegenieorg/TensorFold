@@ -150,3 +150,36 @@ def test_scoring_one_request_does_not_disturb_an_unrelated_ones_result(w):
     assert _same_bits(first, solo_a)
     assert _same_bits(third, solo_a)
     assert _same_bits(second, solo_c)
+
+
+def test_multi_prefill_logits_is_invariant_to_what_shares_the_batch(w):
+    """A text's batched logits do not depend on which other texts share the call, their order or their lengths."""
+
+    from tensorfold.families.qwen3_5.cuda.prefill import multi_prefill_logits
+
+    a, b, c, d = (_prompt(n, seed=s) for n, s in ((37, 1), (91, 2), (60, 3), (140, 4)))
+
+    solo_a = multi_prefill_logits(w, [a])
+    abc = multi_prefill_logits(w, [a, b, c])
+    cba = multi_prefill_logits(w, [c, b, a])
+    ad = multi_prefill_logits(w, [a, d])
+
+    assert _same_bits(solo_a[0], abc[0])            # alone vs. first in a batch of three
+    assert _same_bits(solo_a[0], cba[2])            # alone vs. last, reverse order
+    assert _same_bits(solo_a[0], ad[0])             # alone vs. batched with a different, longer text
+    assert _same_bits(abc[1], cba[1])               # b's row: same either way (its own position in both)
+    assert _same_bits(abc[2], cba[0])               # c's row: same either way
+
+
+def test_multi_prefill_logits_matches_the_single_stream_path_closely(w):
+    """Batched and single-stream prefill take different (but each internally exact) attention tilings, so their
+    bits differ slightly; they should still agree closely and pick the same top token."""
+
+    prompt = _prompt(200, seed=7)
+    solo, _ = prefill_logits(w, prompt)
+    from tensorfold.families.qwen3_5.cuda.prefill import multi_prefill_logits
+
+    batched = multi_prefill_logits(w, [prompt])
+    diff = (solo.float() - batched[0].float()).abs()
+    assert diff.max().item() < 1.0, f"max abs diff {diff.max().item()}"
+    assert int(solo.argmax()) == int(batched[0].argmax())

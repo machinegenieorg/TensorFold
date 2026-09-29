@@ -153,6 +153,115 @@ def prefill_chunk(w: Weights, tokens: torch.Tensor, st: State, *, tp: bool = Fal
     return normed, taps_out, part
 
 
+def _multi_conv_windows(lengths: Sequence[int], keep: int, device) -> torch.Tensor:
+    """``windows`` for several fresh (cold) texts packed back to back: each text's own sliding causal window over
+    its own zero-initialized conv state, then its own rows, never another text's.
+
+    Generalizes the single-stream ``torch.arange(W)[:, None] + torch.arange(keep + 1)[None, :]`` (``base`` 0) the
+    same way ``forward.multi_tree_forward`` generalizes it for tree windows: a text-relative row ``r``'s window
+    entry ``j`` is ``raw = r - keep + j``; ``raw < 0`` reads that text's own (zeroed) conv-state block (index
+    ``raw + keep``, resolved per row by ``stream_ids`` in ``glue.gdn_pre``'s kernel), ``raw >= 0`` reads this
+    text's own qkv row at ``raw`` (global index ``raw + keep + base``).
+    """
+
+    parts = []
+    base = 0
+    for length in lengths:
+        r = torch.arange(length, device=device, dtype=torch.int64)[:, None]
+        j = torch.arange(keep + 1, device=device, dtype=torch.int64)[None, :]
+        raw = r - keep + j
+        parts.append(torch.where(raw < 0, raw + keep, raw + keep + base).to(torch.int32))
+        base += length
+    return torch.cat(parts, dim=0)
+
+
+@torch.no_grad()
+def multi_prefill_logits(w: Weights, texts: Sequence[Sequence[int]]) -> torch.Tensor:
+    """Several independent cold prefills in one forward: token-id lists packed back to back, the row-invariant
+    projections (and MLP) shared across all of them in one bigger matmul a layer, each text kept to its own GDN
+    chain and its own causal attention window (``glue.gdn_pre``'s existing ``stream_ids`` mode and
+    ``attention_texts``, both already used this way for other batched shapes).
+
+    The GDN chain itself still runs once a text (no shared kernel batches independent chunked-delta-rule states
+    yet): this batches the projections and MLP, which dominate a dense 2,560-wide checkpoint's prefill cost, not
+    the whole forward.
+
+    Returns each text's last-position full-vocab logits, ``(len(texts), vocab)`` fp32. No prefix reuse, no KV
+    growth: built for the readout scoring contract, where every request is a complete fresh prompt and
+    ``max_tokens`` is 1.
+    """
+
+    from tensorfold.cuda.kernels.prefill_attention import attention_texts, text_blocks
+
+    c = w.config
+    if w.fast_prefill:
+        raise ValueError("multi_prefill_logits takes the bf16 prompt-glue path only (fast_prefill checkpoints "
+                         "already have FP8-glued, single-stream, prefill kernels: batch those the usual way)")
+    lengths = [len(t) for t in texts]
+    if not texts or min(lengths) < 1:
+        raise ValueError("multi_prefill_logits takes one or more nonempty texts")
+    dev = w.norm.device
+    keep = c.conv_kernel - 1
+    n, total = len(texts), sum(lengths)
+    ids = torch.tensor([int(tok) for text in texts for tok in text], dtype=torch.int32, device=dev)
+    pos = torch.cat([torch.arange(length, dtype=torch.int32, device=dev) for length in lengths])
+    stream_ids = torch.cat([torch.full((length,), t, dtype=torch.int32, device=dev)
+                            for t, length in enumerate(lengths)])
+    windows = _multi_conv_windows(lengths, keep, dev)
+    blocks = text_blocks(lengths, dev)
+    last = torch.tensor(lengths, dtype=torch.int64, device=dev).cumsum(0) - 1
+    x = glue.embedding(ids, w.embed)
+    pending: torch.Tensor | None = None
+    for layer in w.layers:
+        x, h = prefill_bf16.add_rmsnorm(x, pending, layer.input_norm, c.eps)
+        if layer.linear:
+            gdn = layer.gdn
+            qkv = _mm(h, gdn.qkv)
+            if gdn.zba is not None:
+                zba = _mm(h, gdn.zba)
+                vd = c.v_heads * c.dv
+                z = zba[:, :vd].contiguous().reshape(total, c.v_heads, c.dv)
+                b = zba[:, vd:vd + c.v_heads].contiguous()
+                a = zba[:, vd + c.v_heads:].contiguous()
+            else:
+                z = _mm(h, gdn.z).reshape(total, c.v_heads, c.dv)
+                b = _mm(h, gdn.b)
+                a = _mm(h, gdn.a)
+            conv_state = torch.zeros((n * keep, qkv.shape[1]), dtype=torch.bfloat16, device=dev)
+            q, k, v, g, beta = glue.gdn_pre(qkv, conv_state, gdn.conv, windows, a, b, gdn.A_log, gdn.dt_bias,
+                                            kh=c.k_heads, vh=c.v_heads, dk=c.dk, stream_ids=stream_ids, nkeep=keep)
+            zero_state = torch.zeros((c.v_heads, c.dv, c.dk), dtype=torch.float32, device=dev)
+            yr_parts, offset = [], 0
+            for length in lengths:                              # the chunked delta rule itself: one chain a text
+                sl = slice(offset, offset + length)
+                yr_parts.append(deltanet.chain(q[sl], k[sl], v[sl], g[sl], beta[sl], zero_state,
+                                               torch.empty_like(zero_state)))
+                offset += length
+            r = _mm(prefill_bf16.gated_norm(torch.cat(yr_parts), z, gdn.norm, c.eps), gdn.out)
+        else:
+            attn = layer.attn
+            qg = _mm(h, attn.q)
+            if attn.kv is not None:
+                kv = _mm(h, attn.kv)
+                kd = c.kv_heads * c.head_dim
+                key = kv[:, :kd].contiguous()
+                value = kv[:, kd:].contiguous().reshape(total, c.kv_heads, c.head_dim)
+            else:
+                key = _mm(h, attn.k)
+                value = _mm(h, attn.v).reshape(total, c.kv_heads, c.head_dim)
+            q, key = glue.attn_prep(qg, key, attn.q_norm, attn.k_norm, pos, w.inv_freq, c.eps, heads=c.heads,
+                                    kv_heads=c.kv_heads, head_dim=c.head_dim, mrope_section=c.mrope_section)
+            out = attention_texts(q.contiguous(), key.contiguous(), value.contiguous(), blocks,
+                                  scale=c.head_dim ** -0.5)
+            r = _mm(prefill_bf16.gate_mul(out, qg, heads=c.heads, head_dim=c.head_dim), attn.o)
+        x, h = prefill_bf16.add_rmsnorm(x, r, layer.post_norm, c.eps)
+        pending = _mm(prefill_bf16.swiglu(_mm(h, layer.gate), _mm(h, layer.up)), layer.down)
+    x_last = x.index_select(0, last).contiguous()
+    pending_last = pending.index_select(0, last).contiguous()
+    _, normed, _ = glue.add_rmsnorm(x_last, pending_last, w.norm, c.eps)
+    return dense_kernel.prefill_matmul(normed, w.head.weight, f32=True)
+
+
 def chunks(start: int, end: int, size: int = CHUNK) -> list[tuple[int, int]]:
     """Even chunks of at most ``size`` rows (a short one costs a whole weight pass); any bounds give the same bits."""
 
