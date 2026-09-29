@@ -10,6 +10,7 @@ CUDA kernels. Use the [runbook](../../RUNBOOK.md#nvidia-gpus) for the container 
 | [Nemotron 3.5 Lightning](nemotron-3.5.md#cuda) | One or two ranks, MTP chains and CUDA graphs |
 | [GLM-5.3-Flash](glm-5.3-flash.md#cuda) | Two ranks, MTP and optional DFlash2 |
 | [Qwen3.6-35B-A3B](qwen3.6-moe.md#cuda-execution) | One rank, MTP chains and context copies, CUDA graphs |
+| [Qwen3-Embedding-8B](qwen3-embedding.md) | One rank, packed prompt steps for `/v1/embeddings`, bf16 or 4-bit |
 
 An EXL3 checkpoint's trellis is read by one shared module for every family, any codebook (3inst, mcg, mul1)
 and any width 1 to 8, mixed across a checkpoint and inside one MoE layer: `src/tensorfold/cuda/exl3/`. A family

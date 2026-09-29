@@ -12,6 +12,7 @@ Each family page describes its supported checkpoint, kernels and operating limit
 | Gemma 4 26B-A4B | [MLX, fused one-row decode](gemma-4.md) |
 | DeepSeek-V4-Flash | [MLX on a 256 GB Mac, DSpark and MTP drafts](deepseek-v4-flash.md) |
 | Qwen3.6-35B-A3B | [One-GPU CUDA](qwen3.6-moe.md) |
+| Qwen3-Embedding-8B | [One-GPU CUDA, `/v1/embeddings`, 4-bit conversion](qwen3-embedding.md) |
 
 Contributor guides cover [adding an MLX family](adding-a-family.md),
 [adding a CUDA family](adding-a-cuda-family.md) and [CUDA implementation rules](cuda.md).

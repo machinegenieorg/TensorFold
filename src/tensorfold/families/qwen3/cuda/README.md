@@ -12,7 +12,7 @@ lengths or its position in the step.
 
 | File | Kernel | What it computes | Why a text's bits do not depend on the batch |
 | --- | --- | --- | --- |
-| `tensorfold/cuda/kernels/dense_prefill.cu` | `dense_kernel` | a bf16 projection `x @ W.T`: bf16 tensor-core products, one fp32 chain over K in k16 steps | each output adds its K in the same order at any row count; the five block shapes change only which block computes it |
+| `tensorfold/cuda/kernels/dense.py` | `_matmul` | a bf16 projection `x @ W.T`: bf16 tensor-core products, one fp32 chain over K in k16 steps | each output adds its K in the same order at any row count; the four block shapes change only which block computes it |
 | `tensorfold/cuda/kernels/qmm_prefill.cu` (shared with the 27B) | `prefill_kernel` | a 4-bit projection: each weight `bf16(fma(q, s, b))`, then the same fp32 chain | the same, per group of 64 inputs in order |
 | `tensorfold/cuda/kernels/prefill_attention.py` | `_attend_texts` (beside the 27B's `_attend`, sharing `_tile`) | causal attention within each text of a packed step, 64-key tiles | a block's rows read only their text's keys, tiled from the text's own start, exactly as `attention` tiles that text alone |
 | `glue.py` | `_add_rmsnorm` | adds a projection's fp32 output into the fp32 residual, then RMSNorm to bf16 rows | one program a row |

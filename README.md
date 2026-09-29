@@ -32,6 +32,7 @@ See [image input](docs/vision.md) for the API, checkpoint requirements, cache be
 | Qwen3.8 Flash Next (EXL3, experimental) | `turboderp/Qwen3.8-Flash-Next-exl3` (branch `3.05bpw_h5_ng5`; any codebook, a width per tensor) | CUDA | Included MTP head and context copies |
 | Ternary Bonsai 2 27B | `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` | MLX | `z-lab/Qwen3.8-27B-DFlash2` and context copies |
 | Qwen3.8 Flash Next (NVFP4) | `local-inference-lab/Qwen3.8-Flash-Next-NVFP4` (ModelOpt: NVFP4 experts, MXFP8 attention and DeltaNet); `RadixArk/Qwen3.8-Flash-Next-NVFP4` (bf16 besides the experts) | CUDA, one GPU | Included MTP head and context copies |
+| Qwen3-Embedding-8B | `Qwen/Qwen3-Embedding-8B` (bf16), or its 4-bit conversion (`python -m tensorfold.families.qwen3.convert`) | CUDA, one GPU | None: `/v1/embeddings` only |
 
 `tensorfold models` lists families and checkpoints. `tensorfold info MODEL` checks configuration without
 fetching weights. `serve` downloads a missing checkpoint; `pull` downloads it ahead of time.
@@ -71,6 +72,9 @@ needs MLX 0.32.2 or later. Its draft heads come from DeepSeek's MIT-licensed rel
 `python -m tensorfold.families.deepseek_v4.convert` and passed with `--drafter`; see
 [its recipe](docs/recipes/deepseek-v4-flash.md).
 
+Qwen3-Embedding-8B serves `/v1/embeddings` on one NVIDIA GPU, bf16 as shipped or converted to 4-bit. A text's
+vector has the same bits alone and in any batch; see [its recipe](docs/recipes/qwen3-embedding.md).
+
 See the [recipes](docs/recipes/README.md) for supported formats and backend limits.
 
 ## Exact decoding
@@ -97,7 +101,7 @@ between MLX and CUDA, different quantizations, or different tensor-parallel rank
 | `--host`, `--port` | Listen address, default `127.0.0.1:8080` | Both |
 | `--name` | Model ID advertised to clients | Both |
 | `--vision` | Opt-in Qwen3.5/3.8 dense image input | Both |
-| `--alias` | Additional model IDs | MLX |
+| `--alias` | Additional model IDs | Both |
 | `--context N` | Prompt plus reply capacity | Both |
 | `--max-tokens N` | Default reply limit, 4096 | Both |
 | `--temperature`, `--top-p`, `--top-k` | Sampling defaults; temperature zero is greedy | Both |
@@ -112,6 +116,7 @@ between MLX and CUDA, different quantizations, or different tensor-parallel rank
 | `--kv-dtype bf16`, `int8`, `int4` | Flash Next: `int8` or `int4` stores keys and values with one fp16 scale per 32 values. Other families and the MLX path refuse it | CUDA |
 | `--mtp-confidence P` | Flash Next: stop a draft chain before a later draft under this probability, 0 to 1 (default 0.30) | CUDA |
 | `--tp 2 --rank R --master HOST` | Two-rank CUDA execution | CUDA |
+| `--batch-tokens N` | Embedding models: most tokens one forward step packs from waiting requests (default 8192) | CUDA |
 | `--decode-share F` | While a prompt prefills, running replies keep moving for this share of each chunk's time and later prompts start later (default 0.25; 0 prefills whole prompts first, as 0.3.6.2) | MLX |
 | `--prompt-cache-gib N` | Retained conversation-prefix budget; zero disables retention | MLX |
 | `--checkpoint-slots N` | Retained conversation prefixes (default 3 per lane, at least 8); long conversations hit this before the byte budget | MLX |

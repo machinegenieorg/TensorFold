@@ -4,10 +4,11 @@ The base URL is `http://127.0.0.1:8080/v1` with the default server settings.
 
 | Route | Behavior |
 | --- | --- |
-| `GET /v1/models` | Served model ID; MLX also lists configured aliases |
+| `GET /v1/models` | Served model ID and configured aliases (`--alias`) |
 | `GET /health` | Server health and available status information |
 | `POST /v1/chat/completions` | Text chat, optional image input, tools and reasoning; streamed or non-streamed |
 | `POST /v1/completions` | Raw text without a chat template; MLX also accepts token IDs |
+| `POST /v1/embeddings` | Vectors from an embedding model on CUDA (Qwen3-Embedding); see [embeddings](#embeddings) |
 
 On MLX, a completions body containing a nonempty `messages` list uses chat handling. CUDA completions
 require a string `prompt`.
@@ -63,6 +64,32 @@ for Qwen3.8-27B on one or two ranks and for Flash Next on one rank; GLM, Nemotro
 When a client disconnects, its CUDA request stops at the next round, and a request still waiting behind
 another in one-at-a-time serving does not start; two-rank Flash Next, Nemotron and GLM requests finish on
 both ranks.
+
+## Embeddings
+
+A CUDA engine that embeds (the `qwen3` family, such as `Qwen/Qwen3-Embedding-8B`) answers `POST /v1/embeddings`
+in OpenAI's format and refuses chat and completion requests with HTTP 400. Every check below happens before the
+request waits for the GPU; a malformed request gets HTTP 400 and runs nothing.
+
+| Field | Meaning |
+| --- | --- |
+| `input` | A string, a list of strings, a token array or a list of token arrays (at most 2,048 texts). Text gets the tokenizer's special tokens (Qwen3-Embedding's closing `<|endoftext|>`, the token it pools); token arrays are read as given |
+| `model` | Echoed in the reply when it names the served ID or an `--alias`; otherwise the served ID is returned |
+| `encoding_format` | `float` (default) or `base64` (little-endian float32) |
+| `dimensions` | Keep the leading values and L2-normalize again (Matryoshka); Qwen3-Embedding takes 32 to 4,096 |
+| `truncate_prompt_tokens` | Cut a longer input to this many tokens, keeping its start and, for text, the end token after the kept words, as vLLM does by default; -1 means the server's limit. Larger than the limit is refused |
+| `truncation_side` | `left` keeps the last tokens instead; `right` (or absent) keeps the start |
+| `priority` | An integer, lower first (vLLM's convention); see below |
+
+The reply carries `data` (one `{"object": "embedding", "index", "embedding"}` per input, in input order) and
+`usage` with `prompt_tokens` and `total_tokens` after truncation. An input longer than the server's limit
+(`--context`, default the model's window) without `truncate_prompt_tokens` gets HTTP 400, like vLLM's.
+
+One worker runs the model. Each forward step packs the waiting texts of the most urgent priority present, from any
+requests in arrival order, up to `--batch-tokens` tokens (default 8,192); a longer text runs alone. So a query sent
+with a lower priority number than a bulk request waits only for the step in flight, and small requests share
+steps. The engine's arithmetic gives every text the same vector bits alone or in any step, so
+neither batching nor priorities change a vector. A client that disconnects is dropped from later steps.
 
 ## Messages and tools
 
