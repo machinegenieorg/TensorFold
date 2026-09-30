@@ -1,4 +1,5 @@
-"""FP8 projections as ModelOpt stores them (e4m3 codes, one fp32 scale a tensor), read weight-only.
+"""FP8 projections as ModelOpt stores them (e4m3 codes, one fp32 scale a tensor), read weight-only: the NVFP4
+route's bf16 prompt rows (``TF_NVFP4_PROMPT_ROWS=bf16``; FP8 prompt rows, the default, use ``Fp8Linear``).
 
 A projection's weight is ``fp32(code) * weight_scale``, exactly. An e4m3 code is exact in bf16, so the kernel
 takes the codes themselves as the tensor-core operand and applies the scale once, to the fp32 sums:
