@@ -185,6 +185,15 @@ def test_flash_next_on_cuda_takes_both_options(tmp_path, flags):
     assert cli._check_serve_options(args, family, "cuda") is None
 
 
+@pytest.mark.parametrize("flags", [["--mtp-confidence", "0"], ["--mtp-confidence", "0.5"], ["--mtp-confidence", "1"]])
+def test_qwen36_moe_on_cuda_takes_mtp_confidence(tmp_path, flags):
+    from tensorfold.families import qwen3_5_moe
+
+    args = cli.build_parser().parse_args(["serve", str(tmp_path)] + flags)
+    family = SimpleNamespace(title=qwen3_5_moe.TITLE, package=qwen3_5_moe, model_type="qwen3_5_moe")
+    assert cli._check_serve_options(args, family, "cuda") is None
+
+
 @pytest.mark.torch
 def test_no_cuda_engine_serves_one_token_a_round_by_default(tmp_path, monkeypatch):
     """Everything on the lanes: a CUDA engine whose drafter is missing refuses to start rather than decode one token
