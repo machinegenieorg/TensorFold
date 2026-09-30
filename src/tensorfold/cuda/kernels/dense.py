@@ -42,6 +42,64 @@ def _matmul(X, W, OUT, M, N, ldx, K: tl.constexpr, BM: tl.constexpr, BN: tl.cons
         tl.store(OUT + rows[:, None] * N + cols[None, :], acc.to(tl.bfloat16), mask=ok)
 
 
+PRECISE_BLOCK = (64, 64, 64, 3, 4)          # fixed regardless of M: the readout scoring precise path's own
+                                            # block shape, never chosen by row count (exact row/batch invariance)
+
+
+@triton.jit
+def _precise_matmul(X, W, OUT, M, N, ldx, K: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                    GROUP: tl.constexpr):
+    """Like ``_matmul``, but ``X`` is fp32 (never rounded to bf16 before the projection) and ``W`` (bf16, as the
+    checkpoint stores it) is upcast to fp32 before the dot — ``input_precision="ieee"`` so the MMA is full fp32,
+    not TF32's shorter mantissa."""
+
+    pid = tl.program_id(0)
+    row_blocks, col_blocks = tl.cdiv(M, BM), tl.cdiv(N, BN)
+    band = GROUP * col_blocks
+    first = pid // band * GROUP
+    height = tl.minimum(row_blocks - first, GROUP)
+    rows = ((first + pid % band % height) * BM + tl.arange(0, BM)).to(tl.int64)
+    cols = ((pid % band // height) * BN + tl.arange(0, BN)).to(tl.int64)
+    k = tl.arange(0, BK)
+    x = X + rows[:, None] * ldx + k[None, :]
+    w = W + cols[:, None] * K + k[None, :]
+    acc = tl.zeros((BM, BN), tl.float32)
+    for _ in range(0, K, BK):
+        a = tl.load(x, mask=rows[:, None] < M, other=0.0)
+        b = tl.load(w, mask=cols[:, None] < N, other=0.0).to(tl.float32)
+        acc = tl.dot(a, tl.trans(b), acc, input_precision="ieee")
+        x += BK
+        w += BK
+    ok = (rows[:, None] < M) & (cols[None, :] < N)
+    tl.store(OUT + rows[:, None] * N + cols[None, :], acc, mask=ok)
+
+
+def precise_matmul(x: torch.Tensor, w: torch.Tensor, *, out: torch.Tensor | None = None) -> torch.Tensor:
+    """x (M, K) fp32 times w (N, K) bf16 transposed, fp32 accumulate: (M, N) fp32, never rounding ``x`` to bf16
+    first. A single fixed block shape (``PRECISE_BLOCK``) whatever ``M`` is — unlike ``prefill_matmul``'s
+    ``blocks_for(m)`` (bit-identical across shapes at bf16 output, but a couple of fp32 ULPs apart when the
+    output itself is fp32) — so a row's bits are exactly the same regardless of how many other rows (or texts)
+    share the call."""
+
+    if x.dim() != 2 or w.dim() != 2 or x.shape[1] != w.shape[1]:
+        raise ValueError(f"precise_matmul: x (M, K) and w (N, K), not {tuple(x.shape)} and {tuple(w.shape)}")
+    m, k = x.shape
+    n = w.shape[0]
+    if x.dtype != torch.float32 or w.dtype != torch.bfloat16 or k % 64:
+        raise ValueError("precise_matmul takes fp32 x, bf16 w, K a multiple of 64")
+    if x.stride(1) != 1 or not w.is_contiguous():
+        raise ValueError("precise_matmul reads contiguous input rows and a contiguous weight")
+    if out is None:
+        out = torch.empty((m, n), dtype=torch.float32, device=x.device)
+    elif not out.is_contiguous() or tuple(out.shape) != (m, n) or out.dtype != torch.float32:
+        raise ValueError("precise_matmul: out must be a contiguous (M, N) fp32 tensor")
+    bm, bn, bk, stages, warps = PRECISE_BLOCK
+    grid = (triton.cdiv(m, bm) * triton.cdiv(n, bn),)
+    _precise_matmul[grid](x, w, out, m, n, x.stride(0), K=k, BM=bm, BN=bn, BK=bk, GROUP=8, num_stages=stages,
+                          num_warps=warps)
+    return out
+
+
 def blocks_for(m: int) -> tuple[int, int, int, int, int]:
     """The block shape for ``m`` rows; any of ``BLOCKS`` gives the same bits."""
 
