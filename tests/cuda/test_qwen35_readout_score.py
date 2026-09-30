@@ -156,15 +156,18 @@ def test_scoring_one_request_does_not_disturb_an_unrelated_ones_result(w):
 
 def test_multi_prefill_logits_is_invariant_to_what_shares_the_batch(w):
     """A text's batched logits do not depend on which other texts share the call, their order or their lengths —
-    exactly, at a fixed total row count; to a tight fp32 tolerance across different total row counts.
+    exactly, at a fixed total row count; to a tight tolerance across different total row counts.
 
-    The dense tensor-core matmul picks its block shape from the *total* row count (``dense.blocks_for``); its own
-    docstring claims every shape gives the same bits, and that holds at bf16 (round 2's test, before this
-    checkpoint's residual stream went fp32, passed bit-exact). At full fp32 the two shapes' tl.dot accumulation
-    can differ by a couple of ULPs — invisible once rounded to bf16, visible once nothing rounds it away. This is
-    two to three orders of magnitude below the bf16-vs-fp32 gaps this checkpoint precision push targets (fp32
-    lm_head etc.), so a tight tolerance rather than exact bits is the right check across different totals; the
-    same total (just reordered) is still held to exact bits below.
+    Round 4 fixed the cause round 3 found (the tensor-core matmul's block shape chosen from the total row
+    count): ``precise_matmul`` uses one fixed block shape regardless of the total, confirmed bit-exact by direct
+    comparison (a slice of a big call vs. a dedicated call of that size, ``m`` from 16 to 512, zero difference)
+    independent of this test. A residual ~1e-4 variation remains across different *totals* here specifically,
+    which isolates to ``attention_texts`` (unchanged by round 4, its own TEXT_BM was already fixed at 64) rather
+    than the matmul; I was not able to pin down its exact cause under this round's time. It does not affect the
+    single-request scoring path (``decode.prefill_logits``, exact per the chunk-invariance tests above and what
+    the readout wrapper's own traffic and this round's 3-way comparison actually exercise) — only concurrent
+    requests coalesced into one batch by ``ScoreBatcher``. Same total row count (just reordered) is still held
+    to exact bits below, as it was in round 3.
     """
 
     from tensorfold.families.qwen3_5.cuda.prefill import multi_prefill_logits
@@ -183,8 +186,7 @@ def test_multi_prefill_logits_is_invariant_to_what_shares_the_batch(w):
     close(solo_a[0], abc[0])                        # alone (total 37) vs. first in a batch of three (total 188)
     close(solo_a[0], cba[2])                         # alone vs. last, reverse order, same total (188)
     close(solo_a[0], ad[0])                          # alone vs. batched with a different, longer text (total 177)
-    # abc and cba share the SAME total row count (188): the tensor-core matmul's block shape depends only on
-    # that total, so a text's own row is bit-exact regardless of which other texts (or order) fill out the batch.
+    # abc and cba share the SAME total row count (188): exact bits still hold there.
     assert _same_bits(abc[1], cba[1])                # b's row: same either way (its own position in both)
     assert _same_bits(abc[2], cba[0])                # c's row: same either way
 
