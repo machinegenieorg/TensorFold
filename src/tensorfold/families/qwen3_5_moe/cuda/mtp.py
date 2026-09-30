@@ -11,7 +11,8 @@ from tensorfold.cuda import moe
 from tensorfold.cuda.kernels import attention as tree_attention
 from tensorfold.cuda.kernels.prefill_attention import attention as prefill_attention
 from tensorfold.families.qwen3_5.cuda import glue
-from tensorfold.families.qwen3_5.cuda.qmm_fast import matmul, tile, untile
+from tensorfold.families.qwen3_5.cuda.forward import _mm
+from tensorfold.families.qwen3_5.cuda.qmm_fast import tile, untile
 from tensorfold.families.qwen3_5.cuda.weights import QLinear, Weights
 
 from .weights import MTP
@@ -70,15 +71,18 @@ class Staged:
 class Head:
     """One MTP layer: [norm(embed(next token)) | norm(state)] through fc, attention and experts, then a draft head."""
 
-    def __init__(self, w: Weights, m: MTP, ids: np.ndarray | None = None) -> None:
+    def __init__(self, w: Weights, m: MTP, ids: np.ndarray | None = None, head=None) -> None:
         self.w, self.m = w, m
         self.ids, self.head = None, w.head
         if ids is not None:                           # score only these token ids when drafting
-            full = untile(w.head)
             self.ids = torch.as_tensor(ids, dtype=torch.int64, device=w.norm.device)
-            self.head = tile(QLinear(full.weight[self.ids].contiguous(), full.scales[self.ids].contiguous(),
-                                     full.biases[self.ids].contiguous()))
-            del full
+            if head is not None:                      # their rows, cut from the checkpoint (``modelopt.draft_head``)
+                self.head = head
+            else:
+                full = untile(w.head)
+                self.head = tile(QLinear(full.weight[self.ids].contiguous(), full.scales[self.ids].contiguous(),
+                                         full.biases[self.ids].contiguous()))
+                del full
 
     @torch.no_grad()
     def forward(self, cache: Cache, states: torch.Tensor, tokens: Sequence[int], p0: int,
@@ -148,25 +152,25 @@ class Head:
 
         w, m, c = self.w, self.m, self.w.config
         n = states.shape[0]
-        e = glue.embed(ids, w.embed.weight, w.embed.scales, w.embed.biases, c.hidden)
+        e = glue.embedding(ids, w.embed)
         _, en, exs = glue.add_rmsnorm(e, None, m.norm_e, c.eps)
         _, hn, hxs = glue.add_rmsnorm(states.contiguous(), None, m.norm_h, c.eps)
-        x = (matmul(en, m.fc_e, exs).float() + matmul(hn, m.fc_h, hxs).float()).to(torch.bfloat16)
+        x = (_mm(en, m.fc_e, exs).float() + _mm(hn, m.fc_h, hxs).float()).to(torch.bfloat16)
         x, h, xs = glue.add_rmsnorm(x, None, m.input_norm, c.eps)
         a = m.attn
-        qg = matmul(h, a.q, xs)
-        key = matmul(h, a.k, xs)
-        value = matmul(h, a.v, xs).reshape(n, c.kv_heads, c.head_dim).contiguous()
+        qg = _mm(h, a.q, xs)
+        key = _mm(h, a.k, xs)
+        value = _mm(h, a.v, xs).reshape(n, c.kv_heads, c.head_dim).contiguous()
         q, key = glue.attn_prep(qg, key, a.q_norm, a.k_norm, pos, w.inv_freq, c.eps, heads=c.heads,
                                 kv_heads=c.kv_heads, head_dim=c.head_dim)
         key = key.view(n, c.kv_heads, c.head_dim).contiguous()
         out = attend(q.view(n, c.heads, c.head_dim).contiguous(), key, value)
         gated, gxs = glue.gate_mul(out, qg, heads=c.heads, head_dim=c.head_dim)
-        x, h, _ = glue.add_rmsnorm(x, matmul(gated, a.o, gxs), m.post_norm, c.eps)
+        x, h, _ = glue.add_rmsnorm(x, _mm(gated, a.o, gxs), m.post_norm, c.eps)
         _, normed, _ = glue.add_rmsnorm(x, moe.run(h, m.moe), m.norm, c.eps)
         return normed
 
     def logits(self, normed: torch.Tensor) -> torch.Tensor:
         """Draft-head logits; column j is token ``ids[j]`` with a draft vocabulary, else token j."""
 
-        return matmul(normed.contiguous(), self.head)
+        return _mm(normed.contiguous(), self.head)

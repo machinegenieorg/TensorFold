@@ -25,6 +25,37 @@ def test_only_4_bit_groups_of_64_are_read(tmp_path):
         qwen3_5_moe.check(_config(tmp_path, bits=8))
 
 
+def _modelopt(tmp_path, layers, *, beside=False):
+    block = {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION"}
+    if beside:                                   # quantized_layers only in hf_quant_config.json
+        (tmp_path / "hf_quant_config.json").write_text(json.dumps({"quantization": {"quantized_layers": layers}}))
+    else:
+        block["quantized_layers"] = layers
+    (tmp_path / "config.json").write_text(json.dumps({
+        "model_type": "qwen3_5_moe", "quantization_config": block, "text_config": {"model_type": "qwen3_5_moe_text"}}))
+    return tmp_path
+
+
+NVFP4_LAYERS = {"model.language_model.layers.0.mlp.experts": {"quant_algo": "W4A16_NVFP4", "group_size": 16},
+                "lm_head": {"quant_algo": "W4A16_NVFP4", "group_size": 16},
+                "model.language_model.layers.0.linear_attn.in_proj_qkv": {"quant_algo": "FP8"}}
+
+
+@pytest.mark.parametrize("beside", [False, True])
+def test_nvidias_nvfp4_checkpoint_is_read(tmp_path, beside):
+    folder = _modelopt(tmp_path, NVFP4_LAYERS, beside=beside)
+    qwen3_5_moe.check(folder)
+    families.require_readable(families.detect(folder), families.read_config(folder), "cuda")
+    assert "nvidia/Qwen3.6-35B-A3B-NVFP4" in qwen3_5_moe.MODELS
+
+
+@pytest.mark.parametrize("layer", [{"quant_algo": "W4A16_NVFP4", "group_size": 32}, {"quant_algo": "W4A8_AWQ"},
+                                   {"quant_algo": "MXFP8"}])
+def test_other_modelopt_formats_are_refused_before_loading(tmp_path, layer):
+    with pytest.raises(ValueError, match="NVFP4 weights in blocks of 16 and FP8"):
+        qwen3_5_moe.check(_modelopt(tmp_path, {**NVFP4_LAYERS, "model.language_model.layers.1.mlp.experts": layer}))
+
+
 @pytest.mark.parametrize("options, message", [({"tp": 2}, "one GPU"), ({"parallel": 4, "mtp_drafts": 16}, "0 to 15"),
                                               ({"drafter": "some/drafter"}, "its own MTP layer")])
 def test_settings_it_cannot_serve_are_refused_first(tmp_path, options, message):

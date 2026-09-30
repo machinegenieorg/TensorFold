@@ -1,4 +1,8 @@
-"""Qwen3.6 MoE on CUDA: routed-expert layers keep each row's serial bits, and MTP-drafted decoding equals serial."""
+"""Qwen3.6 MoE on CUDA: routed-expert layers keep each row's serial bits, and MTP-drafted decoding equals serial.
+
+Every test runs on two tiny models: the MLX 4-bit route's, and the NVFP4 route's (``qwen36_nvfp4_tiny``: NVFP4
+experts, shared expert and head, FP8 projections, bf16 MTP layer, loaded from a checkpoint in the published layout).
+"""
 
 import random
 
@@ -19,9 +23,27 @@ from tensorfold.families.qwen3_5_moe.cuda.mtp import Head  # noqa: E402
 from tensorfold.families.qwen3_5_moe.cuda.weights import MTP  # noqa: E402
 
 V, D, E, WIDTH, TOP = 256, 256, 16, 64, 4
+FORMAT = ["mlx"]
+
+
+@pytest.fixture(autouse=True, params=["mlx", "nvfp4"])
+def checkpoint_format(request):
+    """Which tiny model ``_model`` builds: the MLX 4-bit route's or the NVFP4 route's."""
+
+    FORMAT[0] = request.param
+    yield request.param
+    FORMAT[0] = "mlx"
 
 
 def _model(seed: int = 11, vocab: int = V):
+    if FORMAT[0] == "nvfp4":
+        from qwen36_nvfp4_tiny import model          # pytest puts tests/cuda on sys.path
+
+        return model(seed, vocab)
+    return _mlx_model(seed, vocab)
+
+
+def _mlx_model(seed: int = 11, vocab: int = V):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     dev = "cuda"
 
@@ -353,7 +375,7 @@ def test_streams_join_and_leave_mid_round(monkeypatch, sampling):
     w, head = _model()
     prompts = [PROMPTS[1], list(range(20, 43)), PROMPTS[0], PROMPTS[2], list(range(50, 81)), LONG]
     counts = [40, 12, 30, 5, 20, 16]
-    arrive = {0: [0], 2: [1, 2], 5: [3], 9: [4], 12: [5]}          # round -> requests admitted before it
+    arrive = {0: [0], 2: [1, 2], 5: [3], 9: [4], 16: [5]}          # round -> requests admitted before it
     refs = [_serial(w, p, sampling, n) for p, n in zip(prompts, counts)]
     dec = MultiDecoder(w, head, depth=3, confidence=0.3)
     streams: dict[int, Stream] = {}
