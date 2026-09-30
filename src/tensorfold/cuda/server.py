@@ -110,13 +110,15 @@ class App:
 
     def __init__(self, engine, model_dir: Path, served: str, *, default_thinking: bool = False,
                  sampling: dict[str, Any] | None = None, max_tokens: int = 4096,
-                 context_window: int | None = None, aliases: tuple[str, ...] | list[str] = ()):
+                 context_window: int | None = None, aliases: tuple[str, ...] | list[str] = (),
+                 name_priority: dict[str, int] | None = None):
         from tokenizers import Tokenizer
 
         self.engine = engine
         self.vision = getattr(engine, "vision", None)
         self.served = served
         self.aliases = tuple(str(alias).strip() for alias in aliases if str(alias).strip())
+        self.name_priority = dict(name_priority or {})       # a request's default priority by the id it asks for
         self.model_dir = Path(model_dir)
         self.tok = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
         self.template = ChatTemplate(model_dir)
@@ -138,6 +140,13 @@ class App:
             if model_id and model_id not in ids:
                 ids.append(model_id)
         return ids
+
+    def request_priority(self, body: dict[str, Any]) -> int:
+        """The request's own ``priority``, else ``--name-priority``'s for the id it asked for, else 0."""
+
+        if body.get("priority") is not None:
+            return int(body["priority"])
+        return int(getattr(self, "name_priority", {}).get(self.reply_model(body), 0))
 
     def reply_model(self, body: Any) -> str:
         """The id a reply names: the one the request asked for when this endpoint answers to it, else ``--name``."""
@@ -263,7 +272,7 @@ class App:
                 return PreparedRequest(rendered.tokens, max_tokens, tools, thinking,
                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
                                        vision=rendered.vision, grammar=self._compiled(body),
-                                       priority=int(body.get("priority") or 0))
+                                       priority=self.request_priority(body))
             text = render(body["messages"])
         else:
             text = body.get("prompt")
@@ -275,7 +284,7 @@ class App:
         # sampling is resolved here, so a malformed control is refused before a stream opens
         return PreparedRequest(prompt, max_tokens, tools, thinking, self.sampling_for(body, prompt),
                                ignore_eos=ignore_eos, stop=stop, grammar=self._compiled(body),
-                               priority=int(body.get("priority") or 0))
+                               priority=self.request_priority(body))
 
     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
         """Why the request cannot run, or None; rendered before a stream's headers are sent."""

@@ -188,3 +188,38 @@ def test_serve_hands_reserve_streams_to_the_cuda_engine(tmp_path, monkeypatch):
     alone = cli.build_parser().parse_args(["serve", str(tmp_path), "--backend", "cuda", "--reserve-streams", "2"])
     with pytest.raises(ValueError, match="--parallel"):
         cli._serve_cuda(alone, family, tmp_path, 8192)
+
+
+def test_a_request_without_a_priority_takes_its_model_ids_default(tmp_path):
+    pytest.importorskip("jinja2")
+    from tests.test_cuda_admission import http_server
+    from tests.test_cuda_server_errors import HI, app_for, request
+
+    app = app_for(tmp_path)
+    app.aliases = ("legacy-name",)
+    app.name_priority = {"fake-cuda": 10}
+    seen = []
+    real = app.engine.generate
+
+    def generate(prompt, max_tokens, sampling, on_tokens, draft=True, priority=0):
+        seen.append(priority)
+        return real(prompt, max_tokens, sampling, on_tokens, draft=draft)
+    app.engine.generate = generate
+    with http_server(app) as port:
+        for body in ({"model": "fake-cuda"}, {"model": "legacy-name"}, {}, {"model": "fake-cuda", "priority": 0},
+                     {"model": "legacy-name", "priority": 3}):
+            status, _, _ = request(port, {"messages": HI, "max_tokens": 4, **body})
+            assert status == 200
+    assert seen == [10, 0, 10, 0, 3]              # its own priority wins; no model asked is the --name's
+
+
+def test_name_priority_must_name_a_served_id(tmp_path):
+    from tensorfold import cli
+
+    ok = cli.build_parser().parse_args(["serve", str(tmp_path), "--name", "qwen3.6", "--alias", "qwen3.8-27b-fp4",
+                                        "--name-priority", "qwen3.6=10"])
+    assert cli._name_priority(ok, "qwen3.6") == {"qwen3.6": 10}
+    for bad in ("other=10", "qwen3.6=high", "qwen3.6"):
+        args = cli.build_parser().parse_args(["serve", str(tmp_path), "--name", "qwen3.6", "--name-priority", bad])
+        with pytest.raises(ValueError, match="--name-priority"):
+            cli._name_priority(args, "qwen3.6")
