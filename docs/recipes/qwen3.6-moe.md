@@ -2,7 +2,7 @@
 
 The `qwen3_5_moe` family serves Qwen3.6-35B-A3B on one NVIDIA GPU. Its layers are the 27B's (Gated DeltaNet
 and gated full attention, every fourth layer attention) with routed experts in place of the dense MLP, and it
-drafts with the checkpoint's own MTP layer.
+drafts with the checkpoint's own MTP layer. It reads the MLX 4-bit conversion and NVIDIA's NVFP4 checkpoint.
 
 ## Checkpoint
 
@@ -20,6 +20,72 @@ is placed in it. After the weights, one Spark keeps about 75 GB for caches: atte
 DeltaNet 63 MB a stream.
 
 `--no-drafts` or request field `"draft": false` selects serial decoding, the reference drafted output equals.
+
+### NVIDIA's NVFP4 checkpoint
+
+```bash
+tensorfold pull nvidia/Qwen3.6-35B-A3B-NVFP4
+tensorfold serve nvidia/Qwen3.6-35B-A3B-NVFP4 --name bench
+```
+
+Tested revision: `1355db6a052410cfd62085d94b58866fd0f2c3c5` (22 GB, ModelOpt 0.44, `MIXED_PRECISION`), the weights
+vLLM serves. The engine reads them as they ship, on `tensorfold/cuda/nvfp4`; each layer's format is the
+checkpoint's:
+
+| Tensors | Stored as | Read by |
+| --- | --- | --- |
+| Routed experts, shared expert | `W4A16_NVFP4`: E2M1 nibbles, an e4m3 scale per 16 values, an fp32 scale per tensor | one table a layer on the experts plan, the shared expert its last expert: `nvfp4/experts_split` (K in slices; `nvfp4/experts` reads the same bytes) |
+| `lm_head` and the draft head (its draft vocabulary's rows) | `W4A16_NVFP4` | `nvfp4.linear.Fp4Linear` |
+| DeltaNet `in_proj_qkv`, `in_proj_z`, `out_proj`; attention `q/k/v/o_proj` | `FP8`: e4m3 codes, an fp32 scale per tensor | `fp8.py`: the codes (exact in bf16) are the tensor-core operand, the scale multiplies the fp32 sums |
+| Embedding, routers, shared-expert gates, `in_proj_a/b`, conv, norms, the MTP layer | bf16 | as stored (`bf16.matmul`), except the MTP layer's experts: they only draft, and are quantized to NVFP4 at load |
+
+Every row stays bf16, decode's and prompts'; nothing reads the checkpoint's `input_scale` tensors (vLLM's static
+FP8 activation scales) or its `kv_cache_quant_algo: FP8` (vLLM's cache format), so the KV cache stays bf16. The
+RMSNorm weights are stored zero-centred (the model applies `1 + w`, which MLX conversions store instead) and become
+that scale in fp32 at load; DeltaNet's gated norm is stored as applied. The vision tower is not read. Exactness is
+the MLX route's: drafted replies equal `"draft": false`, `--parallel N` equals solo, a resumed prompt equals a
+fresh prefill, and startup admits the window before loading.
+
+The branch builds this in three steps, each exact and measured: the route on `nvfp4.experts` and `Fp8Linear`s
+whose prompt rows are FP8 with a scale a row (the 27B's NVFP4 convention); the experts on `nvfp4/experts_split`;
+prompt rows bf16 (`fp8.py`). Fidelity on eight public passages of 1,024 tokens (`pydoc_data` topics and
+standard-library source): next-token NLL, and the share of positions whose top token equals the fp32 forward of
+the bf16 release (`Qwen/Qwen3.6-35B-A3B` at `995ad96`) or of this checkpoint's exactly dequantized weights. Verify
+windows give the tokens serial decoding gives; the prompt path fills the context.
+
+| Scores | NLL | Top 1 = bf16 release | Top 1 = NVFP4, fp32 |
+| --- | ---: | ---: | ---: |
+| bf16 release, fp32 | 0.4464 | 100% | 93.62% |
+| NVFP4 checkpoint, fp32 | 0.5041 | 93.62% | 100% |
+| NVFP4 route, verify windows | 0.5002 | 93.51% | 98.08% |
+| NVFP4 route, prompt path | 0.4993 | 93.56% | 98.36% |
+| the same, prompt rows FP8 (`nvfp4.experts`) | 0.5073 | 93.55% | 97.03% |
+| the same, prompt rows FP8 (`experts_split`) | 0.5105 | 93.49% | 96.92% |
+| MLX 4-bit route, verify windows | 0.5183 | 90.69% | 89.67% |
+| MLX 4-bit route, prompt path (FP8 rows) | 0.5444 | 89.63% | 88.67% |
+
+```bash
+python -m tensorfold.families.qwen3_5_moe.cuda.reference reference <bf16 or NVFP4 folder> out.pt <tokenizer folder>
+python -m tensorfold.families.qwen3_5_moe.cuda.reference route <any checkpoint folder> out.pt <tokenizer folder>
+python -m tensorfold.families.qwen3_5_moe.cuda.reference compare reference.pt route.pt ...
+```
+
+On one RTX PRO 6000 Blackwell Max-Q (NGC 26.07, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`), with 8 client
+threads over HTTP and the workloads of [Concurrent requests](#concurrent-requests), in one session:
+
+| | `--parallel 1` label | chat | `--parallel 8` label | chat | Prefill, 4,096 tokens | Peak memory |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| NVFP4 route | 912 tok/s | 457 tok/s | 1,564 tok/s | 1,104 tok/s | 19,200 tok/s | 24.2-24.8 GB |
+| the same, prompt rows FP8 | 902 | 438 | 1,575 | 1,078 | 22,700 | 24.2-24.8 GB |
+| on `nvfp4.experts`, prompt rows FP8 | 734 | 363 | 1,369 | 1,080 | 18,000 | 24.7-24.8 GB |
+| MLX 4-bit route | 889 | 427 | 1,494 | 1,101 | 22,100 | 22.7-23.5 GB |
+
+Every NVFP4 reply's token SHA-256 is the same at `--parallel 1`, at `--parallel 8` and with `"draft": false`
+(80 of 80, each variant), and without expandable segments. Drafts keep 9.8 tokens a round on the labels and 3.0
+on the chats (MLX: 9.3 and 2.9). On these experts (257 of 512 x 2,048) a layer's gate/up and down take 12 and
+6 us for a row on `experts_split` (54 and 11 on `nvfp4.experts`), 32 and 17 for four (55 and 17), and 1.07 and
+0.82 ms for a 4,096-row prompt chunk (2.22 and 1.54); from 16 rows up the two are within 5%. GB10 figures are
+still to be measured.
 
 ## CUDA execution
 
