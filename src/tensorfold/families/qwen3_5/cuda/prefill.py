@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Sequence
 
 import torch
+import triton
+import triton.language as tl
 
 from tensorfold.cuda import moe
 from tensorfold.cuda.kernels import dense as dense_kernel
@@ -38,12 +40,68 @@ def _mm(x, w: QLinear, f32: bool = False) -> torch.Tensor:
     return matmul_partial(x, packed) if f32 else matmul(x, packed)
 
 
-def _row_mm(x, w: QLinear, tp: bool) -> torch.Tensor:
+def _row_mm(x, w: QLinear, tp: bool, f32: bool = False) -> torch.Tensor:
     if not tp:
-        return _mm(x, w)
+        return _mm(x, w, f32=f32)
     from .distributed import gather_rank_partials
 
     return gather_rank_partials(_mm(x, w))                 # bf16 partials: half the bytes of fp32 over the link
+                                                            # (unchanged by f32: TP halves link bytes, not precision)
+
+
+def is_dense_checkpoint(w: Weights) -> bool:
+    """A plain (unquantized) bf16/fp16/fp32 checkpoint, read at its stored precision throughout — as opposed to an
+    MLX affine, EXL3 or NVFP4 one (which keep their own tested bf16-rounding conventions unchanged here)."""
+
+    return isinstance(w.head, QLinear) and w.head.layout == "dense"
+
+
+@triton.jit
+def _add_rmsnorm_f32_kernel(X, R, W, H, Y, eps, D: tl.constexpr, BLOCK: tl.constexpr, HAS_R: tl.constexpr,
+                            Y_BF16: tl.constexpr):
+    """One program a row: reads only that row (and ``W``), so a row's bits never depend on the row count — the
+    same guarantee ``glue._add_rmsnorm`` gives its bf16 ``H``, kept here for an fp32 one."""
+
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    ok = offs < D
+    x = tl.load(X + row * D + offs, mask=ok, other=0.0).to(tl.float32)
+    if HAS_R:
+        x = x + tl.load(R + row * D + offs, mask=ok, other=0.0).to(tl.float32)
+    tl.store(H + row * D + offs, x, mask=ok)
+    inv = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / D + eps)
+    y = x * inv * tl.load(W + offs, mask=ok, other=0.0).to(tl.float32)
+    tl.store(Y + row * D + offs, y.to(tl.bfloat16) if Y_BF16 else y, mask=ok)
+
+
+def _add_rmsnorm_f32(x: torch.Tensor, residual: torch.Tensor | None, weight: torch.Tensor, eps: float):
+    """The residual stream kept in fp32 throughout (only a projection's *input* rows round to bf16), pushing a
+    dense checkpoint's prefill toward the fp32 reference instead of rounding the running sum at every layer:
+    ``x`` (and the returned ``h``) fp32; ``residual`` (a layer's own output projection) fp32 or bf16, either way
+    added as fp32; the normed value returned for the next projection still rounds to bf16, which every matmul
+    kernel here takes as input regardless of checkpoint precision. Row-invariant: a fixed-size Triton program a
+    row, like every other kernel in this family."""
+
+    rows, d = x.shape
+    h = torch.empty_like(x)
+    y = torch.empty((rows, d), dtype=torch.bfloat16, device=x.device)
+    _add_rmsnorm_f32_kernel[(rows,)](x, residual if residual is not None else x, weight, h, y, eps, D=d,
+                                     BLOCK=triton.next_power_of_2(d), HAS_R=residual is not None, Y_BF16=True,
+                                     num_warps=8)
+    return h, y
+
+
+def _norm_f32(x: torch.Tensor, residual: torch.Tensor | None, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Like ``_add_rmsnorm_f32``, but for the final norm: returns the fp32 normed value itself (never rounded to
+    bf16), for an fp32 lm_head matmul instead of a bf16-rounded one. Same row-invariance."""
+
+    rows, d = x.shape
+    h = torch.empty_like(x)
+    y = torch.empty((rows, d), dtype=torch.float32, device=x.device)
+    _add_rmsnorm_f32_kernel[(rows,)](x, residual if residual is not None else x, weight, h, y, eps, D=d,
+                                     BLOCK=triton.next_power_of_2(d), HAS_R=residual is not None, Y_BF16=False,
+                                     num_warps=8)
+    return y
 
 
 def _grow(st: State, i: int, need: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -61,11 +119,13 @@ def _grow(st: State, i: int, need: int) -> tuple[torch.Tensor, torch.Tensor]:
 
 @torch.no_grad()
 def prefill_chunk(w: Weights, tokens: torch.Tensor, st: State, *, tp: bool = False, capture_taps: bool = False,
-                  last: bool = True, every: bool = False, cut: int = 0, vision=None):
-    """Commit ``tokens`` at [st.pos, st.pos + W) into ``st`` without writing through its entries (``every``: all rows' final normed states; ``cut``: also the state after the first ``cut`` rows, the GDN chains run as two launches with one launch's bits)."""
+                  last: bool = True, every: bool = False, cut: int = 0, vision=None, precise: bool = False):
+    """Commit ``tokens`` at [st.pos, st.pos + W) into ``st`` without writing through its entries (``every``: all rows' final normed states; ``cut``: also the state after the first ``cut`` rows, the GDN chains run as two launches with one launch's bits). ``precise``: a dense checkpoint's residual stream stays fp32 throughout instead of rounding to bf16 every layer (the readout scoring contract; ordinary generation leaves this off, unchanged)."""
 
     c = w.config
     pg = prefill_glue if w.fast_prefill else prefill_bf16         # FP8 inputs only where every projection is 4-bit g64
+    dense = precise and is_dense_checkpoint(w)
+    add_norm = _add_rmsnorm_f32 if dense else pg.add_rmsnorm
     W = int(tokens.shape[0])
     if not 0 <= cut < W:
         raise ValueError(f"cut {cut} is not inside a chunk of {W} rows")
@@ -77,6 +137,8 @@ def prefill_chunk(w: Weights, tokens: torch.Tensor, st: State, *, tp: bool = Fal
     windows = (torch.arange(W, device=dev, dtype=torch.int32)[:, None]
                + torch.arange(keep + 1, device=dev, dtype=torch.int32)[None, :])
     x = glue.embedding(tokens.to(torch.int32), w.embed)
+    if dense:
+        x = x.float()
     if vision is not None:
         from tensorfold.vision.qwen_cuda import replace_rows
 
@@ -87,7 +149,7 @@ def prefill_chunk(w: Weights, tokens: torch.Tensor, st: State, *, tp: bool = Fal
     if part is not None:
         part.kv = []            # the chunk's final buffers, set below: these would outlive a grow that replaces them
     for i, layer in enumerate(w.layers):
-        x, h = pg.add_rmsnorm(x, pending, layer.input_norm, c.eps)
+        x, h = add_norm(x, pending, layer.input_norm, c.eps)
         if layer.linear:
             gdn = layer.gdn
             qkv = _mm(h, gdn.qkv)
@@ -111,7 +173,7 @@ def prefill_chunk(w: Weights, tokens: torch.Tensor, st: State, *, tp: bool = Fal
                 yr = torch.cat([deltanet.chain(q[:cut], k[:cut], v[:cut], g[:cut], beta[:cut], st.rec[i], part.rec[i]),
                                 deltanet.chain(q[cut:], k[cut:], v[cut:], g[cut:], beta[cut:], part.rec[i], final)])
                 part.conv[i] = torch.cat([st.conv[i], qkv[max(0, cut - keep):cut]])[-keep:].contiguous()
-            r = _row_mm(pg.gated_norm(yr, z, gdn.norm, c.eps), gdn.out, tp)
+            r = _row_mm(pg.gated_norm(yr, z, gdn.norm, c.eps), gdn.out, tp, f32=dense)
             st.conv[i] = torch.cat([st.conv[i], qkv[-keep:]])[-keep:].contiguous()
             st.rec[i] = final
         else:
@@ -131,21 +193,22 @@ def prefill_chunk(w: Weights, tokens: torch.Tensor, st: State, *, tp: bool = Fal
             kbuf[p0:p0 + W] = key.view(W, c.kv_heads, c.head_dim)
             vbuf[p0:p0 + W] = value
             out = attention(q.view(W, c.heads, c.head_dim), kbuf, vbuf, p0, scale=c.head_dim ** -0.5)
-            r = _row_mm(pg.gate_mul(out, qg, heads=c.heads, head_dim=c.head_dim), attn.o, tp)
+            r = _row_mm(pg.gate_mul(out, qg, heads=c.heads, head_dim=c.head_dim), attn.o, tp, f32=dense)
         if layer.moe is not None:                          # routed experts read bf16 rows (their prefill form)
             x, h, _ = glue.add_rmsnorm(x, r, layer.post_norm, c.eps)
             pending = moe.run(h, layer.moe, prefill=True)
         else:
-            x, h = pg.add_rmsnorm(x, r, layer.post_norm, c.eps)
-            pending = _row_mm(pg.swiglu(_mm(h, layer.gate), _mm(h, layer.up)), layer.down, tp)
+            x, h = add_norm(x, r, layer.post_norm, c.eps)
+            pending = _row_mm(pg.swiglu(_mm(h, layer.gate), _mm(h, layer.up)), layer.down, tp, f32=dense)
         if capture_taps and i in TAP_LAYERS:
             taps.append((x.float() + pending.float()).to(torch.bfloat16))
     st.pos = p0 + W
     normed = None
+    final_norm = _norm_f32 if dense else (lambda *a: glue.add_rmsnorm(*a)[1])
     if every:
-        _, normed, _ = glue.add_rmsnorm(x, pending, w.norm, c.eps)
+        normed = final_norm(x, pending, w.norm, c.eps)
     elif last:
-        _, normed, _ = glue.add_rmsnorm(x[-1:].contiguous(), pending[-1:].contiguous(), w.norm, c.eps)
+        normed = final_norm(x[-1:].contiguous(), pending[-1:].contiguous(), w.norm, c.eps)
     taps_out = torch.cat(taps, dim=-1) if capture_taps else None
     if part is None:
         return normed, taps_out
@@ -210,10 +273,12 @@ def multi_prefill_logits(w: Weights, texts: Sequence[Sequence[int]]) -> torch.Te
     windows = _multi_conv_windows(lengths, keep, dev)
     blocks = text_blocks(lengths, dev)
     last = torch.tensor(lengths, dtype=torch.int64, device=dev).cumsum(0) - 1
-    x = glue.embedding(ids, w.embed)
+    x = glue.embedding(ids, w.embed).float()   # the residual stream stays fp32 throughout (the scoring contract
+                                                # only, per _add_rmsnorm_f32's own docstring: this function is
+                                                # never used for ordinary generation)
     pending: torch.Tensor | None = None
     for layer in w.layers:
-        x, h = prefill_bf16.add_rmsnorm(x, pending, layer.input_norm, c.eps)
+        x, h = _add_rmsnorm_f32(x, pending, layer.input_norm, c.eps)
         if layer.linear:
             gdn = layer.gdn
             qkv = _mm(h, gdn.qkv)
@@ -237,7 +302,7 @@ def multi_prefill_logits(w: Weights, texts: Sequence[Sequence[int]]) -> torch.Te
                 yr_parts.append(deltanet.chain(q[sl], k[sl], v[sl], g[sl], beta[sl], zero_state,
                                                torch.empty_like(zero_state)))
                 offset += length
-            r = _mm(prefill_bf16.gated_norm(torch.cat(yr_parts), z, gdn.norm, c.eps), gdn.out)
+            r = _mm(prefill_bf16.gated_norm(torch.cat(yr_parts), z, gdn.norm, c.eps), gdn.out, f32=True)
         else:
             attn = layer.attn
             qg = _mm(h, attn.q)
@@ -253,13 +318,13 @@ def multi_prefill_logits(w: Weights, texts: Sequence[Sequence[int]]) -> torch.Te
                                     kv_heads=c.kv_heads, head_dim=c.head_dim, mrope_section=c.mrope_section)
             out = attention_texts(q.contiguous(), key.contiguous(), value.contiguous(), blocks,
                                   scale=c.head_dim ** -0.5)
-            r = _mm(prefill_bf16.gate_mul(out, qg, heads=c.heads, head_dim=c.head_dim), attn.o)
-        x, h = prefill_bf16.add_rmsnorm(x, r, layer.post_norm, c.eps)
-        pending = _mm(prefill_bf16.swiglu(_mm(h, layer.gate), _mm(h, layer.up)), layer.down)
+            r = _mm(prefill_bf16.gate_mul(out, qg, heads=c.heads, head_dim=c.head_dim), attn.o, f32=True)
+        x, h = _add_rmsnorm_f32(x, r, layer.post_norm, c.eps)
+        pending = _mm(prefill_bf16.swiglu(_mm(h, layer.gate), _mm(h, layer.up)), layer.down, f32=True)
     x_last = x.index_select(0, last).contiguous()
     pending_last = pending.index_select(0, last).contiguous()
-    _, normed, _ = glue.add_rmsnorm(x_last, pending_last, w.norm, c.eps)
-    return dense_kernel.prefill_matmul(normed, w.head.weight, f32=True)
+    normed = _norm_f32(x_last, pending_last, w.norm, c.eps)
+    return head_logits(w, normed)
 
 
 def chunks(start: int, end: int, size: int = CHUNK) -> list[tuple[int, int]]:
@@ -270,8 +335,24 @@ def chunks(start: int, end: int, size: int = CHUNK) -> list[tuple[int, int]]:
 
 
 @torch.no_grad()
+def head_logits(w: Weights, normed: torch.Tensor) -> torch.Tensor:
+    """The vocab-wide logits from the final normed hidden state, fp32.
+
+    ``normed`` fp32 (``precise=True`` on a dense checkpoint, via ``_norm_f32``): a plain fp32 matmul against the
+    head weight (bf16 as the checkpoint stores it), instead of rounding the more precise ``normed`` down to bf16
+    for the tensor-core kernel on top of its own fp32 accumulation. ``normed`` bf16 (everything else, unchanged):
+    the existing dense tensor-core kernel or the generic row-invariant one, whichever this checkpoint's head takes.
+    """
+
+    if normed.dtype == torch.float32:
+        return torch.nn.functional.linear(normed, w.head.weight.float())
+    if isinstance(w.head, QLinear) and w.head.layout == "dense":
+        return dense_kernel.prefill_matmul(normed, w.head.weight, f32=True)
+    return _mm(normed, w.head, f32=True)
+
+
 def prefill_state(w: Weights, prompt: Sequence[int], st: State, *, tp: bool = False, draft=None,
-                  size: int = CHUNK, keep_at: int | None = None, vision=None):
+                  size: int = CHUNK, keep_at: int | None = None, vision=None, precise: bool = False):
     """Commit prompt[st.pos:] into ``st``, tapping the drafter's window; ``keep_at``: ``(normed, (state, snapshot))``, the state after prompt[:keep_at] from a cut chunk."""
 
     dev = w.norm.device
@@ -297,7 +378,7 @@ def prefill_state(w: Weights, prompt: Sequence[int], st: State, *, tp: bool = Fa
         cut = keep_at - a if keep_at is not None and a < keep_at < b else 0
         want = draft is not None and b > tap_from
         normed, taps, *part = prefill_chunk(w, ids[a - base:b - base], st, tp=tp, capture_taps=want,
-                                            last=j == len(spans) - 1, cut=cut, vision=vision)
+                                            last=j == len(spans) - 1, cut=cut, vision=vision, precise=precise)
         snap = None
         if want:
             rows = taps[max(0, tap_from - a):]
