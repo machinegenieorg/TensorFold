@@ -36,6 +36,9 @@ def build_parser() -> argparse.ArgumentParser:
     endpoint.add_argument("--port", type=int, default=8080)
     endpoint.add_argument("--name", default="", help="model id clients ask for (default: the model's name)")
     endpoint.add_argument("--alias", action="append", default=[], help="another model id to answer to")
+    endpoint.add_argument("--name-priority", action="append", default=[], metavar="ID=background",
+                          help="a request naming ID (--name or --alias) with no priority of its own is treated as "
+                               "priority: background; CUDA only, repeatable")
     endpoint.add_argument("--vision", action="store_true", help="enable image input for Qwen3.5/3.8 dense vision checkpoints")
     endpoint.add_argument("--vision-urls", action="store_true",
                           help="with --vision, accept public HTTP(S) image URLs (default: data URLs only)")
@@ -380,10 +383,12 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
         if value is not None:
             sampling[key] = value
     app_class = getattr(family.package, "CUDA_APP", None) or App
+    from tensorfold.serve_options import name_priority as _name_priority
+
     app = app_class(engine, model_dir, served, default_thinking=bool(args.thinking), sampling=sampling,
                     max_tokens=int(args.max_tokens), context_window=context if context is not None else args.context,
                     reasoning_effort=args.reasoning_effort, thinking_budget=int(args.thinking_budget),
-                    aliases=list(args.alias))
+                    aliases=list(args.alias), background_ids=frozenset(_name_priority(args)))
     shown = "greedy" if float(sampling.get("temperature", 1.0)) <= 0 else ", ".join(
         f"{k} {v}" for k, v in sampling.items())
     effective_context = app.effective_context_window
