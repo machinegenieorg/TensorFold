@@ -382,7 +382,8 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     app_class = getattr(family.package, "CUDA_APP", None) or App
     app = app_class(engine, model_dir, served, default_thinking=bool(args.thinking), sampling=sampling,
                     max_tokens=int(args.max_tokens), context_window=context if context is not None else args.context,
-                    reasoning_effort=args.reasoning_effort, thinking_budget=int(args.thinking_budget))
+                    reasoning_effort=args.reasoning_effort, thinking_budget=int(args.thinking_budget),
+                    aliases=list(args.alias))
     shown = "greedy" if float(sampling.get("temperature", 1.0)) <= 0 else ", ".join(
         f"{k} {v}" for k, v in sampling.items())
     effective_context = app.effective_context_window

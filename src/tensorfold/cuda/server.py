@@ -64,12 +64,14 @@ class App:
 
     def __init__(self, engine, model_dir: Path, served: str, *, default_thinking: bool = False,
                  sampling: dict[str, Any] | None = None, max_tokens: int = 4096,
-                 context_window: int | None = None, reasoning_effort: str | None = None, thinking_budget: int = 0):
+                 context_window: int | None = None, reasoning_effort: str | None = None, thinking_budget: int = 0,
+                 aliases: tuple[str, ...] | list[str] = ()):
         from tokenizers import Tokenizer
 
         self.engine = engine
         self.vision = getattr(engine, "vision", None)
         self.served = served
+        self.aliases = tuple(str(alias).strip() for alias in aliases if str(alias).strip())
         self.model_dir = Path(model_dir)
         self.tok = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
         self.template = ChatTemplate(model_dir)
@@ -82,6 +84,22 @@ class App:
         if self.context_window < 0:
             raise ValueError("context_window must be 0 or a positive token count")
         self.turns = Turns()                # one request at a time where the engine decodes one
+
+    @property
+    def model_ids(self) -> list[str]:
+        """The ids this endpoint answers to, as the MLX server lists them: ``--name`` first, then each ``--alias``."""
+
+        ids: list[str] = []
+        for model_id in (self.served, *getattr(self, "aliases", ())):
+            if model_id and model_id not in ids:
+                ids.append(model_id)
+        return ids
+
+    def reply_model(self, body: Any) -> str:
+        """The id a reply names: the one the request asked for when this endpoint answers to it, else ``--name``."""
+
+        asked = body.get("model") if isinstance(body, dict) else None
+        return asked if isinstance(asked, str) and asked in self.model_ids else self.served
 
     def _check_fields(self, body: dict[str, Any]) -> str | None:
         import inspect
