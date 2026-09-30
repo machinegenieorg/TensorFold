@@ -65,7 +65,11 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
     depth = 0 if no_drafts else DEPTH if mtp_drafts is None else int(mtp_drafts)
     confidence = CONFIDENCE if mtp_confidence is None else float(mtp_confidence)
     streams = max(1, int(options.get("parallel") or 1))
+    reserve = int(options.get("reserve_streams") or 0)
+    if reserve and not 0 < reserve < streams:
+        raise ValueError(f"--reserve-streams keeps 1 to {streams - 1} of --parallel {streams} streams for foreground "
+                         f"requests, not {reserve}")
     if streams > 1 and not 0 <= depth <= 15:
         raise ValueError(f"--parallel verifies up to 16 rows a stream: --mtp-drafts 0 to 15, not {depth}")
     return Qwen36Engine(Path(model_dir), depth=depth, confidence=confidence, context=context,
-                        context_explicit=options.get("context_explicit"), streams=streams)
+                        context_explicit=options.get("context_explicit"), streams=streams, reserve=reserve)

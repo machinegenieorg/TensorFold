@@ -90,6 +90,7 @@ class PreparedRequest:
     stop: tuple[str, ...] = ()
     vision: Any = None
     grammar: Any = None    # the compiled response_format, or None
+    priority: int = 0      # when a waiting request starts, lower first (engines with a scheduler)
 
 
 def _native_context(model_dir: Path) -> int:
@@ -153,6 +154,9 @@ class App:
             return "this model's CUDA engine has no serial switch (\"draft\": false)"
         if not isinstance(body.get("messages", []), list):
             return "messages must be a list"
+        priority = body.get("priority", 0)
+        if priority is not None and (isinstance(priority, bool) or not isinstance(priority, int)):
+            return "priority must be an integer (lower starts first)"
         try:
             spec = grammar.request_spec(body)
         except RequestError as exc:
@@ -258,7 +262,8 @@ class App:
                                           context_limit=self._context_limit())
                 return PreparedRequest(rendered.tokens, max_tokens, tools, thinking,
                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
-                                       vision=rendered.vision, grammar=self._compiled(body))
+                                       vision=rendered.vision, grammar=self._compiled(body),
+                                       priority=int(body.get("priority") or 0))
             text = render(body["messages"])
         else:
             text = body.get("prompt")
@@ -269,7 +274,8 @@ class App:
             raise RequestError("rendered prompt is empty")
         # sampling is resolved here, so a malformed control is refused before a stream opens
         return PreparedRequest(prompt, max_tokens, tools, thinking, self.sampling_for(body, prompt),
-                               ignore_eos=ignore_eos, stop=stop, grammar=self._compiled(body))
+                               ignore_eos=ignore_eos, stop=stop, grammar=self._compiled(body),
+                               priority=int(body.get("priority") or 0))
 
     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
         """Why the request cannot run, or None; rendered before a stream's headers are sent."""
@@ -396,6 +402,8 @@ class App:
         options: dict[str, Any] = {} if draft else {"draft": False}
         if takes_stop_eos:
             options["stop_eos"] = not prepared.ignore_eos
+        if prepared.priority and "priority" in inspect.signature(self.engine.generate).parameters:
+            options["priority"] = prepared.priority     # engines without a scheduler run requests in turn
         if prepared.grammar is not None:    # response_format: a fresh grammar state, after </think> when thinking
             options["constraint"] = self._grammars().constraint(prepared.grammar, after_think=chat and thinking)
 

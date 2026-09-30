@@ -50,7 +50,8 @@ class Qwen36Engine:
     structured_output = True     # generate takes a response_format constraint (tensorfold.cuda.grammar)
 
     def __init__(self, model_dir: Path, *, depth: int = DEPTH, confidence: float = CONFIDENCE,
-                 context: int | None = None, context_explicit: bool | None = None, streams: int = 1) -> None:
+                 context: int | None = None, context_explicit: bool | None = None, streams: int = 1,
+                 reserve: int = 0) -> None:
         import torch
 
         from tensorfold.cuda.capacity import admit
@@ -117,7 +118,7 @@ class Qwen36Engine:
             self.multi.warm(streams)
             print(f"[tensorfold] {streams} streams of {self.context_window} prompt/reply tokens: together, rounds run "
                   f"eagerly; alone, in CUDA graphs; kernels warmed in {time.perf_counter() - started:.1f}s", flush=True)
-            self.scheduler = Scheduler(self.multi, max_streams=streams)
+            self.scheduler = Scheduler(self.multi, max_streams=streams, reserve=reserve)
 
     def _resume(self, prompt: list[int]):
         """The longest kept prefix, after dropping longer entries its resumed writes would overwrite (they share buffers)."""
@@ -129,9 +130,10 @@ class Qwen36Engine:
         return best
 
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens: Callable[[list[int]], bool | None],
-                 draft: bool = True, stop_eos: bool = True, *, constraint=None) -> dict[str, Any]:
+                 draft: bool = True, stop_eos: bool = True, *, constraint=None, priority: int = 0) -> dict[str, Any]:
         """``draft=False``: serial decoding from a fresh prefill, no drafts or kept states; ``stop_eos=False``: past end tokens.
-        ``constraint``: the reply's grammar, which masks every row where a token is chosen and follows the chosen."""
+        ``constraint``: the reply's grammar, which masks every row where a token is chosen and follows the chosen.
+        ``priority``: with ``--parallel``, when a waiting request starts (lower first); alone, requests run one at a time."""
 
         from tensorfold.families.qwen3_5.cuda.decode import draft_decode, prefill as serial_prefill
 
@@ -145,7 +147,8 @@ class Qwen36Engine:
         max_tokens = max(1, min(int(max_tokens), self.context_window - len(prompt)))
         if self.scheduler is not None:
             extra = {} if constraint is None else {"constraint": constraint}
-            return self.scheduler.submit(list(prompt), max_tokens, sampling, draft, on_tokens, stop_eos, **extra)
+            return self.scheduler.submit(list(prompt), max_tokens, sampling, draft, on_tokens, stop_eos,
+                                         priority=int(priority), **extra)
         t0 = time.perf_counter()
         if not draft or self.head is None:
             st, first = serial_prefill(self.w, prompt, sampling, constraint=constraint)
