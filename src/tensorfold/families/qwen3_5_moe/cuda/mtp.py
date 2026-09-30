@@ -18,6 +18,12 @@ from tensorfold.families.qwen3_5.cuda.weights import QLinear, Weights
 from .weights import MTP
 
 
+def _wide(x: torch.Tensor, w, xs: torch.Tensor) -> torch.Tensor:
+    """A prompt's many rows through a head projection: its wide form where it has one (bf16 weights), else ``_mm``."""
+
+    return w.wide(x) if hasattr(w, "wide") else _mm(x, w, xs)
+
+
 class Cache:
     """The head's attention cache: slot t holds position t; slots below ``pos`` are absorbed, the rest scratch."""
 
@@ -120,7 +126,8 @@ class Head:
     def absorb(self, cache: Cache, states: torch.Tensor, tokens: Sequence[int], p0: int) -> None:
         """``forward``'s keys and values for rows at [p0, p0 + n), written to their slots, and nothing past them:
         a prompt's rows only give later rows something to attend to, so their queries, attention, experts and
-        outputs are never computed (the keys and values carry ``forward``'s bits)."""
+        outputs are never computed. The keys and values carry ``forward``'s bits, but for bf16 projections (the
+        NVFP4 checkpoint's), which take the rows in their wide form: row-invariant bits of their own."""
 
         w, m, c = self.w, self.m, self.w.config
         n = states.shape[0]
@@ -128,10 +135,10 @@ class Head:
             raise ValueError("MTP positions past the cache")
         ids = torch.tensor(list(tokens), dtype=torch.int32, device=states.device)
         pos = torch.arange(p0, p0 + n, dtype=torch.int32, device=states.device)
-        _, h, xs = self._input(states, ids)
+        _, h, xs = self._input(states, ids, _wide)
         a = m.attn
-        key = _mm(h, a.k, xs)
-        value = _mm(h, a.v, xs).reshape(n, c.kv_heads, c.head_dim)
+        key = _wide(h, a.k, xs)
+        value = _wide(h, a.v, xs).reshape(n, c.kv_heads, c.head_dim)
         _, key = glue.attn_prep(key, key, a.q_norm, a.k_norm, pos, w.inv_freq, c.eps, heads=0,
                                 kv_heads=c.kv_heads, head_dim=c.head_dim)       # the keys' programs alone
         cache.k[p0:p0 + n] = key
@@ -168,14 +175,14 @@ class Head:
 
         return self._layer(states[0] if len(states) == 1 else torch.cat(list(states)), ids, pos, attend)
 
-    def _input(self, states: torch.Tensor, ids: torch.Tensor):
+    def _input(self, states: torch.Tensor, ids: torch.Tensor, mm=_mm):
         """[norm(embed(token)) | norm(state)] through fc, then the input norm: (x, normed rows, their group sums)."""
 
         w, m, c = self.w, self.m, self.w.config
         e = glue.embedding(ids, w.embed)
         _, en, exs = glue.add_rmsnorm(e, None, m.norm_e, c.eps)
         _, hn, hxs = glue.add_rmsnorm(states.contiguous(), None, m.norm_h, c.eps)
-        x = (_mm(en, m.fc_e, exs).float() + _mm(hn, m.fc_h, hxs).float()).to(torch.bfloat16)
+        x = (mm(en, m.fc_e, exs).float() + mm(hn, m.fc_h, hxs).float()).to(torch.bfloat16)
         return glue.add_rmsnorm(x, None, m.input_norm, c.eps)
 
     def _layer(self, states: torch.Tensor, ids: torch.Tensor, pos: torch.Tensor, attend) -> torch.Tensor:

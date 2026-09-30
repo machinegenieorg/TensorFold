@@ -107,6 +107,12 @@ class Dense:
             raise ValueError("this projection is not read by FP8 prompt rows")
         return rows8.matmul(xq, self.rows8)
 
+    def wide(self, x: torch.Tensor) -> torch.Tensor:
+        """Many bf16 rows at once (a prompt's, into the MTP head): K in one slice and wider tiles, no partial sums;
+        row-invariant bits of their own (drafts only)."""
+
+        return bf16.matmul(x, self.b, sk=1, block_n=128)
+
 
 def experts_table(gate: tuple, up: tuple, down: tuple, shared: tuple) -> nvs.Experts:
     """One layer's routed experts from stacked checkpoint arrays (each ([E, n, k/2] uint8, [E, n, k/16] e4m3, [E]
