@@ -15,7 +15,7 @@ if not torch.cuda.is_available():
 
 from qwen36_nvfp4_tiny import LM, tensors, write  # noqa: E402  (pytest puts tests/cuda on sys.path)
 
-from tensorfold.cuda.nvfp4 import experts as nvx  # noqa: E402
+from tensorfold.cuda.nvfp4 import experts_split as nvs  # noqa: E402
 from tensorfold.cuda.nvfp4.linear import Fp4Linear, Fp8Linear, fragment_index  # noqa: E402
 from tensorfold.engine.exact_sampling import Sampling  # noqa: E402
 from tensorfold.families.qwen3_5_moe.cuda import modelopt  # noqa: E402
@@ -75,20 +75,23 @@ def test_the_checkpoint_loads_as_it_ships(checkpoint):
     ref = x.float() @ _reference(raw, "lm_head").cuda().T
     assert ((head(x).float() - ref).abs().max() <= 0.01 * ref.abs().max()).item()
     ex = w.layers[0].moe.experts
-    assert isinstance(ex, nvx.Experts4) and ex.count == 17                   # 16 routed, the shared one last
+    assert isinstance(ex, nvs.Experts) and ex.count == 17                    # 16 routed, the shared one last
     p = LM + "layers.0.mlp."
     for j, proj in enumerate(("gate", "up")):
+        words, scales = nvs.unpack(ex.up[:, :, :, j].cpu())
         for e in (0, 5, 15, 16):
             name = f"{p}experts.{e}.{proj}_proj" if e < 16 else f"{p}shared_expert.{proj}_proj"
-            assert torch.allclose(nvx.dense(ex, e, proj).cpu(), _reference(raw, name), rtol=1e-6, atol=0)
-            assert ex.up_scale[e, j].item() == raw[name + ".weight_scale_2"].item()
+            assert torch.equal(words[e], raw[name + ".weight"])
+            assert torch.equal(scales[e], raw[name + ".weight_scale"].view(torch.uint8))
+            assert ex.s_up[e, j].item() == raw[name + ".weight_scale_2"].item() / 2
     assert torch.equal(w.layers[0].moe.router.cpu(),
                        torch.cat([raw[p + "gate.weight"], raw[p + "shared_expert_gate.weight"]]))
     assert isinstance(m.fc_e, modelopt.Dense) and torch.equal(m.fc_h.b.weight.cpu(), raw["mtp.fc.weight"][:, 256:])
     assert isinstance(m.attn.q, modelopt.Dense)                                # decode rows only: no prompt copy
-    assert isinstance(m.moe.experts, nvx.Experts4) and m.moe.experts.count == 17    # NVFP4 at load: they only draft
+    assert isinstance(m.moe.experts, nvs.Experts) and m.moe.experts.count == 17     # NVFP4 at load: they only draft
+    words, scales = nvs.unpack(m.moe.experts.down[:, :, :, 0])
     want = raw["mtp.layers.0.mlp.experts.down_proj"][3].float().cuda()
-    fit = nvx.dense(m.moe.experts, 3, "down")
+    fit = nvfp4.dequantize(words[3], scales[3].view(torch.float8_e4m3fn), 2 * m.moe.experts.s_down[3, 0].item())
     assert ((fit - want).abs().max() <= 0.2 * want.abs().max()).item()
 
 

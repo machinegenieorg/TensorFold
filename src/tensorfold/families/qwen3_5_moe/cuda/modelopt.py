@@ -5,8 +5,9 @@ tensors, on ``tensorfold.cuda.nvfp4``'s kernels:
 
 * ``W4A16_NVFP4`` (blocks of 16): the routed experts, the shared expert and ``lm_head``. Each is packed E2M1
   nibbles, an e4m3 scale a block and an fp32 scale a tensor, kept as stored: a layer's experts and its shared
-  expert as one ``nvfp4.experts`` table on the experts plan, the head (and the draft head, its draft vocabulary's
-  rows) an ``Fp4Linear``. Activations stay bf16.
+  expert as one ``nvfp4.experts_split`` table on the experts plan (K in slices: decode's few rows a call run up to
+  four times faster than on ``nvfp4.experts``), the head (and the draft head, its draft vocabulary's rows) an
+  ``Fp4Linear``. Activations stay bf16.
 * ``FP8``: DeltaNet's ``in_proj_qkv``, ``in_proj_z`` and ``out_proj`` and attention's four projections: e4m3 codes
   and one fp32 scale a tensor, ``Fp8Linear``s: decode's rows bf16 on the exact weights (W8A16), a prompt chunk's
   rows FP8 with a scale a row (the 27B's NVFP4 route's prompt GEMM); ``input_scale`` is vLLM's static activation
@@ -33,6 +34,7 @@ import torch
 
 from tensorfold.cuda.moe import Routed
 from tensorfold.cuda.nvfp4 import experts as nvx
+from tensorfold.cuda.nvfp4 import experts_split as nvs
 from tensorfold.cuda.nvfp4.linear import Fp4Linear, Fp8Linear
 from tensorfold.families.qwen3_5.cuda.nvfp4_load import Plain8
 from tensorfold.families.qwen3_5.cuda.weights import GDN, Attention, Config, Layer, Plain, Weights
@@ -80,22 +82,22 @@ class Dense:
     prefill = __call__
 
 
-def experts_table(gate: tuple, up: tuple, down: tuple, shared: tuple) -> nvx.Experts4:
+def experts_table(gate: tuple, up: tuple, down: tuple, shared: tuple) -> nvs.Experts:
     """One layer's routed experts from stacked checkpoint arrays (each ([E, n, k/2] uint8, [E, n, k/16] e4m3, [E]
-    fp32)) and the NVFP4 shared expert's (the same, unstacked) as expert E of one ``nvfp4.experts`` table."""
+    fp32)) and the NVFP4 shared expert's (the same, unstacked) as expert E of one ``nvfp4.experts_split`` table."""
 
     def join(stack: tuple, one: tuple) -> tuple:
         (w, sc, s2), (ow, osc, os2) = stack, one
         return (torch.cat([w, ow[None]]), torch.cat([sc, osc.contiguous().view(torch.uint8)[None]]),
                 torch.cat([s2, torch.as_tensor(os2, dtype=torch.float32).reshape(1).to(s2.device)]))
 
-    return nvx.make(join(gate, shared[0]), join(up, shared[1]), join(down, shared[2]))
+    return nvs.make(join(gate, shared[0]), join(up, shared[1]), join(down, shared[2]))
 
 
-def draft_experts(gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor) -> nvx.Experts4:
+def draft_experts(gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor) -> nvs.Experts:
     """bf16 experts [E, n, k] (the MTP layer's, the shared one last) as an NVFP4 table: they only draft."""
 
-    return nvx.make(nvx.quantize(gate), nvx.quantize(up), nvx.quantize(down))
+    return nvs.make(nvx.quantize(gate), nvx.quantize(up), nvx.quantize(down))
 
 
 def centred(w: torch.Tensor) -> torch.Tensor:
