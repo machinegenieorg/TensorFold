@@ -130,7 +130,7 @@ def extend(w, head: Head | None, prompt: Sequence[int], st: State, mc: Cache | N
         rows = normed if held is None else torch.cat([held, normed])
         start = a - (0 if held is None else 1)
         if rows.shape[0] > 1:
-            head.forward(mc, rows[:-1], prompt[start + 1:b], start)
+            head.absorb(mc, rows[:-1], prompt[start + 1:b], start)
             mc.pos = b - 1
         held = rows[-1:]
     return normed, held

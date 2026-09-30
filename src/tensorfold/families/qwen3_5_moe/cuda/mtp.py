@@ -117,6 +117,27 @@ class Head:
         return self._layer(states, ids, pos, attend)
 
     @torch.no_grad()
+    def absorb(self, cache: Cache, states: torch.Tensor, tokens: Sequence[int], p0: int) -> None:
+        """``forward``'s keys and values for rows at [p0, p0 + n), written to their slots, and nothing past them:
+        a prompt's rows only give later rows something to attend to, so their queries, attention, experts and
+        outputs are never computed (the keys and values carry ``forward``'s bits)."""
+
+        w, m, c = self.w, self.m, self.w.config
+        n = states.shape[0]
+        if p0 + n > cache.k.shape[0]:
+            raise ValueError("MTP positions past the cache")
+        ids = torch.tensor(list(tokens), dtype=torch.int32, device=states.device)
+        pos = torch.arange(p0, p0 + n, dtype=torch.int32, device=states.device)
+        _, h, xs = self._input(states, ids)
+        a = m.attn
+        key = _mm(h, a.k, xs)
+        value = _mm(h, a.v, xs).reshape(n, c.kv_heads, c.head_dim)
+        _, key = glue.attn_prep(key, key, a.q_norm, a.k_norm, pos, w.inv_freq, c.eps, heads=0,
+                                kv_heads=c.kv_heads, head_dim=c.head_dim)       # the keys' programs alone
+        cache.k[p0:p0 + n] = key
+        cache.v[p0:p0 + n] = value
+
+    @torch.no_grad()
     def forward_streams(self, caches: Sequence[Cache], states: Sequence[torch.Tensor],
                         tokens: Sequence[Sequence[int]], starts: Sequence[int]) -> torch.Tensor:
         """``forward`` for several streams' rows (at most 128 each, over their own caches) in one call, each row with its bits alone."""
@@ -147,16 +168,22 @@ class Head:
 
         return self._layer(states[0] if len(states) == 1 else torch.cat(list(states)), ids, pos, attend)
 
+    def _input(self, states: torch.Tensor, ids: torch.Tensor):
+        """[norm(embed(token)) | norm(state)] through fc, then the input norm: (x, normed rows, their group sums)."""
+
+        w, m, c = self.w, self.m, self.w.config
+        e = glue.embedding(ids, w.embed)
+        _, en, exs = glue.add_rmsnorm(e, None, m.norm_e, c.eps)
+        _, hn, hxs = glue.add_rmsnorm(states.contiguous(), None, m.norm_h, c.eps)
+        x = (_mm(en, m.fc_e, exs).float() + _mm(hn, m.fc_h, hxs).float()).to(torch.bfloat16)
+        return glue.add_rmsnorm(x, None, m.input_norm, c.eps)
+
     def _layer(self, states: torch.Tensor, ids: torch.Tensor, pos: torch.Tensor, attend) -> torch.Tensor:
         """The layer on its rows; ``attend(q, key, value)`` attends and writes the rows' keys where they belong."""
 
         w, m, c = self.w, self.m, self.w.config
         n = states.shape[0]
-        e = glue.embedding(ids, w.embed)
-        _, en, exs = glue.add_rmsnorm(e, None, m.norm_e, c.eps)
-        _, hn, hxs = glue.add_rmsnorm(states.contiguous(), None, m.norm_h, c.eps)
-        x = (_mm(en, m.fc_e, exs).float() + _mm(hn, m.fc_h, hxs).float()).to(torch.bfloat16)
-        x, h, xs = glue.add_rmsnorm(x, None, m.input_norm, c.eps)
+        x, h, xs = self._input(states, ids)
         a = m.attn
         qg = _mm(h, a.q, xs)
         key = _mm(h, a.k, xs)

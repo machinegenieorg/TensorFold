@@ -218,6 +218,27 @@ def test_a_long_prompt_absorbs_through_the_prefill_kernel_and_decodes_serially()
     assert res.tokens == want
 
 
+@pytest.mark.parametrize("rows", [7, 300])
+def test_the_head_absorbs_prompt_rows_as_the_keys_forward_writes(rows):
+    """A prompt's rows enter the head as keys and values alone (no queries, attention, experts or outputs): the
+    bits ``forward`` writes at their slots, through the tree kernel's 128 rows and past them."""
+
+    from tensorfold.families.qwen3_5_moe.cuda.mtp import Cache
+
+    w, head = _model()
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    states = (torch.randn((rows, D), generator=g, device="cuda") * 2).bfloat16()
+    tokens = [3 + (i * 7) % 200 for i in range(rows)]
+    for p0 in (0, 9):
+        full, keys = Cache(w, p0 + rows), Cache(w, p0 + rows)
+        for c in (full, keys):
+            c.k.zero_()
+            c.v.zero_()
+        head.forward(full, states, tokens, p0)
+        head.absorb(keys, states, tokens, p0)
+        assert torch.equal(full.k, keys.k) and torch.equal(full.v, keys.v), p0
+
+
 def test_ignore_eos_decodes_past_end_tokens_as_serial_does():
     """``stop_eos=False`` (ignore_eos) runs drafted rounds through an end token to the count, as serial rounds do."""
 
