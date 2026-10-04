@@ -92,6 +92,11 @@ def build_parser() -> argparse.ArgumentParser:
     speed.add_argument("--reserve-streams", type=int, default=0,
                        help="CUDA, with --parallel: streams kept for foreground requests (priority 0 or below); "
                             "requests with a priority above 0 use at most the rest, so chat never waits behind them")
+    speed.add_argument("--keep-prefixes", type=int, default=None, metavar="N",
+                       help="CUDA, Qwen3.6-35B-A3B with --parallel: prompt states kept to resume from (default 3). "
+                            "A conversation adds up to two (a message start and the prompt's end), each holding a "
+                            "DeltaNet copy and pinning its stream's attention buffer, so raise it when several "
+                            "callers share the server; startup counts each at the full window")
     speed.add_argument("--decode-share", type=float, default=None, help="Mac: while a prompt prefills, running replies "
                        "keep moving for this share of each chunk's time and later prompts start later (default 0.25; "
                        "0: whole prompts first, as 0.3.6.2)")
@@ -369,6 +374,14 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
         if streams <= 1:
             raise ValueError("--reserve-streams needs --parallel 2 or more")
         options["reserve_streams"] = int(args.reserve_streams)
+    if getattr(args, "keep_prefixes", None) is not None:
+        if args.keep_prefixes < 1:
+            raise ValueError(f"--keep-prefixes keeps 1 or more prompt states, not {args.keep_prefixes}")
+        if streams <= 1:
+            raise ValueError("--keep-prefixes needs --parallel 2 or more (one stream keeps its own states)")
+        if family.model_type != "qwen3_5_moe":
+            raise ValueError(f"--keep-prefixes applies to Qwen3.6-35B-A3B (qwen3_5_moe), not {family.title}")
+        options["keep_prefixes"] = int(args.keep_prefixes)
     served = args.name or (args.model.rstrip("/").split("/")[-1] if hub.is_repo_id(args.model) else model_dir.name)
     where = f", rank {args.rank} of 2" if args.tp == 2 else ""
     print(f"[tensorfold] loading {served}: {family.title} ({family.model_type}) on CUDA{where}", flush=True)

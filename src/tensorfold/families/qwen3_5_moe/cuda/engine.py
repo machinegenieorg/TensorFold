@@ -51,7 +51,7 @@ class Qwen36Engine:
 
     def __init__(self, model_dir: Path, *, depth: int = DEPTH, confidence: float = CONFIDENCE,
                  context: int | None = None, context_explicit: bool | None = None, streams: int = 1,
-                 reserve: int = 0) -> None:
+                 reserve: int = 0, keep: int = KEEP_MANY) -> None:
         import torch
 
         from tensorfold.cuda.capacity import admit
@@ -68,6 +68,9 @@ class Qwen36Engine:
         torch.cuda.set_device(0)
         self.depth, self.confidence = int(depth), float(confidence)
         many = streams > 1
+        if int(keep) < 1:
+            raise ValueError(f"keep takes 1 or more prompt states, not {keep}")
+        self.keep = int(keep)
         if many:             # streams' caches of many sizes come and go: growable segments, less slack
             torch.cuda.memory._set_allocator_settings("expandable_segments:True")
         nvfp4 = modelopt.is_modelopt(model_dir)          # the NVFP4 checkpoint as it ships (MTP layer in its index)
@@ -80,7 +83,7 @@ class Qwen36Engine:
         transform = (modelopt.weight_bytes(len(ids) if ids is not None else 0, self.depth > 0) if nvfp4 else
                      lambda name, info: (mtp_weights(name, info) if ".mtp." in name else linear_weights(name, info)))
         # one admission for one stream or many (every stream's states and caches, kept prompt ends), before any load
-        geometry = ((lambda text: stream_geometry(text, streams, KEEP_MANY, self.depth)) if many else
+        geometry = ((lambda text: stream_geometry(text, streams, keep, self.depth)) if many else
                     (lambda text: gdn_geometry(text, 1, self.depth + 1, mtp=self.depth > 0)))
         self.capacity_plan = admit(model_dir, context, context_explicit, torch, geometry, transform,
                                    extra_files=() if nvfp4 else extra)
@@ -112,12 +115,13 @@ class Qwen36Engine:
             from .multi import MultiDecoder
 
             self.multi = MultiDecoder(self.w, self.head, depth=self.depth, confidence=self.confidence,
-                                      context=self.capacity_plan["cache_slots"], keep=KEEP_MANY, points=self.points,
+                                      context=self.capacity_plan["cache_slots"], keep=keep, points=self.points,
                                       graphs=self.graphs)
             started = time.perf_counter()
             self.multi.warm(streams)
             print(f"[tensorfold] {streams} streams of {self.context_window} prompt/reply tokens: together, rounds run "
-                  f"eagerly; alone, in CUDA graphs; kernels warmed in {time.perf_counter() - started:.1f}s", flush=True)
+                  f"eagerly; alone, in CUDA graphs; kernels warmed in {time.perf_counter() - started:.1f}s; "
+                  f"{self.keep} prompt states kept", flush=True)
             self.scheduler = Scheduler(self.multi, max_streams=streams, reserve=reserve)
 
     def _resume(self, prompt: list[int]):

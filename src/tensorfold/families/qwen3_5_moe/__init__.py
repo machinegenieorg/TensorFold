@@ -60,7 +60,7 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
     if int(tp) != 1:
         raise ValueError(f"{TITLE} runs on one GPU: drop --tp")
     from .cuda import CONFIDENCE, DEPTH
-    from .cuda.engine import Qwen36Engine
+    from .cuda.engine import KEEP_MANY, Qwen36Engine
 
     depth = 0 if no_drafts else DEPTH if mtp_drafts is None else int(mtp_drafts)
     confidence = CONFIDENCE if mtp_confidence is None else float(mtp_confidence)
@@ -69,7 +69,12 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
     if reserve and not 0 < reserve < streams:
         raise ValueError(f"--reserve-streams keeps 1 to {streams - 1} of --parallel {streams} streams for foreground "
                          f"requests, not {reserve}")
+    keep = options.get("keep_prefixes")
+    if keep is not None and (streams < 2 or int(keep) < 1):
+        raise ValueError(f"--keep-prefixes keeps 1 or more prompt states and needs --parallel 2 or more, not "
+                         f"{keep} with --parallel {streams}")
     if streams > 1 and not 0 <= depth <= 15:
         raise ValueError(f"--parallel verifies up to 16 rows a stream: --mtp-drafts 0 to 15, not {depth}")
     return Qwen36Engine(Path(model_dir), depth=depth, confidence=confidence, context=context,
-                        context_explicit=options.get("context_explicit"), streams=streams, reserve=reserve)
+                        context_explicit=options.get("context_explicit"), streams=streams, reserve=reserve,
+                        keep=KEEP_MANY if keep is None else int(keep))
