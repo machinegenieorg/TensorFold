@@ -1,0 +1,101 @@
+{
+  "all_runtime_flags_default_off": true,
+  "analyzer_source_sha256": "915d7ad33eb9a61552f5a54db48e6b4df3356ed4537e44c22d26c2771845cef6",
+  "build_receipt_sha256": "eebf47b460876917d742cb88a442233e996c2cb508a9e8e2e2b6d96b1c737213",
+  "client_documentation_delta": "Only the documentation example endpoint is replaced by $BASE_URL; executable client behavior is unchanged.",
+  "cpu_checks": {
+    "host_tests": 334,
+    "native_build_steps": 6,
+    "qualifier_build_steps": 5
+  },
+  "environment": {
+    "capture_container_release": "NVIDIA's PyTorch 26.07 container",
+    "capture_image_sha256": "15b8de8baabe68e46afc51e88f3ccad5042013bafe8f244ec082ce0bb06d47e3",
+    "driver_library_versions": "not independently retained in this public bundle",
+    "hardware": "DGX Spark NVIDIA GB10 sm_121",
+    "native_backend": "CUDA",
+    "os": "Linux aarch64",
+    "zig": "0.17.0"
+  },
+  "final_independent_verification_sha256": "6d76645814c4ff55b74503d77588fe52c19b1ee28a67183e1923c680b402e7b4",
+  "flags": {
+    "candidate": {
+      "TF_PR608_EXACT_CACHE_DRAFT_REUSE": "1",
+      "TF_PR608_EXACT_CACHE_LOGITS": "1",
+      "TF_PR608_EXACT_CACHE_SEQ_REUSE": "1",
+      "TF_PR608_EXACT_CACHE_SKIP_RESET": "1",
+      "TF_PR608_EXACT_PROMPT_CACHE": "1"
+    },
+    "python": {},
+    "stock": {
+      "TF_PR608_EXACT_CACHE_DRAFT_REUSE": "0",
+      "TF_PR608_EXACT_CACHE_LOGITS": "0",
+      "TF_PR608_EXACT_CACHE_SEQ_REUSE": "0",
+      "TF_PR608_EXACT_CACHE_SKIP_RESET": "0",
+      "TF_PR608_EXACT_PROMPT_CACHE": "0"
+    }
+  },
+  "independent_analysis_sha256": "1833c6ff337a9380594b98faabd540b35786877fd91e7824dd8907dba600ce1e",
+  "model_manifest_sha256": "1a556f5bd87c302a86cec21e437e58cede87e7492492b78bf24df5c2882633e4",
+  "models": [
+    {
+      "name": "target",
+      "repo": "Vontra/Qwen3.8-27B-MLX-4bit",
+      "revision": "70ae7fac63274ff2eac54152031433374cb80f2f"
+    },
+    {
+      "name": "drafter",
+      "repo": "z-lab/Qwen3.8-27B-DFlash2",
+      "revision": "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
+    }
+  ],
+  "native_binary_sha256": "469b917ca87959fbf3f38964cd91388da433e1395a5773556560d4982fc7d761",
+  "pr608_head": "99bcc5b29805e29a4baf2cd4beade0f7fe1a5fe8",
+  "publication_parent": "7acdc54473b5c9f54582b5d3c465e89b92daf886",
+  "python_commit": "cb2ebf0540f42604e2759b2ddef497861e928248",
+  "qualification_sha256": "13bf795f292e1014424dabcc5b55776e935de32379c2af1eb85b637882b041c9",
+  "qualifier_included": false,
+  "raw_operational_receipts_included": false,
+  "runtime_commit": "474bd89b68dee96149898ad303626d5d9dce0291",
+  "runtime_prerequisite": "7acdc54473b5c9f54582b5d3c465e89b92daf886",
+  "sanitized": true,
+  "schema": "pr608_three_way_public_provenance_v1",
+  "server_settings": {
+    "context": 32768,
+    "generic_prompt_cache_gib": 0,
+    "kv": "BF16",
+    "parallel": 16,
+    "prefill": "BF16",
+    "temperature": 0,
+    "thinking": false
+  },
+  "source_count": 19,
+  "source_manifest_sha256": "a045512152eabdd1c8a21f3120b822a96f92a3caa0a603dc93c3a4d9eb6bd276",
+  "source_sha256": {
+    "zig/src/families/qwen27/cuda/draft_pool.zig": "3ca8a67b16ff5d019998c5242caea5a351dff94ddeaa461027108dcac0b8fff5",
+    "zig/src/families/qwen27/cuda/draft_pool_test.zig": "2e5792ccd7c8fbef33c50644fa721be9af284cdfcf2bedb78e920330fb28b88c",
+    "zig/src/families/qwen27/cuda/drafts.zig": "fcbc5ffcc643104380f2289d4f9a64444a31627719467f259dedbc31204c1c86",
+    "zig/src/families/qwen27/cuda/engine.zig": "f674145954a3dd59b08b99b5f884ce32b53f7b5d10c282305d65f83e4e19117f",
+    "zig/src/families/qwen27/cuda/exact_cache_policy.zig": "5e550ddcbdd1db0ca50dbc543488b88516809945b8665820a06a0bc3150ca4ab",
+    "zig/src/families/qwen27/cuda/exact_cache_test.zig": "16becde3ec100dec1abeeedb1827181265d8ea1d3a93c30b4eaec2e357b8635a",
+    "zig/src/families/qwen27/cuda/exact_draft_reuse.zig": "2274324c29765e9f425e6d2fa045d1cc6596681c16999fc5a79e58ac599b2ad3",
+    "zig/src/families/qwen27/cuda/exact_first_logits.zig": "eb99f17648837d5026238ee9270cd30895b39a32c9646597fff5953ef511b103",
+    "zig/src/families/qwen27/cuda/exact_logits_policy.zig": "c12f1d89bedfeb9192330c9eca0967abf7fe44886c9e736b09be9747f1ed57ca",
+    "zig/src/families/qwen27/cuda/exact_prompt_cache.zig": "79a88a49ff0908651b8126569b54c15cb4708f003583d1a7755ad6bc35d66d01",
+    "zig/src/families/qwen27/cuda/exact_seq_reuse.zig": "1452fdfc4d1407e1fee62828aff4cb0c5a033f9d637ac124da86a2642d8fb261",
+    "zig/src/families/qwen27/cuda/lanes.zig": "eb3b6539c806a12a83370455785e1468430d0098bc8e4c0c97b784788a32535d",
+    "zig/src/families/qwen27/cuda/reset_skip.zig": "715816eddb923dbada206179405e8863fd0d82da66fa6db5050b44c9d88e46e2",
+    "zig/src/families/qwen27/cuda/reset_skip_factory_test.zig": "003658aae413decc868f5aa4792d23aec9fe6000df903afc613d518a0425e239",
+    "zig/src/families/qwen27/cuda/reset_skip_test.zig": "5386b56c2191d840d216d160deac31705f2b4ff5df6fec4f7ef0f7cbe2bbf058",
+    "zig/src/families/qwen27/cuda/restore_proof.zig": "73357234268ab6c7a5f0fb72bb8fdc980be08743144a5364c56a0c9b8fd2e7bb",
+    "zig/src/families/qwen27/cuda/seq_pool.zig": "88978229ebd42339041992ea489c4cdf82f7cf64ff99295039d8f75508b6ca95",
+    "zig/src/families/qwen27/cuda/seq_pool_test.zig": "362733783b4bd6e5f647eee93f6eab44c34bd94c136398c1c8bcfc382a0819ef",
+    "zig/src/families/qwen27/cuda/state.zig": "b0bb5a6d24c661b72909c1e4c9c89e1125971d01c17c8b2e22238cd5bfdf9caf"
+  },
+  "stock_binary_sha256": "73a0e0434ce5adf3031a22fe2a70cbc9c671150464e4a6ecc4016b8defc12c8d",
+  "tested_client_source_sha256": {
+    "bench_concurrent.py": "1bdd080554bb236532843f5f9490db97fbfd414c8e8618b3c2a1b582fd66e882",
+    "bench_evidence.py": "119c396f24f3c13e181429bc69acff39f34254efd4789c5673a3dcbc54738d93",
+    "run_http.py": "97a3cfbdb5b5ae8f2b945abee6b245ae310876b57b1a4fa6183a7ef028348767"
+  }
+}

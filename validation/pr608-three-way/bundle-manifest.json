@@ -1,0 +1,28 @@
+{
+  "files_sha256": {
+    "README.md": "98e5d2ffa4d5471b5226bd84ec3c10a3c85ceb41b2e9df35560abf33e7028e14",
+    "bench_concurrent.py": "4e336cb213fe55ca5879a51a99dc4185de0ed17fc9096949c9c9bd6f107f7d53",
+    "bench_evidence.py": "119c396f24f3c13e181429bc69acff39f34254efd4789c5673a3dcbc54738d93",
+    "evidence-forward.json": "0b52d1bf0cd44227294ce65a60354129acba8ca450d43ad3e98cba8b283ac642",
+    "evidence-reverse.json": "5becc76a34a5bc0e5456439c204100cbfc5610a2f144eaa6baaba6b7d9e6c578",
+    "provenance.json": "fb430555dea1087ce564f94edd222947d5cf35ee400939ed94e8910aaee167cf",
+    "qualification.json": "13bf795f292e1014424dabcc5b55776e935de32379c2af1eb85b637882b041c9",
+    "requests-forward.jsonl": "b3b6befe1c86947ddeaf8babf781e796d3a41ef191811f04b976bf40fcffb13e",
+    "requests-reverse.jsonl": "f0a5601f248f9558956b47cdd7cd7ee3bffddc4500ea5fcde0a43cff10ad4228",
+    "run_http.py": "97a3cfbdb5b5ae8f2b945abee6b245ae310876b57b1a4fa6183a7ef028348767",
+    "summary.json": "1833c6ff337a9380594b98faabd540b35786877fd91e7824dd8907dba600ce1e",
+    "test_verify.py": "b0693ebafca6810adf1c7834ada33deaec97e70fc2b1317fe9f92e8a6e820e11",
+    "verify.py": "9a8b03ebc093a68d0f9cd9637c482decaeb949924d72e1d958ec874f841f625e"
+  },
+  "host_checks": {
+    "bytecode_files_included": false,
+    "mutation_tests_passed": 9,
+    "python_ast_target": "3.11",
+    "runtime_source_hashes_rechecked": 19,
+    "summary_matches_accepted_independent_analysis": true
+  },
+  "requests": 624,
+  "runtime_commit": "474bd89b68dee96149898ad303626d5d9dce0291",
+  "sanitized": true,
+  "schema": "pr608_three_way_public_bundle_v1"
+}

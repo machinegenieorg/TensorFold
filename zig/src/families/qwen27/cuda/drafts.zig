@@ -31,10 +31,25 @@ pub const Stream = struct {
 
     pub fn deinit(x: *Stream) void {
         x.ctx.deinit();
+        x.deinitHost();
+    }
+
+    fn deinitHost(x: *Stream) void {
         x.copies.deinit();
         x.tokens.deinit(x.gpa);
         x.parents.deinit(x.gpa);
         x.scores.deinit(x.gpa);
+    }
+
+    /// Reconstruct every request-specific host field around exclusively owned, already-fenced storage.
+    pub fn resetStorage(x: *Stream) void {
+        const gpa = x.gpa;
+        var ctx = x.ctx;
+        x.deinitHost();
+        ctx.cur = 0;
+        ctx.len = 0;
+        ctx.end = 0;
+        x.* = init(gpa, ctx);
     }
 
     fn clear(x: *Stream) void {
@@ -100,4 +115,30 @@ pub fn absorb(d: *dr.DFlash2, ops: kern.Ops, taps: u64, copy_items: u64, kept: [
     try ops.upload(copy_items, std.mem.sliceAsBytes(items.items));
     try ops.copies(copy_items, items.items.len);
     try d.absorbMany(absorbs[0..kept.len], gathered);
+}
+
+test "storage reset reconstructs CopyIndex and arrays without replacing Context geometry" {
+    const gpa = std.testing.allocator;
+    const ctx: dr.Context = .{ .arena = .{ .buf = null }, .keys = @splat(@splat(4096)), .values = @splat(@splat(8192)), .cur = 1, .len = 31, .end = 47 };
+    var x = Stream.init(gpa, ctx);
+    defer x.deinit();
+    const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1, 2, 3, 4, 5, 6, 7, 8 };
+    _ = try x.copies.propose(&tokens, 15);
+    try std.testing.expect(x.copies.positions.count() > 0 and x.copies.indexed > 0);
+    x.kind = .tree;
+    try x.tokens.append(gpa, 43);
+    try x.parents.append(gpa, -1);
+    try x.scores.append(gpa, -0.5);
+    x.resetStorage();
+    try std.testing.expectEqual(@as(u1, 0), x.ctx.cur);
+    try std.testing.expectEqual(@as(usize, 0), x.ctx.len);
+    try std.testing.expectEqual(@as(usize, 0), x.ctx.end);
+    try std.testing.expectEqual(ctx.keys, x.ctx.keys);
+    try std.testing.expectEqual(ctx.values, x.ctx.values);
+    try std.testing.expectEqual(@as(usize, 0), x.copies.positions.count());
+    try std.testing.expectEqual(@as(usize, 0), x.copies.indexed);
+    try std.testing.expectEqual(Kind.none, x.kind);
+    try std.testing.expectEqual(@as(usize, 0), x.tokens.items.len);
+    try std.testing.expectEqual(@as(usize, 0), x.parents.items.len);
+    try std.testing.expectEqual(@as(usize, 0), x.scores.items.len);
 }

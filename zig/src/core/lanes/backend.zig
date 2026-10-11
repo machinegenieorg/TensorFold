@@ -58,9 +58,16 @@ pub const DraftRequest = struct {
     ranks: bool = false, // also keep each chained level's best tokens (alternatives(), for grafts)
 };
 
+/// A host handoff after a stream's first token is committed; it must not release the stream.
+pub const Committed = struct {
+    ptr: *anyopaque,
+    call: *const fn (ptr: *anyopaque, index: usize) void,
+};
+
 pub const Backend = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    first_before_draft: bool = false, // initial drafting accepts the already committed first token
 
     pub const VTable = struct {
         /// Prefill the stream's prompt into its caches (and its draft head's).

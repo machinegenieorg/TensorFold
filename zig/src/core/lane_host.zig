@@ -344,15 +344,23 @@ pub const LaneHost = struct {
         const errs = h.gpa.alloc(?anyerror, batch.items.len) catch return h.dropAll(batch.items, "out of memory");
         defer h.gpa.free(errs);
         for (streams, batch.items) |*s, job| s.* = &job.stream;
-        h.core.addStreams(streams, errs) catch |e| return h.dropAll(batch.items, h.words(e));
+        h.core.addStreamsCommitted(streams, errs, .{ .ptr = &batch, .call = firstCommitted }) catch |e| return h.dropAll(batch.items, h.words(e));
         for (batch.items, errs) |job, err| {
             if (err) |e| {
                 _ = if (e == error.Cancelled) h.cancel(job) else h.drop(job, h.words(e));
                 continue;
             }
-            h.prefilled(job, job.began);
+            if (!job.prefill_sent) h.prefilled(job, job.began);
             if (h.deliver(job)) h.remove(job);
         }
+    }
+
+    fn firstCommitted(ptr: *anyopaque, index: usize) void {
+        const batch: *std.ArrayList(*Job) = @ptrCast(@alignCast(ptr));
+        const job = batch.items[index];
+        job.prefill_sent = true;
+        job.host.prefilled(job, job.began);
+        job.host.send(job); // finish only after admission returns: the core still owns its stream pointers
     }
 
     fn dropAll(h: *LaneHost, jobs: []const *Job, message: []const u8) void {
@@ -587,4 +595,5 @@ pub const LaneHost = struct {
 
 test {
     _ = @import("lane_host_test.zig");
+    _ = @import("lane_host_first_test.zig");
 }

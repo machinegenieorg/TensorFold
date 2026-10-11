@@ -63,6 +63,15 @@ pub const Seq = struct {
 
     /// A fresh stream: zero recurrences and conv windows, caches for `capacity` positions.
     pub fn init(gpa: std.mem.Allocator, ops: kern.Ops, g: c.Geometry, capacity: usize) !Seq {
+        return initState(gpa, ops, g, capacity, true);
+    }
+
+    /// Private restore destination: it must be restored or reset before any target work.
+    pub fn initRestoreDestination(gpa: std.mem.Allocator, ops: kern.Ops, g: c.Geometry, capacity: usize) !Seq {
+        return initState(gpa, ops, g, capacity, false);
+    }
+
+    fn initState(gpa: std.mem.Allocator, ops: kern.Ops, g: c.Geometry, capacity: usize, initialize: bool) !Seq {
         var s: Seq = .{ .gpa = gpa, .arena = try Arena.init(ops.k.d, bytes(g, capacity)), .rec = &.{}, .conv = &.{}, .keys = &.{}, .values = &.{}, .head_in = 0, .head_xs = 0, .capacity = capacity };
         errdefer s.arena.deinit();
         s.rec = try gpa.alloc(u64, g.layers);
@@ -90,7 +99,7 @@ pub const Seq = struct {
                 s.values[i] = try A.take(capacity * g.kvInner() * bf);
             }
         }
-        try s.reset(ops, g);
+        if (initialize) try s.reset(ops, g);
         return s;
     }
 
@@ -302,3 +311,7 @@ pub const Scratch = struct {
         s.* = undefined;
     }
 };
+
+test {
+    _ = @import("reset_skip_factory_test.zig");
+}

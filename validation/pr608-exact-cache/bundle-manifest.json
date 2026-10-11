@@ -1,0 +1,29 @@
+{
+  "schema": "pr608_exact_cache_validation_bundle_v1",
+  "runtime_commit": "474bd89b68dee96149898ad303626d5d9dce0291",
+  "runtime_parent": "7acdc54473b5c9f54582b5d3c465e89b92daf886",
+  "sanitized": true,
+  "host_checks": {
+    "mutation_tests_passed": 9,
+    "python_ast_target": "3.11",
+    "independent_metric_ratio_values_reconciled": 184,
+    "runtime_source_hashes_rechecked": 19,
+    "privacy_scan": "No private filesystem roots, physical host addresses, operational IDs or private email matches in bundled files."
+  },
+  "client_delta": "run_http.py and bench_evidence.py are byte-exact copied from the tested client. bench_concurrent.py only substitutes the documentation example address with $BASE_URL; request/timing/concurrency code is unchanged.",
+  "files_sha256": {
+    "README.md": "114a74fd7d8ece9b962dc9d5f2f27a8c55ed712b93b15b664d114383f595c9de",
+    "bench_concurrent.py": "4e336cb213fe55ca5879a51a99dc4185de0ed17fc9096949c9c9bd6f107f7d53",
+    "bench_evidence.py": "119c396f24f3c13e181429bc69acff39f34254efd4789c5673a3dcbc54738d93",
+    "evidence-forward.json": "a7b62a93cea579cd332479071e9a0f66cf17b2e8f37c03f379d22941fbe799bd",
+    "evidence-reverse.json": "a5ab6713b96feadfda4ef94c3cdf73e675a14cd852d6141315dc0f319a6772dd",
+    "provenance.json": "9486da3178372c2e08a45c17ce3fc5bf8aafbbd65ba70656721bcbbcb46d3ce4",
+    "qualification.json": "13bf795f292e1014424dabcc5b55776e935de32379c2af1eb85b637882b041c9",
+    "requests-forward.jsonl": "754123deb031e118e67be698bd5d907151681a602a8cd4bbda2931cc849faf74",
+    "requests-reverse.jsonl": "4edc22d61c3c9c4c9cb02606b25928634b78438a1c307e61cbb3a59c9349424b",
+    "run_http.py": "92e597b391b67486008a098e26a545d1427afe42956339e5f2f72f5ca9d3131b",
+    "summary.json": "a43e486aee08bab0e94e8b4b8da7204482919083155a87a4a29351a388af7427",
+    "test_verify.py": "e4e9f7f783f759678146cc4272759af728ea60e88bc18e9ed79aaa7d767c0848",
+    "verify.py": "a45e2623fec2d867514374813c3ea4f8f30cdfbc1a4e5b91c8a6e28b2f383ce0"
+  }
+}

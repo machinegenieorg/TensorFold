@@ -37,6 +37,7 @@ pub const LogprobRow = logprob.Row;
 test {
     std.testing.refAllDecls(@This());
     _ = @import("engine_test.zig");
+    _ = @import("admit_first_test.zig");
     _ = @import("gpu_full_test.zig");
     _ = @import("drafted_test.zig");
 }

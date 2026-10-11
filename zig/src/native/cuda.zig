@@ -328,7 +328,7 @@ const Host = struct {
                 }
             }.f,
         };
-        return .{ .ptr = h, .vtable = &h.vtable };
+        return .{ .ptr = h, .vtable = &h.vtable, .first_before_draft = h.inner.first_before_draft };
     }
 };
 
@@ -524,12 +524,15 @@ test "a cancel during a long prompt stops it, and the next request's reply is un
     const h = try gpa.create(Host);
     defer gpa.destroy(h);
     h.* = .{ .gpa = gpa, .gpu = null, .family = &target, .release = Nothing.release, .inner = target.backend(), .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined };
+    try std.testing.expect(!h.backend().first_before_draft);
+    h.inner.first_before_draft = true;
     try h.serve(std.testing.io, .{ .exact_width = 8, .mtp = true, .speculate = true, .drafts = 7, .hidden_rows = true }, 8, .{ .lanes = 2 }, null);
     defer {
         h.host.stop();
         h.core.deinit();
         h.cfg.deinit(gpa);
     }
+    try std.testing.expect(h.core.backend.first_before_draft);
     const e = h.host.engine();
     try std.testing.expect(e.memory(false) == null); // no device to count
     const Box = struct {

@@ -1,0 +1,113 @@
+{
+  "schema": "pr608_exact_cache_public_order_v1",
+  "complete": true,
+  "order_name": "forward",
+  "process_order": [
+    "reset_off",
+    "python",
+    "candidate"
+  ],
+  "sanitized": true,
+  "sanitization": "Endpoint URLs and operational state omitted; paths, literal request bodies, original body/output/token hashes, usage/runtime/work and SSE clocks retained. This is a derived structured receipt, not a raw log.",
+  "reports": {
+    "reset_off": {
+      "source_report_sha256": "6b58c849e2c7daf41b63466723cb854541415667908518341e44f6b0ba9eb992",
+      "source_report_schema": "pr608_exact_cache_http_v1",
+      "source_client_sha256": {
+        "bench_concurrent.py": "1bdd080554bb236532843f5f9490db97fbfd414c8e8618b3c2a1b582fd66e882",
+        "bench_evidence.py": "119c396f24f3c13e181429bc69acff39f34254efd4789c5673a3dcbc54738d93",
+        "run_http.py": "92e597b391b67486008a098e26a545d1427afe42956339e5f2f72f5ca9d3131b"
+      },
+      "model": "qwen27-pr608",
+      "parameters": {
+        "levels": [
+          1,
+          16
+        ],
+        "measured_tokens": 256,
+        "prompts": [
+          "code",
+          "chat"
+        ],
+        "repetitions": 3,
+        "seed": 1234,
+        "temperature": 0.0,
+        "warmup_tokens": 16
+      },
+      "health_totals": {
+        "output_tokens": 26144,
+        "prompt_tokens": 2340,
+        "requests": 104
+      },
+      "reported_cache_label": "on"
+    },
+    "python": {
+      "source_report_sha256": "6237d86b56c28528ec14309633380729358d2b0c34c01a464b993cd20dfd7131",
+      "source_report_schema": "pr608_exact_cache_http_v1",
+      "source_client_sha256": {
+        "bench_concurrent.py": "1bdd080554bb236532843f5f9490db97fbfd414c8e8618b3c2a1b582fd66e882",
+        "bench_evidence.py": "119c396f24f3c13e181429bc69acff39f34254efd4789c5673a3dcbc54738d93",
+        "run_http.py": "92e597b391b67486008a098e26a545d1427afe42956339e5f2f72f5ca9d3131b"
+      },
+      "model": "qwen27-pr608",
+      "parameters": {
+        "levels": [
+          1,
+          16
+        ],
+        "measured_tokens": 256,
+        "prompts": [
+          "code",
+          "chat"
+        ],
+        "repetitions": 3,
+        "seed": 1234,
+        "temperature": 0.0,
+        "warmup_tokens": 16
+      },
+      "health_totals": {
+        "output_tokens": 26144,
+        "prompt_tokens": 2340,
+        "requests": 104
+      },
+      "reported_cache_label": "python"
+    },
+    "candidate": {
+      "source_report_sha256": "95da884e7e7996b6f80897c988c729ad66880c040f223601303fb6072f9c8dfe",
+      "source_report_schema": "pr608_exact_cache_http_v1",
+      "source_client_sha256": {
+        "bench_concurrent.py": "1bdd080554bb236532843f5f9490db97fbfd414c8e8618b3c2a1b582fd66e882",
+        "bench_evidence.py": "119c396f24f3c13e181429bc69acff39f34254efd4789c5673a3dcbc54738d93",
+        "run_http.py": "92e597b391b67486008a098e26a545d1427afe42956339e5f2f72f5ca9d3131b"
+      },
+      "model": "qwen27-pr608",
+      "parameters": {
+        "levels": [
+          1,
+          16
+        ],
+        "measured_tokens": 256,
+        "prompts": [
+          "code",
+          "chat"
+        ],
+        "repetitions": 3,
+        "seed": 1234,
+        "temperature": 0.0,
+        "warmup_tokens": 16
+      },
+      "health_totals": {
+        "output_tokens": 26144,
+        "prompt_tokens": 2340,
+        "requests": 104
+      },
+      "reported_cache_label": "on"
+    }
+  },
+  "requests": {
+    "file": "requests-forward.jsonl",
+    "sha256": "754123deb031e118e67be698bd5d907151681a602a8cd4bbda2931cc849faf74",
+    "count": 312
+  },
+  "original_verification_sha256": "17845b0c9a7a7bd310b77a733975c94e57ec32d5ea84030f81321a0f4c6571ec"
+}

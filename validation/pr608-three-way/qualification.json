@@ -1,0 +1,34 @@
+{
+  "schema": "pr608_exact_cache_public_qualification_v1",
+  "sanitized": true,
+  "passed": true,
+  "source_receipt_sha256": "bd2778db23c4d4a69cf16b3792cf81b9197c2c3da3b5abac6a058b1500dea554",
+  "qualifier_source_sha256": "b6fe9373d6f6b0b9c24e08afb8e8feacd6d534005acc554fffb22c01566b47a3",
+  "qualification_binary_sha256": "ebbc73e0ffa97ee31b18ab6c426568a883ade108128278d246448bf4b96b4772",
+  "qualification_log_sha256": "dbee317d06bfc51c7c86529e337b644e341e3d758989c841556882bb643f0bfd",
+  "qualification_audit_sha256": "7053754523ed26f726d0c187ecbb3117985df026da9515f0018fc971add18186",
+  "source_pins_sha256": "a045512152eabdd1c8a21f3120b822a96f92a3caa0a603dc93c3a4d9eb6bd276",
+  "primitive_hashes_match_previous": true,
+  "integrated_snapshot_hash_matches_previous": true,
+  "reset_skip": {
+    "avoided_fill_bytes": 461832192,
+    "avoided_fill_calls": 288,
+    "failed_deferred_transactions": 0,
+    "fallback_resets": 1,
+    "fresh_poisoned_full_state_raw_and_continuation_equal": true,
+    "pooled_poisoned_full_state_raw_and_continuation_equal": true,
+    "positive_hint_actual_miss_reset_before_target": true,
+    "public_open_reset_domains_zero": true,
+    "reset_domain_bytes": 153944064,
+    "reset_domain_calls": 96,
+    "restored_fresh": 2,
+    "restored_pool": 1,
+    "schema": "pr608_exact_cache_reset_skip_v1"
+  },
+  "earlier_state_gates": "Code 14 plain/drafted, chat 31 drafted, full-N packed target/draft/head state, immutable snapshot, 16 independent live owners, first/raw logits and direct 8-token continuation; target/draft reuse and cold cross-key Context poison gates.",
+  "limits": [
+    "This is a sanitized gate attestation; the 968-line device checker and raw logs are not distributed here.",
+    "Direct 8-token continuation is not the full speculative verify/keep loop; HTTP evidence is separate.",
+    "Structural avoided-fill counters are not phase timing."
+  ]
+}

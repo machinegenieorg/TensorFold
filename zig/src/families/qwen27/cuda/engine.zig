@@ -71,6 +71,11 @@ pub const Engine = struct {
         return st.Seq.init(e.gpa, e.ops(), e.w.g, capacity);
     }
 
+    /// Private prefill transaction only; public sequence still returns initialized state.
+    pub fn sequenceForRestore(e: *Engine, capacity: usize) !st.Seq {
+        return st.Seq.initRestoreDestination(e.gpa, e.ops(), e.w.g, capacity);
+    }
+
     /// prefill_state from an empty state: the prompt in even chunks of at most `prompt_rows`, its last row normed.
     pub fn prefill(e: *Engine, seq: *st.Seq, prompt: []const u32) !void {
         if (prompt.len == 0) return error.EmptyPrompt;

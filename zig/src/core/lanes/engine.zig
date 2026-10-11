@@ -86,6 +86,12 @@ pub const Engine = struct {
 
     /// addStream for several streams, their prompt passes shared (admit.zig).
     pub fn addStreams(e: *Engine, streams: []const *Stream, errs: []?anyerror) !void {
+        return e.addStreamsCommitted(streams, errs, null);
+    }
+
+    /// Admit streams, handing committed first tokens to the host before initial drafting when supported.
+    pub fn addStreamsCommitted(e: *Engine, streams: []const *Stream, errs: []?anyerror, hook: ?be.Committed) !void {
+        if (e.backend.first_before_draft) return @import("admit_first.zig").streams(e, streams, errs, hook);
         return admit.streams(e, streams, errs);
     }
 

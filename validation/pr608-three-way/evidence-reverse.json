@@ -1,0 +1,123 @@
+{
+  "complete": true,
+  "lifecycle_attestation": {
+    "all_jobs_passed": true,
+    "complete": true,
+    "jobs": {
+      "candidate": {
+        "passed": true
+      },
+      "python": {
+        "passed": true
+      },
+      "stock": {
+        "passed": true
+      }
+    },
+    "restored": true
+  },
+  "process_order": [
+    "candidate",
+    "stock",
+    "python"
+  ],
+  "provenance_sha256": "966838354657c7b6c31fd0bc912cc561b584a818cf4ca65ce060708301dc985f",
+  "reports": {
+    "candidate": {
+      "health_totals": {
+        "output_tokens": 26624,
+        "prompt_tokens": 2340,
+        "requests": 104
+      },
+      "model": "qwen27-pr608",
+      "parameters": {
+        "levels": [
+          1,
+          16
+        ],
+        "measured_tokens": 256,
+        "prompts": [
+          "code",
+          "chat"
+        ],
+        "repetitions": 3,
+        "seed": 1234,
+        "temperature": 0.0,
+        "uncached_first_use_tokens": 256
+      },
+      "source_report_sha256": "5e6746c9c52e67ac43801927ba015c86601e9294ba453e667cc4395fadaf7876",
+      "source_sha256": {
+        "bench_concurrent.py": "1bdd080554bb236532843f5f9490db97fbfd414c8e8618b3c2a1b582fd66e882",
+        "bench_evidence.py": "119c396f24f3c13e181429bc69acff39f34254efd4789c5673a3dcbc54738d93",
+        "run_http.py": "97a3cfbdb5b5ae8f2b945abee6b245ae310876b57b1a4fa6183a7ef028348767"
+      }
+    },
+    "python": {
+      "health_totals": {
+        "output_tokens": 26624,
+        "prompt_tokens": 2340,
+        "requests": 104
+      },
+      "model": "qwen27-pr608",
+      "parameters": {
+        "levels": [
+          1,
+          16
+        ],
+        "measured_tokens": 256,
+        "prompts": [
+          "code",
+          "chat"
+        ],
+        "repetitions": 3,
+        "seed": 1234,
+        "temperature": 0.0,
+        "uncached_first_use_tokens": 256
+      },
+      "source_report_sha256": "2b737254aa61a58e488023d30ab2e9802ba16130a4820dc869efe90962880b2a",
+      "source_sha256": {
+        "bench_concurrent.py": "1bdd080554bb236532843f5f9490db97fbfd414c8e8618b3c2a1b582fd66e882",
+        "bench_evidence.py": "119c396f24f3c13e181429bc69acff39f34254efd4789c5673a3dcbc54738d93",
+        "run_http.py": "97a3cfbdb5b5ae8f2b945abee6b245ae310876b57b1a4fa6183a7ef028348767"
+      }
+    },
+    "stock": {
+      "health_totals": {
+        "output_tokens": 26624,
+        "prompt_tokens": 2340,
+        "requests": 104
+      },
+      "model": "qwen27-pr608",
+      "parameters": {
+        "levels": [
+          1,
+          16
+        ],
+        "measured_tokens": 256,
+        "prompts": [
+          "code",
+          "chat"
+        ],
+        "repetitions": 3,
+        "seed": 1234,
+        "temperature": 0.0,
+        "uncached_first_use_tokens": 256
+      },
+      "source_report_sha256": "26c9714b8d9807eaceb024d934151f2d6ed25e93e1996b0a570eed49044e93b4",
+      "source_sha256": {
+        "bench_concurrent.py": "1bdd080554bb236532843f5f9490db97fbfd414c8e8618b3c2a1b582fd66e882",
+        "bench_evidence.py": "119c396f24f3c13e181429bc69acff39f34254efd4789c5673a3dcbc54738d93",
+        "run_http.py": "97a3cfbdb5b5ae8f2b945abee6b245ae310876b57b1a4fa6183a7ef028348767"
+      }
+    }
+  },
+  "requests": {
+    "count": 312,
+    "file": "requests-reverse.jsonl",
+    "sha256": "f0a5601f248f9558956b47cdd7cd7ee3bffddc4500ea5fcde0a43cff10ad4228"
+  },
+  "sanitization": "Derived evidence, not raw operational logs. Endpoint URLs and machine/service identities omitted; routes, literal bodies, usage/runtime/work, output fingerprints and all SSE clocks retained.",
+  "sanitized": true,
+  "schema": "pr608_three_way_public_order_v1",
+  "status_sha256": "3d54b21b1ba7e6acbf81dfffa7ad6b97269f9ff17609713997228b2bddc1041c"
+}
